@@ -378,10 +378,12 @@ impl PersistClient {
         T: Timestamp + Lattice + Codec64,
         D: Semigroup + Codec64 + Send + Sync,
     {
-        Ok((
+        let res = (
             self.open_writer(shard_id).await?,
             self.open_reader(shard_id).await?,
-        ))
+        );
+        assert!(res.0.upper() != res.1.since() || res.0.upper().less_equal(&T::minimum()));
+        Ok(res)
     }
 
     /// [Self::open], but returning only a [ReadHandle].
