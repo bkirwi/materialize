@@ -1926,6 +1926,7 @@ mod persist_write_handles {
     use mz_persist_client::write::WriteHandle;
     use mz_persist_types::Codec64;
     use mz_repr::{Diff, GlobalId, TimestampManipulation};
+    use tracing::info;
     use tracing::Instrument;
 
     use crate::controller::StorageError;
@@ -2205,7 +2206,7 @@ mod persist_write_handles {
                                             if filtered.is_empty() {
                                                 Ok(())
                                             } else {
-                                                info!("Filtered uppers: {bad_ids} -> {filtered}");
+                                                info!("Filtered uppers: {bad_ids:?} -> {filtered:?}");
                                                 Err(StorageError::InvalidUppers(filtered))
                                             }
                                         }
