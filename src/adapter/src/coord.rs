@@ -470,13 +470,9 @@ impl<S: Append + 'static> Coordinator<S> {
         // This is disabled for the moment because it has unusual upper
         // advancement behavior.
         // See: https://materializeinc.slack.com/archives/C01CFKM1QRF/p1660726837927649
-        let status_collection_id = if false {
-            Some(self.catalog.resolve_builtin_storage_collection(
-                &crate::catalog::builtin::MZ_SOURCE_STATUS_HISTORY,
-            ))
-        } else {
-            None
-        };
+        let source_status_history_shard = self
+            .catalog
+            .resolve_builtin_storage_collection(&crate::catalog::builtin::MZ_SOURCE_STATUS_HISTORY);
 
         for entry in &entries {
             match entry.item() {
@@ -486,7 +482,7 @@ impl<S: Append + 'static> Coordinator<S> {
                 // using a single dataflow, we have to make sure the rebuild process re-runs
                 // the same multiple-build dataflow.
                 CatalogItem::Source(source) => {
-                    let data_source = match &source.data_source {
+                    let (data_source, status_collection_id) = match &source.data_source {
                         // Re-announce the source description.
                         DataSourceDesc::Ingestion(ingestion) => {
                             let mut source_imports = BTreeMap::new();
@@ -509,17 +505,20 @@ impl<S: Append + 'static> Coordinator<S> {
                                 source_exports.insert(subsource, export);
                             }
 
-                            DataSource::Ingestion(IngestionDescription {
-                                desc: ingestion.desc.clone(),
-                                ingestion_metadata: (),
-                                source_imports,
-                                source_exports,
-                                host_config: ingestion.host_config.clone(),
-                            })
+                            (
+                                DataSource::Ingestion(IngestionDescription {
+                                    desc: ingestion.desc.clone(),
+                                    ingestion_metadata: (),
+                                    source_imports,
+                                    source_exports,
+                                    host_config: ingestion.host_config.clone(),
+                                }),
+                                Some(source_status_history_shard),
+                            )
                         }
-                        DataSourceDesc::Source => DataSource::Other,
+                        DataSourceDesc::Source => (DataSource::Other, None),
                         DataSourceDesc::Introspection(introspection) => {
-                            DataSource::Introspection(*introspection)
+                            (DataSource::Introspection(*introspection), None)
                         }
                     };
 
