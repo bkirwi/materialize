@@ -2205,6 +2205,7 @@ mod persist_write_handles {
                                             if filtered.is_empty() {
                                                 Ok(())
                                             } else {
+                                                info!("Filtered uppers: {bad_ids} -> {filtered}");
                                                 Err(StorageError::InvalidUppers(filtered))
                                             }
                                         }
