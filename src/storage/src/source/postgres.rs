@@ -422,9 +422,9 @@ async fn postgres_replication_loop_inner(
                 );
             }
             Err(ReplicationError::Definite(e)) => {
-                return Err(SourceReaderError {
-                    inner: SourceErrorDetails::Initialization(e.to_string()),
-                })
+                return Err(SourceReaderError::Definite(
+                    SourceErrorDetails::Initialization(e.to_string()),
+                ))
             }
         }
     }
@@ -438,9 +438,9 @@ async fn postgres_replication_loop_inner(
                 )
             }
             Err(ReplicationError::Definite(e)) => {
-                return Err(SourceReaderError {
-                    inner: SourceErrorDetails::Other(e.to_string()),
-                })
+                return Err(SourceReaderError::Definite(SourceErrorDetails::Other(
+                    e.to_string(),
+                )));
             }
             Ok(_) => {
                 // shutdown initiated elsewhere

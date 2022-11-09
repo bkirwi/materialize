@@ -249,9 +249,9 @@ impl SourceReader for KinesisSourceReader {
                             {
                                 // todo@jldlaughlin: Will need track source offsets to grab a new iterator.
                                 error!("{}", err);
-                                return Err(SourceReaderError {
-                                    inner: SourceErrorDetails::Other(err.to_string()),
-                                });
+                                return Err(SourceReaderError::Definite(
+                                    SourceErrorDetails::Other(err.to_string()),
+                                ));
                             }
                             Err(SdkError::ServiceError { err, .. })
                                 if err.is_provisioned_throughput_exceeded_exception() =>
@@ -274,9 +274,9 @@ impl SourceReader for KinesisSourceReader {
                                 // - Unknown (raw HTTP provided)
                                 // - Blocking
                                 error!("{}", e);
-                                return Err(SourceReaderError {
-                                    inner: SourceErrorDetails::Other(e.to_string()),
-                                });
+                                return Err(SourceReaderError::Definite(
+                                    SourceErrorDetails::Other(e.to_string()),
+                                ));
                             }
                         };
 

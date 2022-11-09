@@ -324,8 +324,9 @@ pub struct DecodeResult {
 
 /// A structured error for `SourceReader::get_next_message` implementors.
 #[derive(Debug)]
-pub struct SourceReaderError {
-    pub inner: SourceErrorDetails,
+pub enum SourceReaderError {
+    Definite(SourceErrorDetails),
+    Indefinite(anyhow::Error),
 }
 
 impl SourceReaderError {
@@ -333,9 +334,7 @@ impl SourceReaderError {
     /// when the error is permanently fatal for the source... some critical invariant
     /// is violated or data is corrupted, for example.
     pub fn other_definite(e: anyhow::Error) -> SourceReaderError {
-        SourceReaderError {
-            inner: SourceErrorDetails::Other(format!("{}", e)),
-        }
+        SourceReaderError::Definite(SourceErrorDetails::Other(format!("{}", e)))
     }
 }
 

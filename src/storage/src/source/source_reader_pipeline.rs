@@ -710,9 +710,12 @@ where
 
                     let source_errors = source_errors
                         .into_iter()
-                        .map(|e| SourceError {
-                            source_id: id,
-                            error: e.inner,
+                        .filter_map(|e| match e {
+                            SourceReaderError::Definite(e) => Some(SourceError {
+                                source_id: id,
+                                error: e,
+                            }),
+                            SourceReaderError::Indefinite(_) => None,
                         })
                         .collect_vec();
 
