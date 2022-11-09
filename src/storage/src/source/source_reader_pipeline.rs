@@ -118,6 +118,10 @@ struct SourceMessageBatch<Key, Value, Diff> {
     /// be _definite_: re-running the source will produce the same error. If an error
     /// is added to this collection, the source will be permanently wedged.
     source_errors: Vec<SourceError>,
+    /// A transient error reported by the upstream source. This is used to signal that
+    /// the source is having difficulty making progress, though it may not be permanently
+    /// stuck: a network or authorization issue, for example.
+    transient_error: Option<String>,
     /// The current upper of the `SourceReader`, at the time this batch was
     /// emitted. Source uppers emitted via batches must never regress.
     source_upper: OffsetAntichain,
@@ -708,6 +712,15 @@ where
                             .map(|pid| (pid, MzOffset { offset: u64::MAX })),
                     );
 
+                    let transient_error = source_errors
+                        .iter()
+                        .filter_map(|e| match e {
+                            SourceReaderError::Indefinite(e) => Some(e),
+                            SourceReaderError::Definite(_) => None,
+                        })
+                        .last()
+                        .map(|e| e.to_string());
+
                     let source_errors = source_errors
                         .into_iter()
                         .filter_map(|e| match e {
@@ -730,6 +743,7 @@ where
                     let message_batch = SourceMessageBatch {
                         messages,
                         source_errors,
+                        transient_error,
                         source_upper: extended_source_upper,
                         batch_upper: batch_upper.clone(),
                         batch_lower,
@@ -787,16 +801,21 @@ where
                     let has_errors = batch.source_errors.first();
                     let has_messages = batch.messages.values().any(|vs| !vs.is_empty());
 
-                    let maybe_health = match (has_errors, has_messages) {
-                        (Some(error), _) => {
+                    let maybe_health = match (has_errors, &batch.transient_error, has_messages) {
+                        (Some(error), _, _) => {
                             // Arguably this case should be "failed", since generally a source
                             // cannot recover by the time an error reaches this far down the pipe.
                             // However, we don't actually shut down the source on error yet, so
                             // treating this as a possibly-temporary stall for now.
                             Some(HealthStatus::StalledWithError(error.error.to_string()))
                         }
-                        (_, true) => Some(HealthStatus::Running),
-                        (None, false) => None,
+                        (_, Some(message), _) => {
+                            // This is the transient error case, and is correctly represented as
+                            // a (temporary) stall.
+                            Some(HealthStatus::StalledWithError(message.clone()))
+                        }
+                        (_, _, true) => Some(HealthStatus::Running),
+                        (None, _, false) => None,
                     };
 
                     if let Some(health) = maybe_health {
