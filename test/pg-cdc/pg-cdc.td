@@ -612,5 +612,10 @@ INSERT INTO pk_table VALUES (99999);
 ! SELECT COUNT(*) = 0 FROM pk_table;
 regex:Source error: .*: db error: ERROR: publication "mz_source" does not exist
 
+> SELECT status, error ~* 'publication .+ does not exist'
+  FROM mz_internal.mz_source_status
+  WHERE name = 'mz_source'
+stalled true
+
 $ postgres-execute connection=postgres://postgres:postgres@postgres
 DROP SCHEMA conflict_schema CASCADE;
