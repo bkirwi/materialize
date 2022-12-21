@@ -32,6 +32,7 @@ use mz_persist_types::{Codec, Codec64, Opaque};
 use crate::critical::CriticalReaderId;
 use crate::error::{CodecMismatch, InvalidUsage};
 use crate::internal::compact::CompactReq;
+use crate::internal::gc::GarbageCollector;
 use crate::internal::maintenance::{LeaseExpiration, RoutineMaintenance, WriterMaintenance};
 use crate::internal::metrics::{
     CmdMetrics, Metrics, MetricsRetryStream, RetryMetrics, ShardMetrics,
@@ -1011,9 +1012,13 @@ where
     K: Debug + Codec,
     V: Debug + Codec,
     T: Timestamp + Lattice + Codec64,
-    D: Semigroup + Codec64,
+    D: Semigroup + Codec64 + Send + Sync,
 {
-    pub async fn start_reader_heartbeat_task(self, reader_id: LeasedReaderId) -> JoinHandle<()> {
+    pub async fn start_reader_heartbeat_task(
+        self,
+        reader_id: LeasedReaderId,
+        gc: GarbageCollector<K, V, T, D>,
+    ) -> JoinHandle<()> {
         let mut machine = self;
         spawn(|| "persist::heartbeat_read", async move {
             let sleep_duration = machine.cfg.reader_lease_duration / 2;
@@ -1032,9 +1037,10 @@ where
                 }
 
                 let before_heartbeat = Instant::now();
-                let (_seqno, existed, _maintenance) = machine
+                let (_seqno, existed, maintenance) = machine
                     .heartbeat_leased_reader(&reader_id, (machine.cfg.now)())
                     .await;
+                maintenance.start_performing(&machine, &gc);
 
                 let elapsed_since_heartbeat = before_heartbeat.elapsed();
                 if elapsed_since_heartbeat > Duration::from_secs(60) {
@@ -1053,7 +1059,11 @@ where
         })
     }
 
-    pub async fn start_writer_heartbeat_task(self, writer_id: WriterId) -> JoinHandle<()> {
+    pub async fn start_writer_heartbeat_task(
+        self,
+        writer_id: WriterId,
+        gc: GarbageCollector<K, V, T, D>,
+    ) -> JoinHandle<()> {
         let mut machine = self;
         spawn(|| "persist::heartbeat_write", async move {
             let sleep_duration = machine.cfg.writer_lease_duration / 4;
@@ -1072,9 +1082,10 @@ where
                 }
 
                 let before_heartbeat = Instant::now();
-                let (_seqno, existed, _maintenance) = machine
+                let (_seqno, existed, maintenance) = machine
                     .heartbeat_writer(&writer_id, (machine.cfg.now)())
                     .await;
+                maintenance.start_performing(&machine, &gc);
 
                 let elapsed_since_heartbeat = before_heartbeat.elapsed();
                 if elapsed_since_heartbeat > Duration::from_secs(60) {
