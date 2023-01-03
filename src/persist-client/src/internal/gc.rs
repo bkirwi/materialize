@@ -33,8 +33,7 @@ use crate::internal::paths::{BlobKey, PartialRollupKey, RollupId};
 use crate::metrics::Metrics;
 use crate::ShardId;
 
-#[derive(Debug, Clone)]
-#[cfg_attr(test, derive(PartialEq))]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GcReq {
     pub shard_id: ShardId,
     pub new_seqno_since: SeqNo,
