@@ -495,14 +495,14 @@ where
             cfg,
             metrics,
             machine: machine.clone(),
-            gc,
+            gc: gc.clone(),
             blob,
             reader_id: reader_id.clone(),
             since,
             last_heartbeat,
             explicitly_expired: false,
             leased_seqnos: BTreeMap::new(),
-            heartbeat_task: Some(machine.start_reader_heartbeat_task(reader_id).await),
+            heartbeat_task: Some(machine.start_reader_heartbeat_task(reader_id, gc).await),
         }
     }
 
@@ -724,7 +724,7 @@ where
         let new_reader_id = LeasedReaderId::new();
         let mut machine = self.machine.clone();
         let heartbeat_ts = (self.cfg.now)();
-        let reader_state = machine
+        let (reader_state, _maintenance) = machine
             .register_leased_reader(
                 &new_reader_id,
                 purpose,
@@ -823,7 +823,8 @@ where
     /// happens.
     #[instrument(level = "debug", skip_all, fields(shard = %self.machine.shard_id()))]
     pub async fn expire(mut self) {
-        self.machine.expire_leased_reader(&self.reader_id).await;
+        let (_, maintenance) = self.machine.expire_leased_reader(&self.reader_id).await;
+        maintenance.start_performing(&self.machine, &self.gc);
         self.explicitly_expired = true;
     }
 
@@ -926,6 +927,7 @@ where
             }
         };
         let mut machine = self.machine.clone();
+        let gc = self.gc.clone();
         let reader_id = self.reader_id.clone();
         // Spawn a best-effort task to expire this read handle. It's fine if
         // this doesn't run to completion, we'd just have to wait out the lease
@@ -936,7 +938,8 @@ where
         let _ = handle.spawn_named(
             || format!("ReadHandle::expire ({})", self.reader_id),
             async move {
-                machine.expire_leased_reader(&reader_id).await;
+                let (_, maintenance) = machine.expire_leased_reader(&reader_id).await;
+                maintenance.start_performing(&machine, &gc);
             }
             .instrument(expire_span),
         );
