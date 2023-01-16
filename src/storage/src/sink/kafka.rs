@@ -1074,6 +1074,8 @@ where
         )
         .await;
 
+        info!("Fetching latest progress record");
+
         let latest_ts = s.determine_latest_progress_record().await;
         let latest_ts = s.halt_on_err(latest_ts).await;
         info!(

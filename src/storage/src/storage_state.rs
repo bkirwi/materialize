@@ -21,6 +21,7 @@ use timely::worker::Worker as TimelyWorker;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
+use tracing::info;
 
 use mz_ore::halt;
 use mz_ore::now::NowFn;
@@ -326,6 +327,11 @@ impl<'w, A: Allocate> Worker<'w, A> {
                 }
             }
             StorageCommand::CreateSinks(exports) => {
+                info!(
+                    "Creating sinks: {:?}",
+                    exports.iter().map(|csc| csc.id).collect::<Vec<_>>()
+                );
+
                 for export in exports {
                     self.storage_state
                         .exports
