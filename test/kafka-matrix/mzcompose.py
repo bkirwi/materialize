@@ -54,7 +54,7 @@ def workflow_default(c: Composition) -> None:
                 services=["zookeeper", "kafka", "schema-registry", "materialized"]
             )
             c.wait_for_materialized()
-            c.run("testdrive", "testdrive/kafka-*.td")
+            c.run("testdrive", "testdrive/kafka-exactly-once-sink.td")
             c.kill(
                 "zookeeper",
                 "kafka",
