@@ -1100,6 +1100,30 @@ where
         Continue((work_ret, new_state))
     }
 
+    /// Expire all readers and writers up to the given walltime_ms.
+    pub fn expire_at(&mut self, walltime_ms: u64) -> ExpiryMetrics {
+        // //// Make sure walltime_ms is strictly increasing, in case clocks are offset.
+        // let walltime_ms = walltime_ms.max(self.walltime_ms + 1);
+        // self.walltime_ms = walltime_ms;
+
+        let mut metrics = ExpiryMetrics::default();
+        self.collections.leased_readers.retain(|_, v| {
+            let expiry_time = v.last_heartbeat_timestamp_ms + v.lease_duration_ms;
+            let retain = expiry_time >= walltime_ms;
+            if !retain {
+                metrics.readers_expired += 1;
+            }
+            retain
+        });
+        self.collections.writers.retain(|_, v| {
+            let expiry_time = v.last_heartbeat_timestamp_ms + v.lease_duration_ms;
+            let retain = expiry_time >= walltime_ms;
+            // We don't count writer expiries yet!
+            retain
+        });
+        metrics
+    }
+
     /// Returns the batches that contain updates up to (and including) the given `as_of`. The
     /// result `Vec` contains blob keys, along with a [`Description`] of what updates in the
     /// referenced parts are valid to read.
@@ -1188,6 +1212,11 @@ where
             None
         }
     }
+}
+
+#[derive(Default)]
+pub struct ExpiryMetrics {
+    pub(crate) readers_expired: usize,
 }
 
 /// Wrapper for Antichain that represents a Since
