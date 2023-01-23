@@ -17,7 +17,7 @@ use std::time::Duration;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
 use mz_ore::cast::CastFrom;
-use mz_ore::now::EpochMillis;
+
 use mz_persist::location::SeqNo;
 use mz_persist_types::{Codec, Codec64, Opaque};
 use semver::Version;
@@ -1176,31 +1176,6 @@ where
             }
         });
         ret
-    }
-
-    pub fn handles_needing_expiration(
-        &self,
-        now_ms: EpochMillis,
-    ) -> (Vec<LeasedReaderId>, Vec<WriterId>) {
-        let mut readers = Vec::new();
-        for (reader, state) in self.collections.leased_readers.iter() {
-            let time_since_last_heartbeat_ms =
-                now_ms.saturating_sub(state.last_heartbeat_timestamp_ms);
-            if time_since_last_heartbeat_ms > state.lease_duration_ms {
-                readers.push(reader.clone());
-            }
-        }
-        // critical_readers don't need forced expiration (in fact, that's the
-        // point)
-        let mut writers = Vec::new();
-        for (writer, state) in self.collections.writers.iter() {
-            let time_since_last_heartbeat_ms =
-                now_ms.saturating_sub(state.last_heartbeat_timestamp_ms);
-            if time_since_last_heartbeat_ms > state.lease_duration_ms {
-                writers.push(writer.clone());
-            }
-        }
-        (readers, writers)
     }
 
     pub fn need_rollup(&self) -> Option<SeqNo> {
