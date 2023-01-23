@@ -38,8 +38,8 @@ use crate::internal::metrics::{
 };
 use crate::internal::paths::{PartialRollupKey, RollupId};
 use crate::internal::state::{
-    CompareAndAppendBreak, CriticalReaderState, HollowBatch, IdempotencyToken,
-    LeasedReaderState, NoOpStateTransition, Since, State, StateCollections, Upper, WriterState,
+    CompareAndAppendBreak, CriticalReaderState, HollowBatch, IdempotencyToken, LeasedReaderState,
+    NoOpStateTransition, Since, State, StateCollections, Upper, WriterState,
 };
 use crate::internal::state_diff::StateDiff;
 use crate::internal::state_versions::StateVersions;

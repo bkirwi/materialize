@@ -23,6 +23,7 @@ use mz_persist_types::{Codec, Codec64, Opaque};
 use semver::Version;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::critical::CriticalReaderId;
@@ -1102,23 +1103,23 @@ where
 
     /// Expire all readers and writers up to the given walltime_ms.
     pub fn expire_at(&mut self, walltime_ms: u64) -> ExpiryMetrics {
-        // //// Make sure walltime_ms is strictly increasing, in case clocks are offset.
-        // let walltime_ms = walltime_ms.max(self.walltime_ms + 1);
-        // self.walltime_ms = walltime_ms;
-
         let mut metrics = ExpiryMetrics::default();
-        self.collections.leased_readers.retain(|_, v| {
+        let shard_id = self.shard_id();
+        self.collections.leased_readers.retain(|k, v| {
             let expiry_time = v.last_heartbeat_timestamp_ms + v.lease_duration_ms;
             let retain = expiry_time >= walltime_ms;
             if !retain {
+                info!("Force expiring reader ({k}) of shard ({shard_id}) due to inactivity");
                 metrics.readers_expired += 1;
             }
             retain
         });
-        self.collections.writers.retain(|_, v| {
+        self.collections.writers.retain(|k, v| {
             let expiry_time = v.last_heartbeat_timestamp_ms + v.lease_duration_ms;
             let retain = expiry_time >= walltime_ms;
-            // We don't count writer expiries yet!
+            if !retain {
+                info!("Force expiring writer ({k}) of shard ({shard_id}) due to inactivity");
+            }
             retain
         });
         metrics
