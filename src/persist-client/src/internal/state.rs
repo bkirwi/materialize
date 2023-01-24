@@ -1106,8 +1106,7 @@ where
         let mut metrics = ExpiryMetrics::default();
         let shard_id = self.shard_id();
         self.collections.leased_readers.retain(|k, v| {
-            let expiry_time = v.last_heartbeat_timestamp_ms + v.lease_duration_ms;
-            let retain = expiry_time >= walltime_ms;
+            let retain = v.last_heartbeat_timestamp_ms + v.lease_duration_ms >= walltime_ms;
             if !retain {
                 info!("Force expiring reader ({k}) of shard ({shard_id}) due to inactivity");
                 metrics.readers_expired += 1;
@@ -1115,8 +1114,7 @@ where
             retain
         });
         self.collections.writers.retain(|k, v| {
-            let expiry_time = v.last_heartbeat_timestamp_ms + v.lease_duration_ms;
-            let retain = expiry_time >= walltime_ms;
+            let retain = (v.last_heartbeat_timestamp_ms + v.lease_duration_ms) >= walltime_ms;
             if !retain {
                 info!("Force expiring writer ({k}) of shard ({shard_id}) due to inactivity");
             }
