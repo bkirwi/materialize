@@ -9,6 +9,8 @@
 
 //! A source that reads from an a persist shard.
 
+use differential_dataflow::operators::arrange::Arrange;
+use differential_dataflow::trace::implementations::ord::ColValSpine;
 use differential_dataflow::Collection;
 use std::any::Any;
 use std::rc::Rc;
@@ -203,7 +205,6 @@ where
                 work
             },
         );
-        let rows = Collection::new(rows).leave().inner;
-        (rows, token)
+        (Collection::new(rows).leave().inner, token)
     })
 }

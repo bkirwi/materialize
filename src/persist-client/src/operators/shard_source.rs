@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use differential_dataflow::difference::Semigroup;
-use differential_dataflow::lattice::Lattice;
+use differential_dataflow::lattice::{Lattice, Maximum};
 use differential_dataflow::operators::arrange::ShutdownButton;
 use differential_dataflow::trace::Description;
 use differential_dataflow::{Data, Hashable};
@@ -118,7 +118,10 @@ impl<K: Codec> Schema<RawKey<K>> for Raw<Arc<K::Schema>> {
 /// A timestamp based on the sort order of our data in Persist, intended for use as the
 /// inner timestamp of a Hybrid timestamp type.
 #[derive(PartialOrd, PartialEq, Ord, Eq, Debug, Clone, Serialize, Deserialize, Hash)]
-pub struct SortKey(Vec<u8>);
+pub enum SortKey {
+    Data(Vec<u8>),
+    Max,
+}
 
 impl PartialOrder for SortKey {
     fn less_equal(&self, other: &Self) -> bool {
@@ -128,11 +131,27 @@ impl PartialOrder for SortKey {
 
 impl TotalOrder for SortKey {}
 
+impl Lattice for SortKey {
+    fn join(&self, other: &Self) -> Self {
+        self.max(other).clone()
+    }
+
+    fn meet(&self, other: &Self) -> Self {
+        self.min(other).clone()
+    }
+}
+
 impl Timestamp for SortKey {
     type Summary = ();
 
     fn minimum() -> Self {
-        SortKey(Vec::new())
+        SortKey::Data(Vec::new())
+    }
+}
+
+impl Maximum for SortKey {
+    fn maximum() -> Self {
+        SortKey::Max
     }
 }
 
@@ -669,7 +688,7 @@ where
             let probably_in_order = desc.since() != &Antichain::from_elem(T::minimum());
             for ((raw_k, v), t, d) in fetched {
                 let (k, sort) = match raw_k {
-                    Ok(RawKey(k, bytes)) => (Ok(k), SortKey(bytes)),
+                    Ok(RawKey(k, bytes)) => (Ok(k), SortKey::Data(bytes)),
                     Err(e) => (Err(e), time.1.clone()),
                 };
 
