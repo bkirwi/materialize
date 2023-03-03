@@ -11,7 +11,7 @@
 
 use bytes::BufMut;
 use std::any::Any;
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::convert::Infallible;
@@ -23,6 +23,7 @@ use std::time::Instant;
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::arrange::ShutdownButton;
+use differential_dataflow::trace::Description;
 use differential_dataflow::{Data, Hashable};
 use futures::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -545,9 +546,11 @@ struct ActiveFetches<K, V, T: Timestamp, D> {
 
 enum PartState<K, V, T: Timestamp, D> {
     Pending {
+        desc: Description<T>,
         cap: Rc<InputCapability<Hybrid<T, SortKey>>>,
     },
     InProgress {
+        desc: Description<T>,
         cap: Capability<Hybrid<T, SortKey>>,
         fetched: FetchedPart<RawKey<K>, V, T, D>,
     },
@@ -556,11 +559,7 @@ enum PartState<K, V, T: Timestamp, D> {
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 struct ReadyPart<T> {
     /// The smallest timely timestamp we might emit for this part in the future.
-    time: T,
-    /// The number of tuples we've already emitted from this part.
-    /// In the future, we'd like to use some sort key for the data here, to make consolidation
-    /// more effective... but for now this at least means we won't keep fetching from the same part.
-    sort_key: Vec<u8>,
+    time: Hybrid<T, SortKey>,
     /// The id of the part. Used as a tiebreaker.
     id: usize,
 }
@@ -573,10 +572,16 @@ where
     D: Semigroup + Codec64 + Send + Sync,
 {
     /// Record the capability to be used for a new part file, and return an id for the part.
-    fn push_cap(&mut self, cap: Rc<InputCapability<Hybrid<T, SortKey>>>) -> usize {
+    fn push_cap(
+        &mut self,
+        desc: Description<T>,
+        cap: Rc<InputCapability<Hybrid<T, SortKey>>>,
+    ) -> usize {
         let id = self.next_part_id;
         self.next_part_id += 1;
-        let removed = self.incomplete_parts.insert(id, PartState::Pending { cap });
+        let removed = self
+            .incomplete_parts
+            .insert(id, PartState::Pending { desc, cap });
         assert!(removed.is_none(), "parts should be registered at most once");
         id
     }
@@ -599,16 +604,17 @@ where
                     PartState::InProgress { .. } => {
                         panic!("fetched the same part twice");
                     }
-                    PartState::Pending { cap } => {
+                    PartState::Pending { desc, cap } => {
                         with_cap(cap);
                         // TODO: delay based on the start time of the specific batch
-                        let cap = cap.delayed(cap.time());
-                        self.ready_parts.push(Reverse(ReadyPart {
-                            time: cap.time().0.clone(),
-                            sort_key: Vec::new(),
-                            id,
-                        }));
-                        PartState::InProgress { cap, fetched }
+                        let time = cap.time().clone();
+                        let cap = cap.delayed(&time);
+                        self.ready_parts.push(Reverse(ReadyPart { time, id }));
+                        PartState::InProgress {
+                            desc: desc.clone(),
+                            cap,
+                            fetched,
+                        }
                     }
                 };
                 entry.insert(updated);
@@ -651,39 +657,48 @@ where
     {
         let start_time = Instant::now();
         let mut work = 0;
-        'poll_loop: while let Some(Reverse(ReadyPart {
-            time,
-            mut sort_key,
-            id,
-        })) = self.ready_parts.pop()
-        {
+        'poll_loop: while let Some(Reverse(ReadyPart { mut time, id })) = self.ready_parts.pop() {
             let Entry::Occupied(mut entry) = self.incomplete_parts.entry(id) else {
                 continue;
             };
-            let PartState::InProgress { cap, fetched } = &mut entry.get_mut() else {
+            let PartState::InProgress { desc, cap, fetched } = &mut entry.get_mut() else {
                 continue;
             };
             let mut record_count = 0;
+            // Supposedly a good heuristic for "not a user batch", which should imply sorting.
+            let probably_in_order = desc.since() != &Antichain::from_elem(T::minimum());
             for ((raw_k, v), t, d) in fetched {
-                let k = raw_k.map(|RawKey(k, bytes)| {
-                    // TODO: this is not meaningful when the part is unsorted
-                    // If we want to provide hard guarantees with this approach, we'll either
-                    // need to sort all parts (either earlier or on fetch) or track which ones are
-                    // unsorted and ignore their keys.
-                    sort_key = bytes;
-                    k
-                });
+                let (k, sort) = match raw_k {
+                    Ok(RawKey(k, bytes)) => (Ok(k), SortKey(bytes)),
+                    Err(e) => (Err(e), time.1.clone()),
+                };
+
+                match time.1.cmp(&sort) {
+                    Ordering::Less => {
+                        time.1 = sort.clone();
+                        if probably_in_order {
+                            // Sort key increasing! We should never see anything smaller than this again
+                            // assuming data is sorted.
+                            cap.downgrade(&time);
+                        }
+                    }
+                    Ordering::Equal => {}
+                    Ordering::Greater => {
+                        if probably_in_order {
+                            panic!(
+                                "Seeing data in the part out of sort order! {:?} -> {:?} ({:?}",
+                                time.1, sort, desc
+                            );
+                        }
+                    }
+                }
+
                 record_count += 1;
-                work += emit_fn(
-                    buffer,
-                    cap,
-                    ((k, v), Hybrid(t, SortKey(sort_key.clone())), d),
-                );
+                work += emit_fn(buffer, cap, ((k, v), Hybrid(t, sort), d));
                 let should_return = yield_fn(start_time, work);
                 let should_continue = record_count >= TO_EMIT_AT_ONCE;
                 if should_return || should_continue {
-                    self.ready_parts
-                        .push(Reverse(ReadyPart { time, sort_key, id }));
+                    self.ready_parts.push(Reverse(ReadyPart { time, id }));
                     if should_return {
                         return;
                     } else {
@@ -805,12 +820,13 @@ where
 
                     for (_, part) in buffer.drain(..) {
                         let cap = Rc::clone(&cap);
-                        let part_id = active_fetches.push_cap(cap);
+                        let leased = fetcher.leased_part_from_exchangeable(part);
+
+                        let part_id = active_fetches.push_cap(leased.desc.clone(), cap);
 
                         let fetcher = &fetcher;
                         let semaphore = &semaphore;
                         parts_in_flight.push(async move {
-                            let leased = fetcher.leased_part_from_exchangeable(part);
                             let _permit = semaphore
                                 .acquire()
                                 .await
