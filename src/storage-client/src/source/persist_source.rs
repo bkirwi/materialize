@@ -205,6 +205,6 @@ where
                 work
             },
         );
-        (Collection::new(rows).leave().inner, token)
+        (Collection::new(rows).consolidate().leave().inner, token)
     })
 }
