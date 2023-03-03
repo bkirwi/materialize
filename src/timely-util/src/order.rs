@@ -560,7 +560,7 @@ pub mod hybrid {
     #[derive(
         Eq, PartialEq, Serialize, Deserialize, Hash, Debug, Copy, Clone, Ord, PartialOrd, Default,
     )]
-    pub struct Hybrid<A, B>(A, B);
+    pub struct Hybrid<A, B>(pub A, pub B);
 
     impl<A: PartialOrder, B: PartialOrder> PartialOrder for Hybrid<A, B> {
         #[inline]

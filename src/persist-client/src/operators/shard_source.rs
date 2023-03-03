@@ -26,13 +26,14 @@ use differential_dataflow::operators::arrange::ShutdownButton;
 use differential_dataflow::{Data, Hashable};
 use futures::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use serde::{Deserialize, Serialize};
 use timely::dataflow::channels::pact::{Exchange, Pipeline};
 use timely::dataflow::channels::pushers::Tee;
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
 use timely::dataflow::operators::{Capability, CapabilitySet, InputCapability};
 use timely::dataflow::{Scope, Stream};
 use timely::order::TotalOrder;
-use timely::progress::{Antichain, Timestamp};
+use timely::progress::{Antichain, PathSummary, Timestamp};
 use timely::PartialOrder;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::trace;
@@ -46,6 +47,7 @@ use mz_persist_types::part::{ColumnsMut, ColumnsRef};
 use mz_persist_types::{Codec, Codec64};
 use mz_timely_util::buffer::ConsolidateBuffer;
 use mz_timely_util::builder_async::{Event, OperatorBuilder as AsyncOperatorBuilder};
+use mz_timely_util::order::Hybrid;
 
 use crate::cache::PersistClientCache;
 use crate::fetch::{FetchedPart, LeasedBatchPart, SerdeLeasedBatchPart};
@@ -112,6 +114,37 @@ impl<K: Codec> Schema<RawKey<K>> for Raw<Arc<K::Schema>> {
     }
 }
 
+/// A timestamp based on the sort order of our data in Persist, intended for use as the
+/// inner timestamp of a Hybrid timestamp type.
+#[derive(PartialOrd, PartialEq, Ord, Eq, Debug, Clone, Serialize, Deserialize, Hash)]
+pub struct SortKey(Vec<u8>);
+
+impl PartialOrder for SortKey {
+    fn less_equal(&self, other: &Self) -> bool {
+        self <= other
+    }
+}
+
+impl TotalOrder for SortKey {}
+
+impl Timestamp for SortKey {
+    type Summary = ();
+
+    fn minimum() -> Self {
+        SortKey(Vec::new())
+    }
+}
+
+impl PathSummary<SortKey> for () {
+    fn results_in(&self, src: &SortKey) -> Option<SortKey> {
+        Some(src.clone())
+    }
+
+    fn followed_by(&self, (): &Self) -> Option<Self> {
+        Some(())
+    }
+}
+
 /// Creates a new source that reads from a persist shard, distributing the work
 /// of reading data to all timely workers.
 ///
@@ -134,14 +167,14 @@ impl<K: Codec> Schema<RawKey<K>> for Raw<Arc<K::Schema>> {
 /// using [`timely::dataflow::operators::generic::operator::empty`].
 ///
 /// [advanced by]: differential_dataflow::lattice::Lattice::advance_by
-pub fn shard_source<K, V, E, D, G>(
+pub fn shard_source<K, V, E, T, D, G>(
     scope: &G,
     name: &str,
     clients: Arc<PersistClientCache>,
     location: PersistLocation,
     shard_id: ShardId,
-    as_of: Option<Antichain<G::Timestamp>>,
-    until: Antichain<G::Timestamp>,
+    as_of: Option<Antichain<T>>,
+    until: Antichain<T>,
     flow_control: Option<FlowControl<G>>,
     key_schema: Arc<K::Schema>,
     val_schema: Arc<V::Schema>,
@@ -158,9 +191,9 @@ where
     V: Debug + Codec,
     E: Data,
     D: Semigroup + Codec64 + Send + Sync,
-    G: Scope,
+    G: Scope<Timestamp = Hybrid<T, SortKey>>,
     // TODO: Figure out how to get rid of the TotalOrder bound :(.
-    G::Timestamp: Timestamp + Lattice + Codec64 + TotalOrder,
+    T: Timestamp + Lattice + Codec64 + TotalOrder,
 {
     // WARNING! If emulating any of this code, you should read the doc string on
     // [`LeasedBatchPart`] and [`Subscribe`] or will likely run into intentional
@@ -188,7 +221,7 @@ where
     ) = mpsc::unbounded_channel();
 
     let chosen_worker = usize::cast_from(name.hashed()) % scope.peers();
-    let (descs, descs_shutdown) = shard_source_descs::<K, V, D, G>(
+    let (descs, descs_shutdown) = shard_source_descs::<K, V, T, D, G>(
         scope,
         name,
         Arc::clone(&clients),
@@ -224,14 +257,14 @@ pub struct FlowControl<G: Scope> {
     pub max_inflight_bytes: usize,
 }
 
-pub(crate) fn shard_source_descs<K, V, D, G>(
+pub(crate) fn shard_source_descs<K, V, T, D, G>(
     scope: &G,
     name: &str,
     clients: Arc<PersistClientCache>,
     location: PersistLocation,
     shard_id: ShardId,
-    as_of: Option<Antichain<G::Timestamp>>,
-    until: Antichain<G::Timestamp>,
+    as_of: Option<Antichain<T>>,
+    until: Antichain<T>,
     flow_control: Option<FlowControl<G>>,
     mut consumed_part_rx: mpsc::UnboundedReceiver<SerdeLeasedBatchPart>,
     chosen_worker: usize,
@@ -242,9 +275,9 @@ where
     K: Debug + Codec,
     V: Debug + Codec,
     D: Semigroup + Codec64 + Send + Sync,
-    G: Scope,
+    G: Scope<Timestamp = Hybrid<T, SortKey>>,
     // TODO: Figure out how to get rid of the TotalOrder bound :(.
-    G::Timestamp: Timestamp + Lattice + Codec64 + TotalOrder,
+    T: Timestamp + Lattice + Codec64 + TotalOrder,
 {
     let worker_index = scope.index();
     let num_workers = scope.peers();
@@ -267,7 +300,7 @@ where
             .await
             .expect("location should be valid");
         let read = client
-            .open_leased_reader::<K, V, G::Timestamp, D>(
+            .open_leased_reader::<K, V, T, D>(
                 shard_id,
                 &format!("shard_source({})", name_owned),
                 key_schema,
@@ -372,7 +405,7 @@ where
 
         let mut current_ts = timely::progress::Timestamp::minimum();
         let mut inflight_bytes = 0;
-        let mut inflight_parts: Vec<(Antichain<G::Timestamp>, usize)> = Vec::new();
+        let mut inflight_parts: Vec<(Antichain<T>, usize)> = Vec::new();
 
         let max_inflight_bytes = flow_control_bytes.unwrap_or(usize::MAX);
 
@@ -386,7 +419,7 @@ where
                         batch_parts.append(&mut parts);
                     }
                     Some(Ok(ListenEvent::Progress(progress))) => {
-                        let session_cap = cap_set.delayed(&current_ts);
+                        let session_cap = cap_set.delayed(&Hybrid(current_ts, SortKey::minimum()));
                         let mut descs_output = descs_output.activate();
                         let mut descs_session = descs_output.session(&session_cap);
 
@@ -425,7 +458,9 @@ where
                             );
                         }
 
-                        cap_set.downgrade(progress.iter());
+                        cap_set.downgrade(progress.iter().map(|t| {
+                            Hybrid(t.clone(), SortKey::minimum())
+                        }));
                         match progress.into_option() {
                             Some(ts) => {
                                 current_ts = ts;
@@ -466,6 +501,8 @@ where
                     Some(Event::Data(_, _)) => unreachable!("flow_control_input should not contain data"),
                     None => Antichain::new(),
                 };
+
+                let flow_control_upper = flow_control_upper.into_iter().map(|Hybrid(t, _)| t).collect();
 
                 let retired_parts = inflight_parts.drain_filter_swapping(|(upper, _size)| {
                     PartialOrder::less_equal(&*upper, &flow_control_upper)
@@ -508,10 +545,10 @@ struct ActiveFetches<K, V, T: Timestamp, D> {
 
 enum PartState<K, V, T: Timestamp, D> {
     Pending {
-        cap: Rc<InputCapability<T>>,
+        cap: Rc<InputCapability<Hybrid<T, SortKey>>>,
     },
     InProgress {
-        cap: Capability<T>,
+        cap: Capability<Hybrid<T, SortKey>>,
         fetched: FetchedPart<RawKey<K>, V, T, D>,
     },
 }
@@ -536,7 +573,7 @@ where
     D: Semigroup + Codec64 + Send + Sync,
 {
     /// Record the capability to be used for a new part file, and return an id for the part.
-    fn push_cap(&mut self, cap: Rc<InputCapability<T>>) -> usize {
+    fn push_cap(&mut self, cap: Rc<InputCapability<Hybrid<T, SortKey>>>) -> usize {
         let id = self.next_part_id;
         self.next_part_id += 1;
         let removed = self.incomplete_parts.insert(id, PartState::Pending { cap });
@@ -551,7 +588,7 @@ where
         &mut self,
         id: usize,
         fetched: FetchedPart<RawKey<K>, V, T, D>,
-        with_cap: impl FnOnce(&InputCapability<T>),
+        with_cap: impl FnOnce(&InputCapability<Hybrid<T, SortKey>>),
     ) {
         match self.incomplete_parts.entry(id) {
             Entry::Vacant(_) => {
@@ -567,7 +604,7 @@ where
                         // TODO: delay based on the start time of the specific batch
                         let cap = cap.delayed(cap.time());
                         self.ready_parts.push(Reverse(ReadyPart {
-                            time: cap.time().clone(),
+                            time: cap.time().0.clone(),
                             sort_key: Vec::new(),
                             id,
                         }));
@@ -588,12 +625,26 @@ where
     /// `yield_fn` whether more fuel is available.
     fn do_work<E>(
         &mut self,
-        buffer: &mut ConsolidateBuffer<T, E, D, Tee<T, (E, T, D)>>,
+        buffer: &mut ConsolidateBuffer<
+            Hybrid<T, SortKey>,
+            E,
+            D,
+            Tee<Hybrid<T, SortKey>, (E, Hybrid<T, SortKey>, D)>,
+        >,
         yield_fn: &impl Fn(Instant, usize) -> bool,
         emit_fn: &mut impl FnMut(
-            &mut ConsolidateBuffer<T, E, D, Tee<T, (E, T, D)>>,
-            &Capability<T>,
-            ((Result<K, String>, Result<V, String>), T, D),
+            &mut ConsolidateBuffer<
+                Hybrid<T, SortKey>,
+                E,
+                D,
+                Tee<Hybrid<T, SortKey>, (E, Hybrid<T, SortKey>, D)>,
+            >,
+            &Capability<Hybrid<T, SortKey>>,
+            (
+                (Result<K, String>, Result<V, String>),
+                Hybrid<T, SortKey>,
+                D,
+            ),
         ) -> usize,
     ) where
         E: Data,
@@ -623,7 +674,11 @@ where
                     k
                 });
                 record_count += 1;
-                work += emit_fn(buffer, cap, ((k, v), t, d));
+                work += emit_fn(
+                    buffer,
+                    cap,
+                    ((k, v), Hybrid(t, SortKey(sort_key.clone())), d),
+                );
                 let should_return = yield_fn(start_time, work);
                 let should_continue = record_count >= TO_EMIT_AT_ONCE;
                 if should_return || should_continue {
@@ -651,19 +706,27 @@ pub(crate) fn shard_source_fetch<K, V, E, T, D, G>(
     val_schema: Arc<V::Schema>,
     yield_fn: impl Fn(Instant, usize) -> bool + 'static,
     mut emit_fn: impl FnMut(
-            &mut ConsolidateBuffer<T, E, D, Tee<T, (E, T, D)>>,
-            &Capability<T>,
-            ((Result<K, String>, Result<V, String>), T, D),
+            &mut ConsolidateBuffer<
+                G::Timestamp,
+                E,
+                D,
+                Tee<Hybrid<T, SortKey>, (E, G::Timestamp, D)>,
+            >,
+            &Capability<G::Timestamp>,
+            ((Result<K, String>, Result<V, String>), G::Timestamp, D),
         ) -> usize
         + 'static,
-) -> (Stream<G, (E, T, D)>, Stream<G, SerdeLeasedBatchPart>)
+) -> (
+    Stream<G, (E, G::Timestamp, D)>,
+    Stream<G, SerdeLeasedBatchPart>,
+)
 where
     K: Debug + Codec,
     V: Debug + Codec,
     E: Data,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
-    G: Scope<Timestamp = T>,
+    G: Scope<Timestamp = Hybrid<T, SortKey>>,
 {
     let mut builder =
         AsyncOperatorBuilder::new(format!("shard_source_fetch({})", name), descs.scope());
@@ -708,7 +771,7 @@ where
         let semaphore = Semaphore::new(MAX_CONCURRENT_FETCHES);
         let mut parts_in_flight = FuturesUnordered::new();
 
-        let mut active_fetches = ActiveFetches {
+        let mut active_fetches: ActiveFetches<K, V, T, D> = ActiveFetches {
             next_part_id: 0,
             incomplete_parts: Default::default(),
             ready_parts: Default::default(),
@@ -716,7 +779,7 @@ where
 
         // Here to keep the select statement small and readable.
         enum FetchEvent<'a, K, V, T: Timestamp + Codec64, D, R> {
-            Input(Event<'a, T, R>),
+            Input(Event<'a, Hybrid<T, SortKey>, R>),
             Fetched(usize, LeasedBatchPart<T>, FetchedPart<RawKey<K>, V, T, D>),
             DoWork,
             Done,
@@ -793,14 +856,13 @@ where
     (fetched_stream, tokens_stream)
 }
 
-pub(crate) fn shard_source_tokens<T, G>(
+pub(crate) fn shard_source_tokens<G>(
     tokens: &Stream<G, SerdeLeasedBatchPart>,
     name: &str,
     consumed_part_tx: mpsc::UnboundedSender<SerdeLeasedBatchPart>,
     chosen_worker: usize,
 ) where
-    T: Timestamp + Lattice + Codec64,
-    G: Scope<Timestamp = T>,
+    G: Scope,
 {
     let worker_index = tokens.scope().index();
 

@@ -9,17 +9,18 @@
 
 //! A source that reads from an a persist shard.
 
+use differential_dataflow::Collection;
 use std::any::Any;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use mz_persist_client::operators::shard_source::shard_source;
+use mz_persist_client::operators::shard_source::{shard_source, SortKey};
 use mz_persist_types::codec_impls::UnitSchema;
 
-use timely::dataflow::operators::OkErr;
+use timely::dataflow::operators::{Enter, OkErr};
 use timely::dataflow::{Scope, Stream};
-use timely::progress::Antichain;
+use timely::progress::{Antichain, Timestamp as TimelyTimestamp};
 
 use mz_expr::MfpPlan;
 use mz_persist_client::cache::PersistClientCache;
@@ -31,6 +32,7 @@ use crate::types::errors::DataflowError;
 use crate::types::sources::SourceData;
 
 pub use mz_persist_client::operators::shard_source::FlowControl;
+use mz_timely_util::order::Hybrid;
 
 /// Creates a new source that reads from a persist shard, distributing the work
 /// of reading data to all timely workers.
@@ -55,7 +57,7 @@ pub use mz_persist_client::operators::shard_source::FlowControl;
 ///
 /// [advanced by]: differential_dataflow::lattice::Lattice::advance_by
 pub fn persist_source<G, YFn>(
-    scope: &G,
+    scope: &mut G,
     source_id: GlobalId,
     persist_clients: Arc<PersistClientCache>,
     metadata: CollectionMetadata,
@@ -99,7 +101,7 @@ where
 /// [advanced by]: differential_dataflow::lattice::Lattice::advance_by
 #[allow(clippy::needless_borrow)]
 pub fn persist_source_core<G, YFn>(
-    scope: &G,
+    scope: &mut G,
     source_id: GlobalId,
     persist_clients: Arc<PersistClientCache>,
     metadata: CollectionMetadata,
@@ -125,66 +127,83 @@ where
     // Extract the MFP if it exists; leave behind an identity MFP in that case.
     let map_filter_project = map_filter_project.map(|mfp| mfp.take());
 
-    let (rows, token) = shard_source(
-        scope,
-        &name,
-        persist_clients,
-        metadata.persist_location,
-        metadata.data_shard,
-        as_of,
-        until.clone(),
-        flow_control,
-        Arc::new(metadata.relation_desc),
-        Arc::new(UnitSchema),
-        yield_fn,
-        move |output, capability, ((key, val), time, diff)| {
-            let mut work = 0;
-            match (key, val) {
-                (Ok(SourceData(Ok(row))), Ok(())) => {
-                    if let Some(mfp) = &map_filter_project {
-                        let arena = mz_repr::RowArena::new();
-                        let mut datums_local = datum_vec.borrow_with(&row);
-                        for result in mfp.evaluate(
-                            &mut datums_local,
-                            &arena,
-                            time,
-                            diff,
-                            |time| !until.less_equal(time),
-                            &mut row_builder,
-                        ) {
-                            match result {
-                                Ok((row, time, diff)) => {
-                                    // Additional `until` filtering due to temporal filters.
-                                    if !until.less_equal(&time) {
-                                        output.give_at(capability, (Ok(row), time, diff));
-                                        work += 1;
+    scope.scoped("subtime", |scope| {
+        let (rows, token) = shard_source(
+            scope,
+            &name,
+            persist_clients,
+            metadata.persist_location,
+            metadata.data_shard,
+            as_of,
+            until.clone(),
+            flow_control.map(
+                |FlowControl {
+                     progress_stream,
+                     max_inflight_bytes,
+                 }| FlowControl {
+                    progress_stream: progress_stream.enter(scope),
+                    max_inflight_bytes,
+                },
+            ),
+            Arc::new(metadata.relation_desc),
+            Arc::new(UnitSchema),
+            yield_fn,
+            move |output, capability, ((key, val), time, diff)| {
+                let mut work = 0;
+                match (key, val) {
+                    (Ok(SourceData(Ok(row))), Ok(())) => {
+                        if let Some(mfp) = &map_filter_project {
+                            let arena = mz_repr::RowArena::new();
+                            let mut datums_local = datum_vec.borrow_with(&row);
+                            for result in mfp.evaluate(
+                                &mut datums_local,
+                                &arena,
+                                time.0,
+                                diff,
+                                |time| !until.less_equal(time),
+                                &mut row_builder,
+                            ) {
+                                match result {
+                                    Ok((row, time, diff)) => {
+                                        // Additional `until` filtering due to temporal filters.
+                                        if !until.less_equal(&time) {
+                                            output.give_at(
+                                                capability,
+                                                (Ok(row), Hybrid(time, SortKey::minimum()), diff),
+                                            );
+                                            work += 1;
+                                        }
                                     }
-                                }
-                                Err((err, time, diff)) => {
-                                    // Additional `until` filtering due to temporal filters.
-                                    if !until.less_equal(&time) {
-                                        output.give_at(capability, (Err(err), time, diff));
-                                        work += 1;
+                                    Err((err, time, diff)) => {
+                                        // Additional `until` filtering due to temporal filters.
+                                        if !until.less_equal(&time) {
+                                            output.give_at(
+                                                capability,
+                                                (Err(err), Hybrid(time, SortKey::minimum()), diff),
+                                            );
+                                            work += 1;
+                                        }
                                     }
                                 }
                             }
+                        } else {
+                            output.give_at(capability, (Ok(row), time, diff));
+                            work += 1;
                         }
-                    } else {
-                        output.give_at(capability, (Ok(row), time, diff));
+                    }
+                    (Ok(SourceData(Err(err))), Ok(())) => {
+                        output.give_at(capability, (Err(err), time, diff));
                         work += 1;
                     }
+                    // TODO(petrosagg): error handling
+                    (Err(_), Ok(_)) | (Ok(_), Err(_)) | (Err(_), Err(_)) => {
+                        panic!("decoding failed")
+                    }
                 }
-                (Ok(SourceData(Err(err))), Ok(())) => {
-                    output.give_at(capability, (Err(err), time, diff));
-                    work += 1;
-                }
-                // TODO(petrosagg): error handling
-                (Err(_), Ok(_)) | (Ok(_), Err(_)) | (Err(_), Err(_)) => {
-                    panic!("decoding failed")
-                }
-            }
-            work
-        },
-    );
-    (rows, token)
+                work
+            },
+        );
+        let rows = Collection::new(rows).leave().inner;
+        (rows, token)
+    })
 }
