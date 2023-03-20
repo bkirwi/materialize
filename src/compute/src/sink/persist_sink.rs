@@ -790,8 +790,8 @@ where
                         // We want to pass along the data directly if `to_append` is small, but to avoid
                         // having to iterate through everything twice we'll check if `correction`
                         // is small as a reasonable proxy.
-                        let minimum_batch_updates =
-                            persist_clients.cfg().sink_minimum_batch_updates();
+                        let minimum_batch_updates = 20_000;
+                        // persist_clients.cfg().sink_minimum_batch_updates();
                         let batch_or_data = if correction.len() >= minimum_batch_updates {
                             let batch = write
                                 .batch(
