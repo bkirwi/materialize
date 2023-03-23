@@ -408,7 +408,7 @@ where
 
             for (seqno, rollup) in state.collections.rollups.iter() {
                 let previous = rollup_holds.insert(rollup.key.clone(), *seqno);
-                if previous.is_none() && *seqno <= req.new_seqno_since {
+                if previous.is_none() {
                     // We've discovered a new rollup! It's safe to truncate up to here.
                     report_step_timing(&machine.applier.metrics.gc.steps.apply_diff_seconds);
                     truncate_range(
