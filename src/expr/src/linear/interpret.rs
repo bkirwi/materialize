@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
+use mz_repr::adt::datetime::DateTimeUnits;
 use mz_repr::{ColumnType, Datum, RelationType, Row, RowArena, ScalarType};
 
 use crate::{
@@ -45,6 +46,15 @@ fn unary_monotonic(func: &UnaryFunc) -> Monotonic {
         | CastUint64ToMzTimestamp(_)
         | CastTimestampToMzTimestamp(_)
         | CastTimestampTzToMzTimestamp(_) => Yes,
+        // Extracting the "most significant bits" of the a timestamp is monotonic.
+        ExtractTimestampTz(extract) => match extract.0 {
+            DateTimeUnits::Epoch
+            | DateTimeUnits::Millennium
+            | DateTimeUnits::Century
+            | DateTimeUnits::Decade
+            | DateTimeUnits::Year => Yes,
+            _ => No,
+        },
         // Negation is monotonically decreasing, but that's fine.
         NegInt64(_) | NegNumeric(_) | Not(_) => Yes,
         // Trivially monotonic, since all non-none values map to `false`.
