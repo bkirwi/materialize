@@ -346,10 +346,10 @@ mod impls {
 
     impl ColumnStats<Option<Vec<u8>>> for OptionStats<BytesStats> {
         fn lower<'a>(&'a self) -> Option<<Option<Vec<u8>> as Data>::Ref<'a>> {
-            Some(self.some.lower())
+            self.some.lower().map(Some)
         }
         fn upper<'a>(&'a self) -> Option<<Option<Vec<u8>> as Data>::Ref<'a>> {
-            Some(self.some.upper())
+            self.some.upper().map(Some)
         }
         fn none_count(&self) -> usize {
             self.none
@@ -411,27 +411,27 @@ mod impls {
         }
     }
 
+    const VARLEN_MAX_LEN: usize = 100;
+
     impl From<&BinaryArray<i32>> for PrimitiveStats<Vec<u8>> {
         fn from(value: &BinaryArray<i32>) -> Self {
             assert!(value.validity().is_none());
-            let lower = arrow2::compute::aggregate::min_binary(value)
-                .unwrap_or_default()
-                .to_owned();
-            let upper = arrow2::compute::aggregate::max_binary(value)
-                .unwrap_or_default()
-                .to_owned();
+            let lower = arrow2::compute::aggregate::min_binary(value).unwrap_or_default();
+            let lower = lower[..std::cmp::min(lower.len(), VARLEN_MAX_LEN)].to_owned();
+            let upper = arrow2::compute::aggregate::max_binary(value).unwrap_or_default();
+            // WIP this is a correctness error, we need to inc the last byte.
+            let upper = upper[..std::cmp::min(upper.len(), VARLEN_MAX_LEN)].to_owned();
             PrimitiveStats { lower, upper }
         }
     }
 
     impl From<&BinaryArray<i32>> for OptionStats<PrimitiveStats<Vec<u8>>> {
         fn from(value: &BinaryArray<i32>) -> Self {
-            let lower = arrow2::compute::aggregate::min_binary(value)
-                .unwrap_or_default()
-                .to_owned();
-            let upper = arrow2::compute::aggregate::max_binary(value)
-                .unwrap_or_default()
-                .to_owned();
+            let lower = arrow2::compute::aggregate::min_binary(value).unwrap_or_default();
+            let lower = lower[..std::cmp::min(lower.len(), VARLEN_MAX_LEN)].to_owned();
+            let upper = arrow2::compute::aggregate::max_binary(value).unwrap_or_default();
+            // WIP this is a correctness error, we need to inc the last byte.
+            let upper = upper[..std::cmp::min(upper.len(), VARLEN_MAX_LEN)].to_owned();
             let none = value.validity().map_or(0, |x| x.unset_bits());
             OptionStats {
                 none,
@@ -459,24 +459,22 @@ mod impls {
     impl From<&Utf8Array<i32>> for PrimitiveStats<String> {
         fn from(value: &Utf8Array<i32>) -> Self {
             assert!(value.validity().is_none());
-            let lower = arrow2::compute::aggregate::min_string(value)
-                .unwrap_or_default()
-                .to_owned();
-            let upper = arrow2::compute::aggregate::max_string(value)
-                .unwrap_or_default()
-                .to_owned();
+            let lower = arrow2::compute::aggregate::min_string(value).unwrap_or_default();
+            let lower = lower[..std::cmp::min(lower.len(), VARLEN_MAX_LEN)].to_owned();
+            let upper = arrow2::compute::aggregate::max_string(value).unwrap_or_default();
+            // WIP this is a correctness error, we need to inc the last byte.
+            let upper = upper[..std::cmp::min(upper.len(), VARLEN_MAX_LEN)].to_owned();
             PrimitiveStats { lower, upper }
         }
     }
 
     impl From<&Utf8Array<i32>> for OptionStats<PrimitiveStats<String>> {
         fn from(value: &Utf8Array<i32>) -> Self {
-            let lower = arrow2::compute::aggregate::min_string(value)
-                .unwrap_or_default()
-                .to_owned();
-            let upper = arrow2::compute::aggregate::max_string(value)
-                .unwrap_or_default()
-                .to_owned();
+            let lower = arrow2::compute::aggregate::min_string(value).unwrap_or_default();
+            let lower = lower[..std::cmp::min(lower.len(), VARLEN_MAX_LEN)].to_owned();
+            let upper = arrow2::compute::aggregate::max_string(value).unwrap_or_default();
+            // WIP this is a correctness error, we need to inc the last byte.
+            let upper = upper[..std::cmp::min(upper.len(), VARLEN_MAX_LEN)].to_owned();
             let none = value.validity().map_or(0, |x| x.unset_bits());
             OptionStats {
                 none,

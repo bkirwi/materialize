@@ -21,7 +21,6 @@ use mz_ore::now::SYSTEM_TIME;
 use mz_persist_client::cache::StateCache;
 use mz_persist_client::critical::SinceHandle;
 use mz_persist_client::metrics::Metrics;
-use mz_persist_types::codec_impls::TodoSchema;
 use timely::order::TotalOrder;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
@@ -40,6 +39,7 @@ use mz_persist_client::{PersistClient, ShardId};
 use crate::maelstrom::api::{Body, ErrorCode, MaelstromError, NodeId, ReqTxnOp, ResTxnOp};
 use crate::maelstrom::node::{Handle, Service};
 use crate::maelstrom::services::{CachingBlob, MaelstromBlob, MaelstromConsensus};
+use crate::maelstrom::txn::codec_impls::{MaelstromKeySchema, MaelstromValSchema};
 use crate::maelstrom::Args;
 use crate::BUILD_INFO;
 
@@ -140,8 +140,8 @@ impl Transactor {
             .open(
                 shard_id,
                 "maelstrom long-lived",
-                Arc::new(TodoSchema::<MaelstromKey>::default()),
-                Arc::new(TodoSchema::<MaelstromVal>::default()),
+                Arc::new(MaelstromKeySchema),
+                Arc::new(MaelstromValSchema),
             )
             .await?;
         // Use the CONTROLLER_CRITICAL_SINCE id for all nodes so we get coverage
@@ -270,8 +270,8 @@ impl Transactor {
                 .open_leased_reader(
                     self.shard_id,
                     "maelstrom short-lived",
-                    Arc::new(TodoSchema::<MaelstromKey>::default()),
-                    Arc::new(TodoSchema::<MaelstromVal>::default()),
+                    Arc::new(MaelstromKeySchema),
+                    Arc::new(MaelstromValSchema),
                 )
                 .await
                 .expect("codecs should match");
@@ -712,13 +712,17 @@ impl Service for TransactorService {
 }
 
 mod codec_impls {
-    use mz_persist_types::codec_impls::TodoSchema;
+    use mz_persist_types::columnar::{
+        ColumnGet, ColumnPush, Data, DataType, PartDecoder, PartEncoder, Schema,
+    };
+    use mz_persist_types::part::{ColumnsMut, ColumnsRef};
+    use mz_persist_types::stats::StatsFn;
     use mz_persist_types::Codec;
 
     use crate::maelstrom::txn::{MaelstromKey, MaelstromVal};
 
     impl Codec for MaelstromKey {
-        type Schema = TodoSchema<MaelstromKey>;
+        type Schema = MaelstromKeySchema;
 
         fn codec_name() -> String {
             "MaelstromKey".into()
@@ -739,8 +743,51 @@ mod codec_impls {
         }
     }
 
+    #[derive(Debug)]
+    pub struct MaelstromKeySchema;
+
+    #[derive(Debug)]
+    pub struct MaelstromKeyEncoder<'a>(&'a mut <u64 as Data>::Mut);
+
+    impl<'a> PartEncoder<'a, MaelstromKey> for MaelstromKeyEncoder<'a> {
+        fn encode(&mut self, val: &MaelstromKey) {
+            ColumnPush::<u64>::push(self.0, val.0)
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct MaelstromKeyDecoder<'a>(&'a <u64 as Data>::Col);
+
+    impl<'a> PartDecoder<'a, MaelstromKey> for MaelstromKeyDecoder<'a> {
+        fn decode(&self, idx: usize, val: &mut MaelstromKey) {
+            val.0 = ColumnGet::<u64>::get(self.0, idx)
+        }
+    }
+
+    impl Schema<MaelstromKey> for MaelstromKeySchema {
+        type Encoder<'a> = MaelstromKeyEncoder<'a>;
+
+        type Decoder<'a> = MaelstromKeyDecoder<'a>;
+
+        fn columns(&self) -> Vec<(String, DataType, StatsFn)> {
+            vec![("".into(), <u64 as Data>::TYPE, StatsFn::Default)]
+        }
+
+        fn decoder<'a>(&self, mut cols: ColumnsRef<'a>) -> Result<Self::Decoder<'a>, String> {
+            let ret = MaelstromKeyDecoder(cols.col::<u64>("")?);
+            let () = cols.finish()?;
+            Ok(ret)
+        }
+
+        fn encoder<'a>(&self, mut cols: ColumnsMut<'a>) -> Result<Self::Encoder<'a>, String> {
+            let ret = MaelstromKeyEncoder(cols.col::<u64>("")?);
+            let () = cols.finish()?;
+            Ok(ret)
+        }
+    }
+
     impl Codec for MaelstromVal {
-        type Schema = TodoSchema<MaelstromVal>;
+        type Schema = MaelstromValSchema;
 
         fn codec_name() -> String {
             "MaelstromVal".into()
@@ -758,6 +805,52 @@ mod codec_impls {
             Ok(MaelstromVal(
                 serde_json::from_slice(buf).map_err(|err| err.to_string())?,
             ))
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct MaelstromValSchema;
+
+    #[derive(Debug)]
+    pub struct MaelstromValEncoder<'a>(&'a mut <Vec<u8> as Data>::Mut);
+
+    impl<'a> PartEncoder<'a, MaelstromVal> for MaelstromValEncoder<'a> {
+        fn encode(&mut self, val: &MaelstromVal) {
+            let mut buf = Vec::new();
+            val.encode(&mut buf);
+            ColumnPush::<Vec<u8>>::push(self.0, &buf)
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct MaelstromValDecoder<'a>(&'a <Vec<u8> as Data>::Col);
+
+    impl<'a> PartDecoder<'a, MaelstromVal> for MaelstromValDecoder<'a> {
+        fn decode(&self, idx: usize, val: &mut MaelstromVal) {
+            *val = MaelstromVal::decode(ColumnGet::<Vec<u8>>::get(self.0, idx))
+                .expect("should be valid MaelstromVal")
+        }
+    }
+
+    impl Schema<MaelstromVal> for MaelstromValSchema {
+        type Encoder<'a> = MaelstromValEncoder<'a>;
+
+        type Decoder<'a> = MaelstromValDecoder<'a>;
+
+        fn columns(&self) -> Vec<(String, DataType, StatsFn)> {
+            vec![("".into(), <Vec<u8> as Data>::TYPE, StatsFn::Default)]
+        }
+
+        fn decoder<'a>(&self, mut cols: ColumnsRef<'a>) -> Result<Self::Decoder<'a>, String> {
+            let ret = MaelstromValDecoder(cols.col::<Vec<u8>>("")?);
+            let () = cols.finish()?;
+            Ok(ret)
+        }
+
+        fn encoder<'a>(&self, mut cols: ColumnsMut<'a>) -> Result<Self::Encoder<'a>, String> {
+            let ret = MaelstromValEncoder(cols.col::<Vec<u8>>("")?);
+            let () = cols.finish()?;
+            Ok(ret)
         }
     }
 }

@@ -2435,6 +2435,12 @@ impl RustType<ProtoTestScriptSourceConnection> for TestScriptSourceConnection {
 #[repr(transparent)]
 pub struct SourceData(pub Result<Row, DataflowError>);
 
+impl Default for SourceData {
+    fn default() -> Self {
+        SourceData(Ok(Row::default()))
+    }
+}
+
 impl Deref for SourceData {
     type Target = Result<Row, DataflowError>;
 
@@ -2529,7 +2535,11 @@ impl<'a> PartEncoder<'a, SourceData> for SourceDataEncoder<'a> {
 }
 
 pub(crate) const SOURCE_DATA_ERROR: &str = "mz_internal_super_secret_source_data_errors";
-fn fake_relation_desc(desc: &RelationDesc) -> RelationDesc {
+
+/// Returns a modified version of the given RelationDesc that accounts for the
+/// SourceData nullability hack. Exposed for PersistSourceDataStatsImpl, which
+/// maybe just wants to live here instead.
+pub fn fake_relation_desc(desc: &RelationDesc) -> RelationDesc {
     let names = desc.iter_names().cloned();
     let typs = desc.iter_types().map(|x| {
         // TODO(mfp): This makes them all nullable so we can set them all to

@@ -40,7 +40,7 @@ use tracing::error;
 
 use crate::controller::CollectionMetadata;
 use crate::types::errors::DataflowError;
-use crate::types::sources::{SourceData, SOURCE_DATA_ERROR};
+use crate::types::sources::{fake_relation_desc, SourceData, SOURCE_DATA_ERROR};
 
 pub use mz_persist_client::operators::shard_source::FlowControl;
 use mz_timely_util::buffer::ConsolidateBuffer;
@@ -131,6 +131,7 @@ where
 {
     let name = source_id.to_string();
     let desc = metadata.relation_desc.clone();
+    let fake_desc = fake_relation_desc(&desc);
     let filter_plan = map_filter_project.as_ref().map(|p| (*p).clone());
     let time_range = if let Some(lower) = as_of.as_ref().and_then(|a| a.as_option().copied()) {
         // If we have a lower bound, we can provide a bound on mz_now to our filter pushdown.
@@ -159,7 +160,10 @@ where
                 let mut ranges = ColumnSpecs::new(desc.typ().clone(), &arena);
                 // TODO: even better if we can use the lower bound of the part itself!
                 ranges.push_unmaterializable(UnmaterializableFunc::MzNow, time_range);
-                let stats = PersistSourceDataStatsImpl { desc: &desc, stats };
+                let stats = PersistSourceDataStatsImpl {
+                    desc: &fake_desc,
+                    stats,
+                };
                 let total_count = stats.len();
                 for (id, _) in desc.iter().enumerate() {
                     let min = stats.col_min(id, &arena);
@@ -433,15 +437,15 @@ impl PersistSourceDataStats for PersistSourceDataStatsImpl<'_> {
         impl<'a> DatumToPersistFn<Option<usize>> for ColNullCount<'a> {
             fn call<T: DatumToPersist>(self) -> Option<usize> {
                 let ColNullCount(stats) = self;
-                let stats = downcast_stats::<T::Data>(stats)?;
+                let stats = downcast_stats::<T::Data>(stats).expect("WIP");
                 Some(stats.none_count())
             }
         }
 
         let name = self.desc.get_name(idx);
         let typ = &self.desc.typ().column_types[idx];
-        let stats = self.stats.key.cols.get(name.as_str())?;
-        typ.to_persist(ColNullCount(stats.as_ref()))
+        let stats = self.stats.key.cols.get(name.as_str());
+        typ.to_persist(ColNullCount(stats?.as_ref()))
     }
 
     fn row_min(&self, _row: &mut Row) -> Option<usize> {
@@ -450,5 +454,146 @@ impl PersistSourceDataStats for PersistSourceDataStatsImpl<'_> {
 
     fn row_max(&self, _row: &mut Row) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mz_persist_client::stats::PartStats;
+    use mz_persist_types::codec_impls::UnitSchema;
+    use mz_persist_types::columnar::{PartEncoder, Schema};
+    use mz_persist_types::part::PartBuilder;
+    use mz_persist_types::stats::StructStats;
+    use mz_repr::stats::PersistSourceDataStats;
+    use mz_repr::{
+        Datum, DatumToPersist, DatumToPersistFn, RelationDesc, Row, RowArena, ScalarType,
+    };
+    use proptest::prelude::*;
+
+    use crate::source::persist_source::PersistSourceDataStatsImpl;
+    use crate::types::sources::{fake_relation_desc, SourceData};
+
+    proptest! {
+       #[test]
+       #[cfg_attr(miri, ignore)] // too slow
+        fn scalar_type_columnar_roundtrip(scalar_type in any::<ScalarType>() ) {
+            use mz_persist_types::parquet::validate_roundtrip;
+            let mut rows = Vec::new();
+            for datum in scalar_type.interesting_datums() {
+               rows.push(SourceData(Ok(Row::pack(std::iter::once(datum)))));
+            }
+
+            // Non-nullable version of the column.
+            let schema = RelationDesc::empty().with_column("col", scalar_type.clone().nullable(false));
+            for row in rows.iter() {
+                assert_eq!(validate_roundtrip(&schema, row), Ok(()));
+            }
+
+            // Nullable version of the column.
+            let schema = RelationDesc::empty().with_column("col", scalar_type.nullable(true));
+            rows.push(SourceData(Ok(Row::pack(std::iter::once(Datum::Null)))));
+            for row in rows.iter() {
+                assert_eq!(validate_roundtrip(&schema, row), Ok(()));
+            }
+        }
+    }
+
+    /// A helper for writing tests that validate stats collection.
+    pub fn validate_stats<T, S, F>(schema: &S, val: &T, validate: F) -> Result<(), String>
+    where
+        T: Default + PartialEq + std::fmt::Debug,
+        S: Schema<T>,
+        F: FnOnce(&PartStats) -> Result<(), String>,
+    {
+        let mut part = PartBuilder::new(schema, &UnitSchema);
+        {
+            let part_mut = part.get_mut();
+            schema.encoder(part_mut.key)?.encode(val);
+            part_mut.ts.push(1);
+            part_mut.diff.push(1);
+        }
+        let part = part.finish()?;
+
+        let mut key = StructStats {
+            len: part.len(),
+            cols: Default::default(),
+        };
+        let mut key_cols = part.key_ref();
+        for (name, _typ, stats_fn) in schema.columns() {
+            let col_stats = key_cols.stats(&name, stats_fn)?;
+            key.cols.insert(name, col_stats);
+        }
+        key_cols.finish()?;
+        let stats = PartStats { key };
+
+        validate(&stats)
+    }
+
+    struct VerifyStatsSome<'a>(PersistSourceDataStatsImpl<'a>, &'a RowArena, Datum<'a>);
+    impl<'a> DatumToPersistFn<()> for VerifyStatsSome<'a> {
+        fn call<T: DatumToPersist>(self) -> () {
+            let VerifyStatsSome(stats, arena, datum) = self;
+            if let Some(lower) = stats.col_min(0, arena) {
+                assert!(lower <= datum, "{} vs {} stats={:?}", lower, datum, stats);
+            }
+            if let Some(upper) = stats.col_max(0, arena) {
+                assert!(upper >= datum, "{} vs {}", upper, datum);
+            }
+            assert_eq!(stats.col_null_count(0), Some(0));
+        }
+    }
+
+    struct VerifyStatsNone<'a>(PersistSourceDataStatsImpl<'a>);
+    impl<'a> DatumToPersistFn<()> for VerifyStatsNone<'a> {
+        fn call<T: DatumToPersist>(self) -> () {
+            let VerifyStatsNone(stats) = self;
+            // assert!(stats.lower().is_none());
+            // assert!(stats.upper().is_none());
+            assert_eq!(stats.col_null_count(0), Some(1));
+        }
+    }
+
+    proptest! {
+       #[test]
+       #[cfg_attr(miri, ignore)] // too slow
+        fn scalar_type_stats_roundtrip(scalar_type in any::<ScalarType>() ) {
+            mz_ore::test::init_logging();
+            let arena = RowArena::default();
+
+            // Non-nullable version of the column.
+            let column_type = scalar_type.clone().nullable(false);
+            let schema = RelationDesc::empty().with_column("col", column_type.clone());
+            let fake_schema = fake_relation_desc(&schema);
+            for datum in scalar_type.interesting_datums() {
+                let row = SourceData(Ok(Row::pack(std::iter::once(datum))));
+                let res = validate_stats(&schema, &row, |stats| {
+                    let stats = PersistSourceDataStatsImpl{stats,desc: &fake_schema };
+                    column_type.to_persist(VerifyStatsSome(stats, &arena, datum));
+                    Ok(())
+                });
+                assert_eq!(res, Ok(()));
+             }
+
+            // Nullable version of the column.
+            let column_type = scalar_type.clone().nullable(true);
+            let schema = RelationDesc::empty().with_column("col", column_type.clone());
+            let fake_schema = fake_relation_desc(&schema);
+            for datum in scalar_type.interesting_datums() {
+                let row = SourceData(Ok(Row::pack(std::iter::once(datum))));
+                let res = validate_stats(&schema, &row, |stats| {
+                    let stats = PersistSourceDataStatsImpl{stats,desc: &fake_schema };
+                    column_type.to_persist(VerifyStatsSome(stats, &arena, datum));
+                    Ok(())
+                });
+                assert_eq!(res, Ok(()));
+            }
+            let row = SourceData(Ok(Row::pack(std::iter::once(Datum::Null))));
+            let res = validate_stats(&schema, &row, |stats| {
+                let stats = PersistSourceDataStatsImpl{stats,desc: &fake_schema };
+                column_type.to_persist(VerifyStatsNone(stats));
+                Ok(())
+            });
+            assert_eq!(res, Ok(()));
+        }
     }
 }
