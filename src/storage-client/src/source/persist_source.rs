@@ -29,7 +29,7 @@ use timely::dataflow::{Scope, Stream};
 use timely::progress::Antichain;
 use timely::scheduling::Activator;
 
-use mz_expr::{MfpPlan, MfpPushdown};
+use mz_expr::{ColumnSpecs, Interpreter, MfpPlan, ResultSpec, UnmaterializableFunc};
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::fetch::FetchedPart;
 use mz_repr::{
@@ -130,8 +130,18 @@ where
     YFn: Fn(Instant, usize) -> bool + 'static,
 {
     let name = source_id.to_string();
-    let mfp_pushdown = map_filter_project.as_ref().map(|x| MfpPushdown::new(*x));
     let desc = metadata.relation_desc.clone();
+    let filter_plan = map_filter_project.as_ref().map(|p| (*p).clone());
+    let time_range = if let Some(lower) = as_of.as_ref().and_then(|a| a.as_option().copied()) {
+        // If we have a lower bound, we can provide a bound on mz_now to our filter pushdown.
+        // Range is inclusive, so it's safe to use the maximum timestamp as the upper bound when
+        // `until ` is the empty antichain.
+        // TODO: continually narrow this as the frontier progresses.
+        let upper = until.as_option().copied().unwrap_or(Timestamp::MAX);
+        ResultSpec::value_between(Datum::MzTimestamp(lower), Datum::MzTimestamp(upper))
+    } else {
+        ResultSpec::anything()
+    };
     let (fetched, token) = shard_source(
         &mut scope.clone(),
         &name,
@@ -144,9 +154,42 @@ where
         Arc::new(metadata.relation_desc),
         Arc::new(UnitSchema),
         move |stats| {
-            mfp_pushdown.as_ref().map_or(true, |x| {
-                x.should_fetch(&PersistSourceDataStatsImpl { desc: &desc, stats })
-            })
+            if let Some(plan) = &filter_plan {
+                let arena = RowArena::new();
+                let mut ranges = ColumnSpecs::new(desc.typ().clone(), &arena);
+                // TODO: even better if we can use the lower bound of the part itself!
+                ranges.push_unmaterializable(UnmaterializableFunc::MzNow, time_range);
+                let stats = PersistSourceDataStatsImpl { desc: &desc, stats };
+                let total_count = stats.len();
+                for (id, _) in desc.iter().enumerate() {
+                    let min = stats.col_min(id, &arena);
+                    let max = stats.col_max(id, &arena);
+                    let nulls = stats.col_null_count(id);
+                    if let (Some(total_count), Some(min), Some(max), Some(nulls)) =
+                        (total_count, min, max, nulls)
+                    {
+                        let value_range = if nulls == total_count {
+                            ResultSpec::nothing()
+                        } else {
+                            ResultSpec::value_between(min, max)
+                        };
+                        let null_range = if nulls == 0 {
+                            ResultSpec::nothing()
+                        } else {
+                            ResultSpec::null()
+                        };
+                        let range = value_range.union(null_range);
+                        if nulls > 0 {
+                            assert!(range.may_contain(Datum::Null));
+                        }
+                        ranges.push_column(id, range);
+                    }
+                }
+                let result = ranges.eval_mfp_plan(plan).range;
+                result.may_contain(Datum::True) || result.may_fail()
+            } else {
+                true
+            }
         },
     );
     let rows = decode_and_mfp(&fetched, &name, until, map_filter_project, yield_fn);

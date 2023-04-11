@@ -100,6 +100,7 @@ pub use relation::canonicalize;
 pub use id::{Id, LocalId, PartitionId, SourceInstanceId};
 pub use id::{ProtoId, ProtoLocalId, ProtoPartitionId};
 pub use linear::{
+    interpret::{ColumnSpec, ColumnSpecs, Interpreter, ResultSpec, Trace},
     memoize_expr,
     plan::{MfpPlan, MfpPushdown, SafeMfpPlan},
     util::{join_permutations, permutation_for_arrangement},
