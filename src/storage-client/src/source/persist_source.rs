@@ -340,7 +340,10 @@ impl PendingWork {
                                 // Ideally we'd be able to include the part stats here, but that
                                 // would require us to exchange them around. It's unclear if that's
                                 // worth it for work that's already known to be unnecessary.
-                                panic!("persist filter pushdown correctness violation! {} {} val={:?} mfp={:?}", name, key, result, map_filter_project);
+                                panic!(
+                                    "persist filter pushdown correctness violation! {} {} row={:?} mfp={:?} stats={:?}",
+                                    name, key, row, map_filter_project, self.fetched_part.stats
+                                );
                             }
                             match result {
                                 Ok((row, time, diff)) => {

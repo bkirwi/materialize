@@ -19,14 +19,16 @@ use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
 use mz_ore::cast::CastFrom;
+use mz_persist::indexed::encoding::BlobTraceBatchPart;
+use mz_persist::location::{Blob, SeqNo};
+use mz_persist_types::stats::ProtoStructStats;
+use mz_persist_types::{Codec, Codec64};
+use mz_proto::ProtoType;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tracing::{debug_span, trace_span, Instrument};
-
-use mz_persist::indexed::encoding::BlobTraceBatchPart;
-use mz_persist::location::{Blob, SeqNo};
-use mz_persist_types::{Codec, Codec64};
 
 use crate::error::InvalidUsage;
 use crate::internal::encoding::Schemas;
@@ -222,6 +224,7 @@ where
         part: encoded_part,
         schemas,
         filter_pushdown_audit: part.filter_pushdown_audit.then(|| part.key.0.clone()),
+        stats: part.stats.clone(),
         _phantom: PhantomData,
     };
 
@@ -377,6 +380,10 @@ where
             leased_seqno: self.leased_seqno,
             reader_id: self.reader_id.clone(),
             filter_pushdown_audit: self.filter_pushdown_audit,
+            stats: self
+                .stats
+                .as_ref()
+                .map(|stats| ProtoStructStats::from_rust(&stats.key).encode_to_vec()),
         };
         // If `x` has a lease, we've effectively transferred it to `r`.
         let _ = self.leased_seqno.take();
@@ -433,6 +440,8 @@ pub struct FetchedPart<K: Codec, V: Codec, T, D> {
     part: EncodedPart<T>,
     schemas: Schemas<K, V>,
     filter_pushdown_audit: Option<String>,
+    /// TODO: remove this.
+    pub stats: Option<Arc<PartStats>>,
 
     _phantom: PhantomData<fn() -> (K, V, D)>,
 }
@@ -445,6 +454,7 @@ impl<K: Codec, V: Codec, T: Clone, D> Clone for FetchedPart<K, V, T, D> {
             part: self.part.clone(),
             schemas: self.schemas.clone(),
             filter_pushdown_audit: self.filter_pushdown_audit.clone(),
+            stats: self.stats.clone(),
             _phantom: self._phantom.clone(),
         }
     }
@@ -622,6 +632,7 @@ pub struct SerdeLeasedBatchPart {
     leased_seqno: Option<SeqNo>,
     reader_id: LeasedReaderId,
     filter_pushdown_audit: bool,
+    stats: Option<Vec<u8>>,
 }
 
 impl<T: Timestamp + Codec64> LeasedBatchPart<T> {
@@ -649,7 +660,14 @@ impl<T: Timestamp + Codec64> LeasedBatchPart<T> {
             // TODO(mfp): We don't need stats after the batch is Exchanged into
             // the fetch operator. This is unfortunately non-obvious, so perhaps
             // better would be to lift stats off LeasedBatchPart.
-            stats: None,
+            stats: x.stats.map(|s| {
+                Arc::new(PartStats {
+                    key: ProtoStructStats::decode(s.as_slice())
+                        .unwrap()
+                        .into_rust()
+                        .unwrap(),
+                })
+            }),
             leased_seqno: x.leased_seqno,
             reader_id: x.reader_id,
             filter_pushdown_audit: x.filter_pushdown_audit,
