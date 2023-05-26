@@ -479,7 +479,17 @@ impl ColumnarRecordsBuilder {
 
 #[cfg(test)]
 mod tests {
+    use arrow2::array::{Array, Int32Array, StructArray};
+    use arrow2::bitmap::Bitmap;
+    use arrow2::chunk::Chunk;
+    use arrow2::datatypes::{Field, Schema};
+    use arrow2::io::parquet::read;
+    use arrow2::io::parquet::write::{
+        transverse, CompressionOptions, Encoding, FileWriter, RowGroupIterator, Version,
+        WriteOptions,
+    };
     use mz_persist_types::Codec64;
+    use std::io::{Cursor, Write};
 
     use super::*;
 
@@ -511,5 +521,72 @@ mod tests {
             .map(|((k, v), t, d)| ((k.to_vec(), v.to_vec()), u64::decode(t), i64::decode(d)))
             .collect();
         assert_eq!(reads, updates);
+    }
+
+    #[test]
+    fn roundrips() {
+        // Four cases: present struct with present field, missing struct,
+        // valid struct with missing field, present field but missing struct (weird)
+        let ints = Int32Array::from(&[Some(1), None, None, Some(3)]);
+        let struct_validity = Bitmap::from(&[true, false, true, false]);
+
+        // Encode!
+        let structs = StructArray::new(
+            arrow2::datatypes::DataType::Struct(vec![Field::new(
+                "ints",
+                ints.data_type().clone(),
+                true,
+            )]),
+            vec![Box::new(ints)],
+            Some(struct_validity.clone()),
+        );
+        let schema = Schema::from(vec![Field::new("ints", structs.data_type().clone(), true)]);
+        let chunk = Chunk::new(vec![structs.boxed()]);
+
+        let options = WriteOptions {
+            write_statistics: true,
+            compression: CompressionOptions::Uncompressed,
+            version: Version::V2,
+            data_pagesize_limit: None,
+        };
+
+        let encodings = schema
+            .fields
+            .iter()
+            .map(|f| transverse(&f.data_type, |e| Encoding::Plain))
+            .collect();
+
+        let mut buffer = vec![];
+        let mut writer = FileWriter::try_new(&mut buffer, schema.clone(), options).unwrap();
+
+        for group in
+            RowGroupIterator::try_new([Ok(chunk.clone())].into_iter(), &schema, options, encodings)
+                .unwrap()
+        {
+            writer.write(group.unwrap()).unwrap();
+        }
+
+        let _ = writer.end(None);
+
+        // Decode!
+        let mut cursor = Cursor::new(buffer);
+        let metadata = read::read_metadata(&mut cursor).unwrap();
+
+        let schema = read::infer_schema(&metadata).unwrap();
+
+        let row_groups = metadata.row_groups;
+
+        let chunks = read::FileReader::new(
+            &mut cursor,
+            row_groups,
+            schema,
+            Some(1024 * 8 * 8),
+            None,
+            None,
+        );
+
+        let read_chunk = chunks.into_iter().next().unwrap().unwrap();
+
+        assert_eq!(chunk, read_chunk);
     }
 }
