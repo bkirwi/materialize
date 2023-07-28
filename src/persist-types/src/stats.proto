@@ -16,6 +16,9 @@ package mz_persist_types.stats;
 message ProtoStructStats {
     uint64 len = 1;
     map<string, ProtoDynStats> cols = 2;
+    // A lower bound on the serialized key, using the same representation
+    // as the serialized form. Only populated at the top level.
+    bytes lower_key = 3;
 }
 
 message ProtoDynStats {

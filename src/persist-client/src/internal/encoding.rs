@@ -11,6 +11,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::mem;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
@@ -1049,8 +1050,9 @@ pub struct LazyPartStats {
 
 impl LazyPartStats {
     pub fn encode(x: &PartStats, map_proto: impl FnOnce(&mut ProtoStructStats)) -> Self {
-        let PartStats { key } = x;
+        let PartStats { key, lower_key } = x;
         let mut proto_stats = ProtoStructStats::from_rust(key);
+        proto_stats.lower_key = lower_key.clone();
         map_proto(&mut proto_stats);
         LazyPartStats {
             key: LazyProto::from(&proto_stats),
@@ -1061,9 +1063,11 @@ impl LazyPartStats {
     /// This does not cache the returned value, it decodes each time it's
     /// called.
     pub fn decode(&self) -> PartStats {
-        let key = self.key.decode().expect("valid proto");
+        let mut key = self.key.decode().expect("valid proto");
+        let lower_key = mem::take(&mut key.lower_key);
         PartStats {
             key: key.into_rust().expect("valid stats"),
+            lower_key,
         }
     }
 }

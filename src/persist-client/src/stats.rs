@@ -15,6 +15,7 @@ use mz_persist_types::part::{Part, PartBuilder};
 use mz_persist_types::stats::StructStats;
 use mz_persist_types::Codec;
 use proptest_derive::Arbitrary;
+use serde::ser::SerializeStruct;
 use timely::progress::Antichain;
 
 use crate::internal::encoding::Schemas;
@@ -25,19 +26,27 @@ use crate::ShardId;
 pub struct PartStats {
     /// Aggregate statistics about key data contained in a [Part].
     pub key: StructStats,
+    /// A lower bound on the key data in its serialized form.
+    pub lower_key: Vec<u8>,
 }
 
 impl serde::Serialize for PartStats {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let PartStats { key } = self;
-        key.serialize(s)
+        let PartStats { key, lower_key } = self;
+        let mut s = s.serialize_struct("PartStats", 2)?;
+        s.serialize_field("key", key)?;
+        s.serialize_field("lower_key", &hex::encode(lower_key))?;
+        s.end()
     }
 }
 
 impl PartStats {
-    pub(crate) fn new(part: &Part) -> Result<Self, String> {
+    pub(crate) fn new(part: &Part, lower_key: &[u8]) -> Result<Self, String> {
         let key = part.key_stats()?;
-        Ok(PartStats { key })
+        Ok(PartStats {
+            key,
+            lower_key: lower_key.to_vec(),
+        })
     }
 
     pub(crate) fn legacy_part_format<K: Codec, V: Codec>(
@@ -51,8 +60,12 @@ impl PartStats {
         let mut builder = new_format.get_mut();
         let mut key = schemas.key.encoder(builder.key)?;
         let mut val = schemas.val.encoder(builder.val)?;
+        let mut lower_key = None;
         for x in part {
             for ((k, v), t, d) in x.iter() {
+                if lower_key == None {
+                    lower_key = Some(k);
+                }
                 let k = K::decode(k)?;
                 let v = V::decode(v)?;
                 key.encode(&k);
@@ -64,7 +77,7 @@ impl PartStats {
         drop(key);
         drop(val);
         let new_format = new_format.finish()?;
-        Self::new(&new_format)
+        Self::new(&new_format, lower_key.unwrap_or(&[]))
     }
 }
 

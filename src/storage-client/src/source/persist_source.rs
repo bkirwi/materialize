@@ -938,7 +938,10 @@ mod tests {
             let stats = part.key_stats()?;
 
             let stats = PersistSourceDataStats {
-                stats: &PartStats { key: stats },
+                stats: &PartStats {
+                    key: stats,
+                    lower_key: vec![],
+                },
                 desc: &schema,
             };
             let arena = RowArena::default();

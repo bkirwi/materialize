@@ -486,6 +486,8 @@ impl TrimStats for ProtoStructStats {
     fn trim(&mut self) {
         use proto_dyn_stats::*;
 
+        self.lower_key = truncate_bytes(&self.lower_key, TRUNCATE_LEN, TruncateBound::Lower)
+            .expect("Always true for a lower bound");
         for value in self.cols.values_mut() {
             match &mut value.kind {
                 Some(Kind::Primitive(stats)) => stats.trim(),
@@ -1111,6 +1113,7 @@ mod impls {
                     .iter()
                     .map(|(k, v)| (k.into_proto(), v.into_proto()))
                     .collect(),
+                lower_key: vec![],
             }
         }
 

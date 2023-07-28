@@ -1339,7 +1339,7 @@ fn serialize_part_stats<S: Serializer>(
     val: &Option<LazyPartStats>,
     s: S,
 ) -> Result<S::Ok, S::Error> {
-    let val = val.as_ref().map(|x| x.decode().key);
+    let val = val.as_ref().map(|x| x.decode());
     val.serialize(s)
 }
 
