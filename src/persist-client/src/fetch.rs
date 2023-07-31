@@ -9,6 +9,7 @@
 
 //! Fetching batches of data from persist's backing store
 
+use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use mz_ore::cast::CastFrom;
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Blob, SeqNo};
 use mz_persist_types::{Codec, Codec64};
+use mz_timely_util::order::Reverse;
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
@@ -611,7 +613,7 @@ where
 ///
 /// We avoid implementing copy to make it hard to accidentally duplicate a cursor. However,
 /// clone is very cheap.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Ord, PartialOrd, Eq, PartialEq)]
 pub(crate) struct Cursor {
     part_idx: usize,
     idx: usize,
@@ -662,6 +664,24 @@ impl Cursor {
             self.idx += 1;
         }
         update
+    }
+}
+
+struct PartIterator<'a, T: Timestamp> {
+    parts: &'a [EncodedPart<T>],
+    heap: BinaryHeap<Reverse<((&'a [u8], &'a [u8], T), usize, Cursor)>>,
+}
+
+impl<'a, T: Timestamp + Codec64> Iterator for PartIterator<'a, T> {
+    type Item = (&'a [u8], &'a [u8], T, [u8; 8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Reverse((_, index, mut cursor)) = self.heap.pop()?;
+        let popped = cursor.pop(&self.parts[index]);
+        if let Some((k, v, t, _)) = &popped {
+            self.heap.push(Reverse(((k, v, t.clone()), index, cursor)));
+        }
+        popped
     }
 }
 
