@@ -9,6 +9,7 @@
 
 //! Fetching batches of data from persist's backing store
 
+use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -35,7 +36,7 @@ use crate::internal::machine::retry_external;
 use crate::internal::metrics::{Metrics, ReadMetrics, ShardMetrics};
 use crate::internal::paths::PartialBatchKey;
 use crate::read::{LeasedReaderId, ReadHandle};
-use crate::ShardId;
+use crate::{metrics, ShardId};
 
 /// Capable of fetching [`LeasedBatchPart`] while not holding any capabilities.
 #[derive(Debug)]
@@ -667,21 +668,111 @@ impl Cursor {
     }
 }
 
-struct PartIterator<'a, T: Timestamp> {
-    parts: &'a [EncodedPart<T>],
-    heap: BinaryHeap<Reverse<((&'a [u8], &'a [u8], T), usize, Cursor)>>,
+#[derive(Debug)]
+struct PartRef<'a, T: Timestamp> {
+    next: Option<(&'a [u8], &'a [u8], T, [u8; 8])>,
+    index: usize,
+    ts_filter: FetchBatchFilter<T>,
+    cursor: Cursor,
+    part: &'a EncodedPart<T>,
 }
 
-impl<'a, T: Timestamp + Codec64> Iterator for PartIterator<'a, T> {
-    type Item = (&'a [u8], &'a [u8], T, [u8; 8]);
+impl<'a, T: Timestamp> PartialEq for PartRef<'a, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.sort_key() == other.sort_key()
+    }
+}
+
+impl<'a, T: Timestamp> Eq for PartRef<'a, T> {}
+
+impl<'a, T: Timestamp> PartialOrd for PartRef<'a, T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<'a, T: Timestamp> Ord for PartRef<'a, T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.sort_key().cmp(&other.sort_key()).reverse()
+    }
+}
+
+impl<'a, T: Timestamp> PartRef<'a, T> {
+    fn sort_key(&self) -> impl Ord + '_ {
+        (&self.next, self.index)
+    }
+}
+
+impl<'a, T: Timestamp + Codec64 + Lattice> PartRef<'a, T> {
+    fn new(index: usize, part: &'a EncodedPart<T>, ts_filter: FetchBatchFilter<T>) -> Self {
+        let cursor = Cursor::default();
+        let mut instance = Self {
+            next: None,
+            index,
+            ts_filter,
+            cursor,
+            part,
+        };
+        instance.shift();
+        instance
+    }
+    fn shift(&mut self) -> Option<(&'a [u8], &'a [u8], T, [u8; 8])> {
+        let ret = self.next.take();
+        self.next = loop {
+            let mut next = self.cursor.pop(self.part);
+            let ok = match &mut next {
+                None => true,
+                Some((_, _, time, _)) => self.ts_filter.filter_ts(time),
+            };
+            if ok {
+                break next;
+            }
+        };
+        ret
+    }
+}
+
+struct PartIterator<'a, K: Codec, V: Codec, T: Timestamp, D> {
+    metrics: Arc<Metrics>,
+    heap: BinaryHeap<PartRef<'a, T>>,
+    _phantom: PhantomData<fn() -> (K, V, D)>,
+}
+
+impl<'a, K, V, T, D> Iterator for PartIterator<'a, K, V, T, D>
+where
+    K: Codec,
+    V: Codec,
+    T: Timestamp + Codec64 + Lattice,
+    D: Codec64 + Semigroup,
+{
+    type Item = (Result<K, String>, Result<V, String>, T, D);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Reverse((_, index, mut cursor)) = self.heap.pop()?;
-        let popped = cursor.pop(&self.parts[index]);
-        if let Some((k, v, t, _)) = &popped {
-            self.heap.push(Reverse(((k, v, t.clone()), index, cursor)));
+        'retry: loop {
+            let (key, value, time, diff) = {
+                let mut part = self.heap.peek_mut()?;
+                part.shift()?
+            };
+            let mut diff = D::decode(diff);
+
+            loop {
+                let mut part = self.heap.peek_mut()?;
+
+                let (k, v, t, _) = part.next.as_ref()?;
+                // If the top of the heap has a larger k/v/t, return the existing one.
+                if (k, v, t) == (&key, &value, &time) {
+                    let (_, _, _, d) = part.shift()?;
+                    diff.plus_equals(&D::decode(d));
+                } else {
+                    if diff.is_zero() {
+                        continue 'retry;
+                    }
+                    let key = self.metrics.codecs.key.decode(|| K::decode(key));
+                    let value = self.metrics.codecs.val.decode(|| V::decode(value));
+                    return Some((key, value, time, diff));
+                }
+            }
         }
-        popped
     }
 }
 
