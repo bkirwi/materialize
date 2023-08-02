@@ -10,7 +10,8 @@
 //! Read capabilities and handles
 
 use std::backtrace::Backtrace;
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -35,8 +36,8 @@ use tracing::{debug, debug_span, instrument, trace_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::fetch::{
-    fetch_leased_part, BatchFetcher, FetchedPart, LeasedBatchPart, SerdeLeasedBatchPart,
-    SerdeLeasedBatchPartMetadata,
+    fetch_batch_part, fetch_leased_part, BatchFetcher, Cursor, EncodedPartIter, FetchedPart,
+    LeasedBatchPart, PartIterator, PartRef, SerdeLeasedBatchPart, SerdeLeasedBatchPartMetadata,
 };
 use crate::internal::encoding::Schemas;
 use crate::internal::machine::Machine;
@@ -1031,41 +1032,52 @@ where
     ) -> Result<Vec<((Result<K, String>, Result<V, String>), T, D)>, Since<T>> {
         let snap = self.snapshot(as_of).await?;
 
-        let mut contents = Vec::new();
-        let mut last_consolidate_len = 0;
-        let mut is_consolidated = true;
-        for part in snap {
-            let (part, fetched_part) = fetch_leased_part(
-                part,
-                self.blob.as_ref(),
-                Arc::clone(&self.metrics),
-                &self.metrics.read.snapshot,
-                &self.machine.applier.shard_metrics,
-                Some(&self.reader_id),
-                self.schemas.clone(),
-            )
-            .await;
-            self.process_returned_leased_part(part);
-            contents.extend(fetched_part);
-            // NB: FetchedPart streaming consolidates its output, but it's possible
-            // that decoding introduces duplicates again.
-            is_consolidated = false;
+        let Some(metadata) = snap.first().map(|lease| lease.metadata.clone()) else {
+            return Ok(vec![])
+        };
 
-            // If the size of contents has doubled since the last consolidated
-            // size, try consolidating it again.
-            if contents.len() >= last_consolidate_len * 2 {
-                consolidate_updates(&mut contents);
-                last_consolidate_len = contents.len();
-                is_consolidated = true
-            }
-        }
+        let blob = self.blob.as_ref();
+        let metrics = self.metrics.as_ref();
+        let shard_metrics = self.machine.applier.shard_metrics.as_ref();
+        let read_metrics = &self.metrics.read.snapshot;
+        let parts = futures::future::join_all({
+            // Concurrently fetch and return leases for parts
 
-        // Note that if there is only one part, it's consolidated in the loop
-        // above, and we don't consolidate it again here.
-        if !is_consolidated {
-            consolidate_updates(&mut contents);
-        }
-        Ok(contents)
+            // TODO: could be a shared ref...
+            snap.into_iter().map(|part| {
+                let mut lease_returner = self.lease_returner.clone();
+                async move {
+                    let fetched = fetch_batch_part(
+                        &part.shard_id,
+                        blob,
+                        metrics,
+                        shard_metrics,
+                        read_metrics,
+                        &part.key,
+                        &part.desc,
+                    )
+                    .await
+                    .expect("leased batch part to still exist");
+
+                    lease_returner.return_leased_part(part);
+                    fetched
+                }
+            })
+        })
+        .await;
+
+        let mut cursors = vec![Cursor::default(); parts.len()];
+
+        let iterators = parts
+            .iter()
+            .zip(cursors.iter_mut())
+            .map(|(p, c)| EncodedPartIter::new(p, c))
+            .collect::<Vec<_>>();
+
+        let contents: PartIterator<K, V, T, D> =
+            PartIterator::new(Arc::clone(&self.metrics), iterators, &metadata);
+
+        Ok(contents.collect())
     }
 }
 

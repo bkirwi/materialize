@@ -9,7 +9,7 @@
 
 //! Fetching batches of data from persist's backing store
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -24,17 +24,17 @@ use mz_ore::cast::CastFrom;
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Blob, SeqNo};
 use mz_persist_types::{Codec, Codec64};
-use mz_timely_util::order::Reverse;
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
+use tokio::task::JoinHandle;
 use tracing::{debug_span, trace_span, Instrument};
 
 use crate::error::InvalidUsage;
 use crate::internal::encoding::{LazyPartStats, Schemas};
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{Metrics, ReadMetrics, ShardMetrics};
-use crate::internal::paths::PartialBatchKey;
+use crate::internal::paths::{BlobKey, PartialBatchKey};
 use crate::read::{LeasedReaderId, ReadHandle};
 use crate::{metrics, ShardId};
 
@@ -132,6 +132,25 @@ enum FetchBatchFilter<T> {
 }
 
 impl<T: Timestamp + Lattice> FetchBatchFilter<T> {
+    fn new(meta: &SerdeLeasedBatchPartMetadata) -> Self
+    where
+        T: Codec64,
+    {
+        match &meta {
+            SerdeLeasedBatchPartMetadata::Snapshot { as_of } => {
+                let as_of =
+                    Antichain::from(as_of.iter().map(|x| T::decode(*x)).collect::<Vec<_>>());
+                FetchBatchFilter::Snapshot { as_of }
+            }
+            SerdeLeasedBatchPartMetadata::Listen { as_of, lower } => {
+                let as_of =
+                    Antichain::from(as_of.iter().map(|x| T::decode(*x)).collect::<Vec<_>>());
+                let lower =
+                    Antichain::from(lower.iter().map(|x| T::decode(*x)).collect::<Vec<_>>());
+                FetchBatchFilter::Listen { as_of, lower }
+            }
+        }
+    }
     fn filter_ts(&self, t: &mut T) -> bool {
         match self {
             FetchBatchFilter::Snapshot { as_of } => {
@@ -183,17 +202,7 @@ where
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
-    let ts_filter = match &part.metadata {
-        SerdeLeasedBatchPartMetadata::Snapshot { as_of } => {
-            let as_of = Antichain::from(as_of.iter().map(|x| T::decode(*x)).collect::<Vec<_>>());
-            FetchBatchFilter::Snapshot { as_of }
-        }
-        SerdeLeasedBatchPartMetadata::Listen { as_of, lower } => {
-            let as_of = Antichain::from(as_of.iter().map(|x| T::decode(*x)).collect::<Vec<_>>());
-            let lower = Antichain::from(lower.iter().map(|x| T::decode(*x)).collect::<Vec<_>>());
-            FetchBatchFilter::Listen { as_of, lower }
-        }
-    };
+    let ts_filter = FetchBatchFilter::new(&part.metadata);
 
     let encoded_part = fetch_batch_part(
         &part.shard_id,
@@ -668,76 +677,96 @@ impl Cursor {
     }
 }
 
-#[derive(Debug)]
-struct PartRef<'a, T: Timestamp> {
-    next: Option<(&'a [u8], &'a [u8], T, [u8; 8])>,
-    index: usize,
-    ts_filter: FetchBatchFilter<T>,
-    cursor: Cursor,
+type Raw<'a, T> = (&'a [u8], &'a [u8], T, [u8; 8]);
+
+pub(crate) struct EncodedPartIter<'a, T: Timestamp> {
     part: &'a EncodedPart<T>,
+    // Invariant: this cursor always points at exactly the next record that would be
+    // returned by peek, if any.
+    cursor: &'a mut Cursor,
+    next: Option<Raw<'a, T>>,
 }
 
-impl<'a, T: Timestamp> PartialEq for PartRef<'a, T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.sort_key() == other.sort_key()
+impl<'a, T: Timestamp + Codec64> EncodedPartIter<'a, T> {
+    pub(crate) fn new(part: &'a EncodedPart<T>, cursor: &'a mut Cursor) -> Self {
+        let next = cursor.peek(part);
+        Self { part, cursor, next }
+    }
+
+    pub(crate) fn peek(&self) -> Option<Raw<'a, T>> {
+        self.next.clone() // NB: cheap!
     }
 }
 
-impl<'a, T: Timestamp> Eq for PartRef<'a, T> {}
+impl<'a, T: Timestamp + Codec64> Iterator for EncodedPartIter<'a, T> {
+    type Item = Raw<'a, T>;
 
-impl<'a, T: Timestamp> PartialOrd for PartRef<'a, T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+    fn next(&mut self) -> Option<Self::Item> {
+        let out = self.next.take();
+        self.cursor.idx += 1;
+        self.next = self.cursor.peek(self.part);
+        out
     }
 }
 
-impl<'a, T: Timestamp> Ord for PartRef<'a, T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.sort_key().cmp(&other.sort_key()).reverse()
-    }
-}
-
-impl<'a, T: Timestamp> PartRef<'a, T> {
-    fn sort_key(&self) -> impl Ord + '_ {
-        (&self.next, self.index)
-    }
+/// This is used as a max-heap entry. Thus, from largest to smallest, we want:
+/// - Structs with peek: Some(_) should sort larger than structs with peek: None.
+/// - For two structs that both have a present peek value, the _smaller_ of the two should sort larger.
+/// Otherwise the order is arbitrary but consistent.
+#[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
+pub(crate) struct PartRef<'a, T: Timestamp> {
+    pub(crate) peek: Option<Reverse<Raw<'a, T>>>,
+    pub(crate) index: usize,
 }
 
 impl<'a, T: Timestamp + Codec64 + Lattice> PartRef<'a, T> {
-    fn new(index: usize, part: &'a EncodedPart<T>, ts_filter: FetchBatchFilter<T>) -> Self {
-        let cursor = Cursor::default();
-        let mut instance = Self {
-            next: None,
-            index,
-            ts_filter,
-            cursor,
-            part,
-        };
-        instance.shift();
-        instance
-    }
-    fn shift(&mut self) -> Option<(&'a [u8], &'a [u8], T, [u8; 8])> {
-        let ret = self.next.take();
-        self.next = loop {
-            let mut next = self.cursor.pop(self.part);
-            let ok = match &mut next {
-                None => true,
-                Some((_, _, time, _)) => self.ts_filter.filter_ts(time),
-            };
-            if ok {
-                break next;
-            }
-        };
-        ret
+    fn pop(&mut self, from: &mut [EncodedPartIter<'a, T>]) -> Option<Raw<'a, T>> {
+        let iter = &mut from[self.index];
+        let popped = iter.next();
+        self.peek = iter.peek().map(|r| Reverse(r));
+        popped
     }
 }
 
-struct PartIterator<'a, K: Codec, V: Codec, T: Timestamp, D> {
+pub(crate) struct PartIterator<'a, K: Codec, V: Codec, T: Timestamp, D> {
     metrics: Arc<Metrics>,
+    parts: Vec<EncodedPartIter<'a, T>>,
     heap: BinaryHeap<PartRef<'a, T>>,
+    filter_ts: FetchBatchFilter<T>,
     _phantom: PhantomData<fn() -> (K, V, D)>,
 }
 
+impl<'a, K, V, T, D> PartIterator<'a, K, V, T, D>
+where
+    K: Codec,
+    V: Codec,
+    T: Timestamp + Codec64 + Lattice,
+    D: Codec64 + Semigroup,
+{
+    pub fn new(
+        metrics: Arc<Metrics>,
+        parts: Vec<EncodedPartIter<'a, T>>,
+        meta: &SerdeLeasedBatchPartMetadata,
+    ) -> Self {
+        let heap = parts
+            .iter()
+            .enumerate()
+            .map(|(i, e)| PartRef {
+                peek: e.peek().clone().map(Reverse),
+                index: i,
+            })
+            .collect::<BinaryHeap<_>>();
+        let filter_ts = FetchBatchFilter::new(meta);
+
+        Self {
+            metrics,
+            parts,
+            heap,
+            filter_ts,
+            _phantom: Default::default(),
+        }
+    }
+}
 impl<'a, K, V, T, D> Iterator for PartIterator<'a, K, V, T, D>
 where
     K: Codec,
@@ -745,23 +774,32 @@ where
     T: Timestamp + Codec64 + Lattice,
     D: Codec64 + Semigroup,
 {
-    type Item = (Result<K, String>, Result<V, String>, T, D);
+    type Item = ((Result<K, String>, Result<V, String>), T, D);
 
     fn next(&mut self) -> Option<Self::Item> {
         'retry: loop {
-            let (key, value, time, diff) = {
+            let (key, value, mut time, diff) = {
                 let mut part = self.heap.peek_mut()?;
-                part.shift()?
+                part.pop(&mut self.parts)?
             };
+            if !self.filter_ts.filter_ts(&mut time) {
+                continue 'retry;
+            }
+
             let mut diff = D::decode(diff);
 
-            loop {
+            'consolidate: loop {
                 let mut part = self.heap.peek_mut()?;
 
-                let (k, v, t, _) = part.next.as_ref()?;
+                let Reverse((k, v, t, _)) = part.peek.as_ref()?;
+                let mut t = t.clone();
+                if !self.filter_ts.filter_ts(&mut t) {
+                    continue 'consolidate;
+                }
+
                 // If the top of the heap has a larger k/v/t, return the existing one.
-                if (k, v, t) == (&key, &value, &time) {
-                    let (_, _, _, d) = part.shift()?;
+                if (k, v, &t) == (&key, &value, &time) {
+                    let (_, _, _, d) = part.pop(&mut self.parts)?;
                     diff.plus_equals(&D::decode(d));
                 } else {
                     if diff.is_zero() {
@@ -769,11 +807,16 @@ where
                     }
                     let key = self.metrics.codecs.key.decode(|| K::decode(key));
                     let value = self.metrics.codecs.val.decode(|| V::decode(value));
-                    return Some((key, value, time, diff));
+                    return Some(((key, value), time, diff));
                 }
             }
         }
     }
+}
+
+struct FetchedParts<T: Timestamp> {
+    parts: EncodedPart<T>,
+    ts_filter: FetchBatchFilter<T>,
 }
 
 /// This represents the serde encoding for [`LeasedBatchPart`]. We expose the struct
