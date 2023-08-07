@@ -549,7 +549,7 @@ where
             self.cfg.build_version.clone(),
             Antichain::from_elem(T::minimum()),
             None,
-            false,
+            true,
         );
         BatchBuilder {
             builder,
