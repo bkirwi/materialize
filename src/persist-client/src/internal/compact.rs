@@ -789,13 +789,18 @@ where
                     let start = Instant::now();
                     let mut updates_decoded = 0;
                     let mut cursor = Cursor::default();
-                    while let Some((k, v, mut t, d)) = cursor.pop(&part) {
-                        t.advance_by(desc.since().borrow());
-                        let d = D::decode(d);
-                        let k = k.to_vec();
-                        let v = v.to_vec();
+                    while let Some((k1, v1, mut t1, d1)) = cursor.pop(&part) {
+                        t1.advance_by(desc.since().borrow());
+                        assert!(
+                            (k.as_slice(), v.as_slice()) <= (k1, v1),
+                            "key-values in a part should be larger the previous part ({shard_id} run {index} index {})",
+                            remaining_updates_by_run[index],
+                        );
+                        let d = D::decode(d1);
+                        let k = k1.to_vec();
+                        let v = v1.to_vec();
                         // default heap ordering is descending
-                        sorted_updates.push(Reverse((((k, v), t, d), index)));
+                        sorted_updates.push(Reverse((((k, v), t1, d), index)));
                         remaining_updates_by_run[index] += 1;
 
                         updates_decoded += 1;
