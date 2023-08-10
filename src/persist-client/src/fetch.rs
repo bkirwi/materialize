@@ -23,6 +23,7 @@ use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Blob, SeqNo};
 use mz_persist_types::{Codec, Codec64};
 use serde::{Deserialize, Serialize};
+use timely::progress::frontier::AntichainRef;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tracing::{debug_span, trace_span, Instrument};
@@ -505,6 +506,9 @@ where
             while let Some((k_next, v_next, mut t_next, d_next)) = self.part_cursor.peek(&self.part)
             {
                 if (k, v) != (k_next, v_next) {
+                    if !self.part.is_user_batch() && (k, v) > (k_next, v_next) {
+                        panic!("logic error: detected out-of-order KVs in non-user part file!")
+                    }
                     break;
                 }
 
@@ -602,6 +606,10 @@ where
             part: Arc::new(part),
             needs_truncation,
         }
+    }
+
+    pub(crate) fn is_user_batch(&self) -> bool {
+        self.part.desc.since().borrow() == AntichainRef::new(&[T::minimum()])
     }
 }
 
