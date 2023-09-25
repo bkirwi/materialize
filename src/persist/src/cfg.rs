@@ -18,7 +18,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::file::{FileBlob, FileBlobConfig};
-use crate::location::{Blob, Consensus, ExternalError};
+use crate::location::{Blob, Consensus, ExternalError, Tasked};
 use crate::mem::{MemBlob, MemBlobConfig, MemConsensus};
 use crate::metrics::{PostgresConsensusMetrics, S3BlobMetrics};
 use crate::postgres::{PostgresConsensus, PostgresConsensusConfig};
@@ -165,9 +165,9 @@ impl ConsensusConfig {
     /// Opens the associated implementation of [Consensus].
     pub async fn open(self) -> Result<Arc<dyn Consensus + Send + Sync>, ExternalError> {
         match self {
-            ConsensusConfig::Postgres(config) => {
-                Ok(Arc::new(PostgresConsensus::open(config).await?))
-            }
+            ConsensusConfig::Postgres(config) => Ok(Arc::new(Tasked(Arc::new(
+                PostgresConsensus::open(config).await?,
+            )))),
             ConsensusConfig::Mem => Ok(Arc::new(MemConsensus::default())),
         }
     }
