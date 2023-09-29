@@ -426,17 +426,6 @@ where
                     }
                     return Ok(Ok((seqno, writer_maintenance)));
                 }
-                Err(CompareAndAppendBreak::AlreadyCommitted) => {
-                    // A previous iteration through this loop got an
-                    // Indeterminate error but was successful. Sanity check this
-                    // and pass along the good news.
-                    assert!(indeterminate.is_some());
-                    self.applier.metrics.cmds.compare_and_append_noop.inc();
-                    if !writer_was_present {
-                        metrics.state.writer_added.inc();
-                    }
-                    return Ok(Ok((seqno, WriterMaintenance::default())));
-                }
                 Err(CompareAndAppendBreak::InvalidUsage(err)) => {
                     // InvalidUsage is (or should be) a deterministic function
                     // of the inputs and independent of anything in persist
