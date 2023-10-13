@@ -142,6 +142,7 @@ pub mod operators {
 }
 pub mod iter;
 pub mod read;
+pub mod restore;
 pub mod rpc;
 pub mod stats;
 pub mod usage;
