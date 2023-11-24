@@ -30,6 +30,7 @@ use mz_storage_client::controller::{IntrospectionType, ReadPolicy, StorageContro
 use thiserror::Error;
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
 use timely::PartialOrder;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::controller::error::CollectionMissing;
@@ -908,7 +909,14 @@ where
         // Install a compaction hold on `id` at `timestamp`.
         let mut updates = BTreeMap::new();
         updates.insert(id, ChangeBatch::new_from(timestamp.clone(), 1));
-        self.update_read_capabilities(&mut updates);
+        match &peek_target {
+            PeekTarget::Index => self.update_read_capabilities(&mut updates),
+            PeekTarget::Persist { .. } => {
+                info!("installing persist peek hold: {since:?} <= {timestamp:?}");
+                self.storage_controller
+                    .update_read_capabilities(&mut updates)
+            }
+        };
 
         let otel_ctx = OpenTelemetryContext::obtain();
         self.compute.peeks.insert(
@@ -920,6 +928,7 @@ where
                 // TODO(guswynn): can we just hold the `tracing::Span` here instead?
                 otel_ctx: otel_ctx.clone(),
                 requested_at: Instant::now(),
+                target_meta: peek_target.clone(),
             },
         );
 
@@ -1228,7 +1237,12 @@ where
 
         let update = (peek.target, ChangeBatch::new_from(peek.time, -1));
         let mut updates = [update].into();
-        self.update_read_capabilities(&mut updates);
+        match &peek.target_meta {
+            PeekTarget::Index => self.update_read_capabilities(&mut updates),
+            PeekTarget::Persist { .. } => self
+                .storage_controller
+                .update_read_capabilities(&mut updates),
+        }
     }
 
     pub fn handle_response(
@@ -1413,6 +1427,8 @@ where
 struct PendingPeek<T> {
     /// ID of the collection targeted by this peek.
     target: GlobalId,
+    /// Information about the collection targeted by the peek.
+    target_meta: PeekTarget,
     /// The peek time.
     time: T,
     /// For replica-targeted peeks, this specifies the replica whose response we should pass on.
