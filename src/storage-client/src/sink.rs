@@ -439,6 +439,17 @@ async fn determine_latest_progress_record(
         }
         let partition = partitions.into_element();
 
+        // Seek to the beginning of the progress topic.
+        let mut tps = TopicPartitionList::new();
+        tps.add_partition(progress_topic, partition);
+        tps.set_partition_offset(progress_topic, partition, Offset::Beginning)?;
+        progress_client.assign(&tps).with_context(|| {
+            format!(
+                "Error seeking in progress topic {}:{}",
+                progress_topic, partition
+            )
+        })?;
+
         // We scan from the beginning and see if we can find a progress record. We have
         // to do it like this because Kafka Control Batches mess with offsets. We
         // therefore cannot simply take the last offset from the back and expect a
@@ -473,17 +484,6 @@ async fn determine_latest_progress_record(
                     e
                 )
             })?;
-
-        // Seek to the beginning of the progress topic.
-        let mut tps = TopicPartitionList::new();
-        tps.add_partition(progress_topic, partition);
-        tps.set_partition_offset(progress_topic, partition, Offset::Beginning)?;
-        progress_client.assign(&tps).with_context(|| {
-            format!(
-                "Error seeking in progress topic {}:{}",
-                progress_topic, partition
-            )
-        })?;
 
         // Helper to get the progress consumer's current position.
         let get_position = || {
