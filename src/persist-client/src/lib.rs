@@ -692,6 +692,8 @@ impl PersistClient {
 
         let () = maintenance.perform(&machine, &gc).await;
 
+        std::future::pending::<()>().await;
+
         Ok(())
     }
 
