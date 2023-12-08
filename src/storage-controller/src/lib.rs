@@ -3373,28 +3373,15 @@ where
     ) -> Result<ReadHandle<SourceData, (), T, Diff>, StorageError> {
         let metadata = &self.collection(id)?.collection_metadata;
 
-        let persist_client = self
-            .persist
-            .open(metadata.persist_location.clone())
-            .await
-            .unwrap();
-
         // We create a new read handle every time someone requests a snapshot and then immediately
         // expire it instead of keeping a read handle permanently in our state to avoid having it
-        // heartbeat continously. The assumption is that calls to snapshot are rare and therefore
+        // heartbeat continuously. The assumption is that calls to snapshot are rare and therefore
         // worth it to always create a new handle.
-        let read_handle = persist_client
-            .open_leased_reader::<SourceData, (), _, _>(
-                metadata.data_shard,
-                Arc::new(metadata.relation_desc.clone()),
-                Arc::new(UnitSchema),
-                Diagnostics {
-                    shard_name: id.to_string(),
-                    handle_purpose: format!("snapshot {}", id),
-                },
-            )
-            .await
-            .expect("invalid persist usage");
+        let read_handle = self
+            .persist_read_handles
+            .read(id, metadata.relation_desc.clone())
+            .await;
+
         Ok(read_handle)
     }
 

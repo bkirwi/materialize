@@ -21,12 +21,14 @@ use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use itertools::Itertools;
 use mz_persist_client::critical::SinceHandle;
+use mz_persist_client::read::ReadHandle;
 use mz_persist_client::stats::SnapshotStats;
 use mz_persist_client::write::WriteHandle;
 use mz_persist_client::ShardId;
 use mz_persist_txn::txns::{Tidy, TxnsHandle};
+use mz_persist_types::codec_impls::UnitSchema;
 use mz_persist_types::Codec64;
-use mz_repr::{Diff, GlobalId, TimestampManipulation};
+use mz_repr::{Diff, GlobalId, RelationDesc, TimestampManipulation};
 use mz_storage_client::client::{StorageResponse, TimestamplessUpdate, Update};
 use mz_storage_types::controller::TxnsCodecRow;
 use mz_storage_types::sources::SourceData;
@@ -59,6 +61,11 @@ enum PersistReadWorkerCmd<T: Timestamp + Lattice + Codec64> {
     Update(GlobalId, SinceHandle<SourceData, (), T, Diff, PersistEpoch>),
     Downgrade(BTreeMap<GlobalId, Antichain<T>>),
     SnapshotStats(GlobalId, Antichain<T>, oneshot::Sender<SnapshotStatsRes<T>>),
+    Read(
+        GlobalId,
+        RelationDesc,
+        oneshot::Sender<ReadHandle<SourceData, (), T, Diff>>,
+    ),
 }
 
 /// A newtype wrapper to hang a Debug impl off of.
@@ -119,6 +126,14 @@ impl<T: Timestamp + Lattice + Codec64> PersistReadWorker<T> {
                                     StorageError::IdentifierMissing(id),
                                 )))),
                             };
+                            // It's fine if the listener hung up.
+                            let _ = tx.send(res);
+                        }
+                        PersistReadWorkerCmd::Read(id, desc, tx) => {
+                            let handle = since_handles.get(&id).expect("PersistReadWorkerCmd::Read only valid for reading extant since handles");
+                            let res = handle
+                                .open_reader(Arc::new(desc), Arc::new(UnitSchema))
+                                .await;
                             // It's fine if the listener hung up.
                             let _ = tx.send(res);
                         }
@@ -216,6 +231,16 @@ impl<T: Timestamp + Lattice + Codec64> PersistReadWorker<T> {
         let (tx, rx) = oneshot::channel();
         self.send(PersistReadWorkerCmd::SnapshotStats(id, as_of, tx));
         rx.await.expect("PersistReadWorker should be live").0.await
+    }
+
+    pub(crate) async fn read(
+        &self,
+        id: GlobalId,
+        schema: RelationDesc,
+    ) -> ReadHandle<SourceData, (), T, Diff> {
+        let (tx, rx) = oneshot::channel();
+        self.send(PersistReadWorkerCmd::Read(id, schema, tx));
+        rx.await.expect("PersistReadWorker should be live")
     }
 
     fn send(&self, cmd: PersistReadWorkerCmd<T>) {
