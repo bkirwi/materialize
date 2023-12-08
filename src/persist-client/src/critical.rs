@@ -11,6 +11,7 @@
 
 use std::fmt::Debug;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use differential_dataflow::difference::Semigroup;
@@ -23,8 +24,10 @@ use timely::progress::{Antichain, Timestamp};
 use tracing::instrument;
 use uuid::Uuid;
 
+use crate::internal::encoding::Schemas;
 use crate::internal::machine::Machine;
 use crate::internal::state::Since;
+use crate::read::{LeasedReaderId, ReadHandle};
 use crate::stats::SnapshotStats;
 use crate::{parse_id, GarbageCollector, ShardId};
 
@@ -156,6 +159,37 @@ where
     /// This handle's `opaque`.
     pub fn opaque(&self) -> &O {
         &self.opaque
+    }
+
+    /// Get a leased reader that "belongs" to this critical since handle.
+    ///
+    /// What does "belongs" mean? In general, it's not safe to rely on a lease holding back
+    /// the since of a shard, since leases might expire at any time -- so if you've got a
+    /// leased reader with a particular since, you want some critical handle with a not-later
+    /// since. Persist does not have a way to enforce this: but this API at least makes the
+    /// relationship explicit.
+    pub async fn open_reader(
+        &self,
+        key_schema: Arc<K::Schema>,
+        val_schema: Arc<V::Schema>,
+    ) -> ReadHandle<K, V, T, D> {
+        let reader_id = LeasedReaderId::new();
+        let heartbeat_ts = (self.machine.applier.cfg.now)();
+        ReadHandle::new(
+            self.machine.applier.cfg.clone(),
+            Arc::clone(&self.machine.applier.metrics),
+            self.machine.clone(),
+            self.gc.clone(),
+            Arc::clone(&self.machine.applier.state_versions.blob),
+            reader_id,
+            Schemas {
+                key: key_schema,
+                val: val_schema,
+            },
+            self.since.clone(),
+            heartbeat_ts,
+        )
+        .await
     }
 
     /// Attempts to forward the since capability of this handle to `new_since` iff
