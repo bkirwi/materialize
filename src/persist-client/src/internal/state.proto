@@ -21,9 +21,15 @@ message ProtoU64Description {
     ProtoU64Antichain since = 3;
 }
 
+message ProtoTsRewrite {
+    uint64 from = 1;
+    uint64 to = 2;
+}
+
 message ProtoHollowBatchPart {
     string key = 1;
     uint64 encoded_size_bytes = 2;
+    ProtoTsRewrite ts_rewrite = 4;
 
     bytes key_lower = 3;
 

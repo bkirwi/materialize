@@ -9,6 +9,7 @@
 
 syntax = "proto3";
 
+import "google/protobuf/empty.proto";
 import "persist-client/src/internal/state.proto";
 
 package mz_persist_client.batch;
@@ -17,6 +18,12 @@ message ProtoBatch {
     string shard_id = 1;
     string version = 2;
     mz_persist_client.internal.state.ProtoHollowBatch batch = 3;
+    oneof single_ts {
+        google.protobuf.Empty empty = 5;
+        uint64 single = 6;
+        google.protobuf.Empty multi = 7;
+        mz_persist_client.internal.state.ProtoTsRewrite rewrite = 8;
+    }
 
     reserved 4;
 }

@@ -46,7 +46,7 @@ use crate::internal::encoding::{LazyPartStats, Schemas};
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{BatchWriteMetrics, Metrics, ShardMetrics};
 use crate::internal::paths::{PartId, PartialBatchKey, WriterKey};
-use crate::internal::state::{HollowBatch, HollowBatchPart};
+use crate::internal::state::{HollowBatch, HollowBatchPart, TsRewrite};
 use crate::stats::{untrimmable_columns, PartStats, STATS_BUDGET_BYTES, STATS_COLLECTION_ENABLED};
 use crate::write::WriterId;
 use crate::{PersistConfig, ShardId};
@@ -72,6 +72,9 @@ where
 
     /// A handle to the data represented by this batch.
     pub(crate) batch: HollowBatch<T>,
+
+    /// WIP
+    pub(crate) single_ts: SingleTs<T>,
 
     /// Handle to the [Blob] that the blobs of this batch were uploaded to.
     pub(crate) blob: Arc<dyn Blob + Send + Sync>,
@@ -114,6 +117,7 @@ where
         shard_id: ShardId,
         version: Version,
         batch: HollowBatch<T>,
+        single_ts: SingleTs<T>,
     ) -> Self {
         Self {
             batch_delete_enabled,
@@ -121,6 +125,7 @@ where
             shard_id,
             version,
             batch,
+            single_ts,
             blob,
             _phantom: PhantomData,
         }
@@ -139,6 +144,28 @@ where
     /// The `lower` of this [Batch].
     pub fn lower(&self) -> &Antichain<T> {
         self.batch.desc.lower()
+    }
+
+    /// WIP
+    pub fn rewrite_ts(&mut self, to: &T) -> Result<(), InvalidUsage<T>> {
+        // WIP these errors aren't right
+        match &self.single_ts {
+            SingleTs::Empty => Err(InvalidUsage::AddAfterRewrite),
+            SingleTs::Single(from) => {
+                let ts_rewrite = TsRewrite {
+                    from: T::encode(from),
+                    to: T::encode(&to),
+                };
+                for part in self.batch.parts.iter_mut() {
+                    assert_eq!(part.ts_rewrite, None);
+                    part.ts_rewrite = Some(ts_rewrite.clone());
+                }
+                self.single_ts = SingleTs::Rewrite(ts_rewrite);
+                Ok(())
+            }
+            SingleTs::Multi => Err(InvalidUsage::AddAfterRewrite),
+            SingleTs::Rewrite(_) => Err(InvalidUsage::AddAfterRewrite),
+        }
     }
 
     /// Marks the blobs that this batch handle points to as consumed, likely
@@ -195,6 +222,7 @@ where
             shard_id: self.shard_id.into_proto(),
             version: self.version.to_string(),
             batch: Some(self.batch.into_proto()),
+            single_ts: self.single_ts.into_proto(),
         };
         self.mark_consumed();
         ret
@@ -362,6 +390,32 @@ where
 }
 
 #[derive(Debug)]
+pub(crate) enum SingleTs<T> {
+    Empty,
+    Single(T),
+    Multi,
+    Rewrite(TsRewrite),
+}
+
+impl<T: PartialEq + Clone> SingleTs<T> {
+    fn observe(&mut self, ts: &T) -> Result<(), InvalidUsage<T>> {
+        match self {
+            SingleTs::Empty => {
+                *self = SingleTs::Single(ts.clone());
+                Ok(())
+            }
+            SingleTs::Single(t) if t == ts => Ok(()),
+            SingleTs::Single(_) => {
+                *self = SingleTs::Multi;
+                Ok(())
+            }
+            SingleTs::Multi => Ok(()),
+            SingleTs::Rewrite(_) => Err(InvalidUsage::AddAfterRewrite),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct BatchBuilderInternal<K, V, T, D>
 where
     K: Codec,
@@ -370,6 +424,7 @@ where
 {
     lower: Antichain<T>,
     inclusive_upper: Antichain<Reverse<T>>,
+    single_ts: SingleTs<T>,
 
     shard_id: ShardId,
     version: Version,
@@ -430,6 +485,7 @@ where
         Self {
             lower,
             inclusive_upper: Antichain::new(),
+            single_ts: SingleTs::Empty,
             blob,
             buffer: BatchBuffer::new(
                 Arc::clone(&metrics),
@@ -509,6 +565,7 @@ where
                 len: self.num_updates,
                 runs: self.runs,
             },
+            self.single_ts,
         );
 
         Ok(batch)
@@ -532,7 +589,7 @@ where
                 lower: self.lower.clone(),
             });
         }
-
+        let () = self.single_ts.observe(ts)?;
         self.inclusive_upper.insert(Reverse(ts.clone()));
 
         match self.buffer.push(key, val, ts.clone(), diff.clone()) {
@@ -597,6 +654,11 @@ where
             }
         }
 
+        let ts_rewrite = match self.single_ts {
+            SingleTs::Empty | SingleTs::Single(_) | SingleTs::Multi => None,
+            SingleTs::Rewrite(_) => unreachable!("WIP not supposed to happen"),
+        };
+
         let start = Instant::now();
         self.parts
             .write(
@@ -605,6 +667,7 @@ where
                 columnar,
                 self.inline_upper.clone(),
                 self.since.clone(),
+                ts_rewrite,
             )
             .await;
         self.metrics
@@ -802,6 +865,7 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
         updates: ColumnarRecords,
         upper: Antichain<T>,
         since: Antichain<T>,
+        ts_rewrite: Option<TsRewrite>,
     ) {
         let desc = Description::new(self.lower.clone(), upper, since);
         let metrics = Arc::clone(&self.metrics);
@@ -899,6 +963,7 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
                 HollowBatchPart {
                     key: partial_key,
                     encoded_size_bytes: payload_len,
+                    ts_rewrite,
                     key_lower,
                     stats,
                 }
@@ -953,7 +1018,7 @@ pub(crate) fn validate_truncate_batch<T: Timestamp>(
 mod tests {
     use crate::cache::PersistClientCache;
     use crate::internal::paths::{BlobKey, PartialBlobKey};
-    use crate::tests::{all_ok, CodecProduct};
+    use crate::tests::{all_ok, new_test_client, CodecProduct};
     use crate::PersistLocation;
 
     use super::*;
@@ -1161,5 +1226,40 @@ mod tests {
         assert!(untrimmable.should_retain("ijk_xyZ"));
         assert!(untrimmable.should_retain("ww-XYZ"));
         assert!(!untrimmable.should_retain("xya"));
+    }
+
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // too slow
+    async fn rewrite_ts() {
+        // WIP edge cases to test:
+        // - rewrite before add
+        // - rewrite twice
+        // - add after rewrite
+        // - various lower/upper declarations
+        // - rewrite to smaller ts
+        // - rewrite to same ts
+        // - compaction
+        // - rewrite under snapshot as_of
+        // - rewrite past snapshot as_of
+        // - CaAB with one rewritten batch one not
+        // - transmittable batch
+        // - rewrite a ts more than once (e.g. multiple txn conflicts)
+
+        let client = new_test_client().await;
+        let (mut write, read) = client
+            .expect_open::<String, (), u64, i64>(ShardId::new())
+            .await;
+
+        let mut batch = write.builder(Antichain::from_elem(0));
+        batch.add(&"foo".to_owned(), &(), &1, &1).await.unwrap();
+        let mut batch = batch.finish(Antichain::from_elem(3)).await.unwrap();
+        batch.rewrite_ts(&2).unwrap();
+        write
+            .expect_compare_and_append_batch(&mut [&mut batch], 0, 3)
+            .await;
+
+        let (actual, _) = read.expect_listen(0).await.read_until(&3).await;
+        let expected = vec![(((Ok("foo".to_owned())), Ok(())), 2, 1)];
+        assert_eq!(actual, expected);
     }
 }

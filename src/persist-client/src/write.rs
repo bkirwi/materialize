@@ -548,6 +548,10 @@ where
                 .into_rust_if_some("ProtoBatch::batch")
                 .expect("valid transmittable batch"),
             blob: Arc::clone(&self.blob),
+            single_ts: batch
+                .single_ts
+                .into_rust()
+                .expect("valid transmittable batch"),
             _phantom: std::marker::PhantomData,
         };
         assert_eq!(ret.shard_id, self.machine.shard_id());

@@ -34,6 +34,7 @@ use crate::internal::encoding::{LazyPartStats, Schemas};
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{Metrics, ReadMetrics, ShardMetrics};
 use crate::internal::paths::{BlobKey, PartialBatchKey};
+use crate::internal::state::TsRewrite;
 use crate::read::LeasedReaderId;
 use crate::stats::PartStats;
 use crate::ShardId;
@@ -117,6 +118,7 @@ where
             metadata: part.metadata.clone(),
             filter_pushdown_audit: part.filter_pushdown_audit,
             stats: part.stats.clone(),
+            ts_rewrite: part.ts_rewrite.clone(),
             _phantom: PhantomData,
         };
         Ok(fetched_blob)
@@ -217,6 +219,7 @@ where
         read_metrics,
         &part.key,
         &part.desc,
+        part.ts_rewrite.as_ref(),
     )
     .await
     .unwrap_or_else(|blob_key| {
@@ -274,6 +277,7 @@ pub(crate) fn decode_batch_part_blob<T>(
     key: &str,
     registered_desc: Description<T>,
     value: &SegmentedBytes,
+    ts_rewrite: Option<&TsRewrite>,
 ) -> EncodedPart<T>
 where
     T: Timestamp + Lattice + Codec64,
@@ -292,7 +296,7 @@ where
         read_metrics.part_goodbytes.inc_by(u64::cast_from(
             part.updates.iter().map(|x| x.goodbytes()).sum::<usize>(),
         ));
-        EncodedPart::new(key, registered_desc, part)
+        EncodedPart::new(key, registered_desc, part, ts_rewrite)
     })
 }
 
@@ -304,13 +308,21 @@ pub(crate) async fn fetch_batch_part<T>(
     read_metrics: &ReadMetrics,
     key: &PartialBatchKey,
     registered_desc: &Description<T>,
+    ts_rewrite: Option<&TsRewrite>,
 ) -> Result<EncodedPart<T>, BlobKey>
 where
     T: Timestamp + Lattice + Codec64,
 {
     let value =
         fetch_batch_part_blob(shard_id, blob, metrics, shard_metrics, read_metrics, key).await?;
-    let part = decode_batch_part_blob(metrics, read_metrics, key, registered_desc.clone(), &value);
+    let part = decode_batch_part_blob(
+        metrics,
+        read_metrics,
+        key,
+        registered_desc.clone(),
+        &value,
+        ts_rewrite,
+    );
     Ok(part)
 }
 
@@ -375,6 +387,7 @@ pub struct LeasedBatchPart<T> {
     /// A lower bound on the key. If a tight lower bound is not available, the
     /// empty vec (as the minimum vec) is a conservative choice.
     pub(crate) key_lower: Vec<u8>,
+    pub(crate) ts_rewrite: Option<TsRewrite>,
 }
 
 impl<T> LeasedBatchPart<T>
@@ -404,6 +417,7 @@ where
             stats: self.stats.clone(),
             filter_pushdown_audit: self.filter_pushdown_audit,
             key_lower: std::mem::take(&mut self.key_lower),
+            ts_rewrite: self.ts_rewrite.clone(),
         };
         // If `x` has a lease, we've effectively transferred it to `r`.
         let _ = self.leased_seqno.take();
@@ -467,6 +481,7 @@ pub struct FetchedBlob<K: Codec, V: Codec, T, D> {
     part: SegmentedBytes,
     schemas: Schemas<K, V>,
     metadata: SerdeLeasedBatchPartMetadata,
+    ts_rewrite: Option<TsRewrite>,
     filter_pushdown_audit: bool,
     stats: Option<LazyPartStats>,
     _phantom: PhantomData<fn() -> D>,
@@ -482,6 +497,7 @@ impl<K: Codec, V: Codec, T: Clone, D> Clone for FetchedBlob<K, V, T, D> {
             part: self.part.clone(),
             schemas: self.schemas.clone(),
             metadata: self.metadata.clone(),
+            ts_rewrite: self.ts_rewrite.clone(),
             filter_pushdown_audit: self.filter_pushdown_audit.clone(),
             stats: self.stats.clone(),
             _phantom: self._phantom.clone(),
@@ -498,6 +514,7 @@ impl<K: Codec, V: Codec, T: Timestamp + Lattice + Codec64, D> FetchedBlob<K, V, 
             &self.key,
             self.registered_desc.clone(),
             &self.part,
+            self.ts_rewrite.as_ref(),
         );
         FetchedPart::new(
             Arc::clone(&self.metrics),
@@ -583,6 +600,7 @@ pub(crate) struct EncodedPart<T> {
     registered_desc: Description<T>,
     part: Arc<BlobTraceBatchPart<T>>,
     needs_truncation: bool,
+    ts_rewrite: Option<(T, T)>,
 }
 
 impl<K, V, T, D> Iterator for FetchedPart<K, V, T, D>
@@ -649,6 +667,7 @@ where
         key: &str,
         registered_desc: Description<T>,
         part: BlobTraceBatchPart<T>,
+        ts_rewrite: Option<&TsRewrite>,
     ) -> Self {
         // There are two types of batches in persist:
         // - Batches written by a persist user (either directly or indirectly
@@ -698,11 +717,13 @@ where
                 key, inline_desc, registered_desc
             );
         }
+        let ts_rewrite = ts_rewrite.map(|x| (T::decode(x.from), T::decode(x.to)));
 
         EncodedPart {
             registered_desc,
             part: Arc::new(part),
             needs_truncation,
+            ts_rewrite,
         }
     }
 
@@ -743,7 +764,12 @@ impl Cursor {
                 }
             };
 
-            let t = T::decode(t);
+            let mut t = T::decode(t);
+            if let Some((from, to)) = &encoded.ts_rewrite {
+                assert_eq!(&t, from);
+                tracing::info!("WIP rewriting ts {:?} -> {:?}", from, to);
+                t.clone_from(to);
+            }
 
             // This filtering is really subtle, see the comment above for
             // what's going on here.
@@ -802,6 +828,7 @@ pub struct SerdeLeasedBatchPart {
     stats: Option<LazyPartStats>,
     filter_pushdown_audit: bool,
     key_lower: Vec<u8>,
+    ts_rewrite: Option<TsRewrite>,
 }
 
 impl SerdeLeasedBatchPart {
@@ -838,6 +865,7 @@ impl<T: Timestamp + Codec64> LeasedBatchPart<T> {
             stats: x.stats,
             filter_pushdown_audit: x.filter_pushdown_audit,
             key_lower: x.key_lower,
+            ts_rewrite: x.ts_rewrite,
         }
     }
 }

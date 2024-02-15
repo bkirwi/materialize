@@ -1054,6 +1054,7 @@ impl<'a, T: Timestamp + Lattice + Codec64> CompactionPart<'a, T> {
                     &metrics.read.compaction,
                     &part.key,
                     part_desc,
+                    part.ts_rewrite.as_ref(),
                 )
                 .await
             }
@@ -1113,6 +1114,7 @@ fn start_prefetches<T: Timestamp + Lattice + Codec64>(
             let shard_metrics = Arc::clone(shard_metrics);
             let part_key = part.key.clone();
             let part_desc = part_desc.clone();
+            let part_ts_rewrite = part.ts_rewrite.clone();
             let handle = spawn(
                 || "persist::compaction::prefetch",
                 async move {
@@ -1124,6 +1126,7 @@ fn start_prefetches<T: Timestamp + Lattice + Codec64>(
                         &metrics.read.compaction,
                         &part_key,
                         &part_desc,
+                        part_ts_rewrite.as_ref(),
                     )
                     .await
                 }
@@ -1309,6 +1312,7 @@ mod tests {
             .map(|encoded_size_bytes| HollowBatchPart {
                 key: PartialBatchKey("".into()),
                 encoded_size_bytes,
+                ts_rewrite: None,
                 key_lower: vec![],
                 stats: None,
             })

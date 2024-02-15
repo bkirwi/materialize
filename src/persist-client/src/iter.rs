@@ -34,7 +34,7 @@ use tracing::{debug_span, Instrument};
 use crate::fetch::{fetch_batch_part, Cursor, EncodedPart, FetchBatchFilter, LeasedBatchPart};
 use crate::internal::metrics::{BatchPartReadMetrics, ReadMetrics, ShardMetrics};
 use crate::internal::paths::{PartialBatchKey, WriterKey};
-use crate::internal::state::HollowBatchPart;
+use crate::internal::state::{HollowBatchPart, TsRewrite};
 use crate::metrics::Metrics;
 use crate::read::SubscriptionLeaseReturner;
 use crate::ShardId;
@@ -68,6 +68,7 @@ pub(crate) enum FetchData<T> {
         part_key: PartialBatchKey,
         part_desc: Description<T>,
         key_lower: Vec<u8>,
+        ts_rewrite: Option<TsRewrite>,
     },
     Leased {
         blob: Arc<dyn Blob + Send + Sync>,
@@ -110,6 +111,7 @@ impl<T: Codec64 + Timestamp + Lattice> FetchData<T> {
                 shard_metrics,
                 part_key,
                 part_desc,
+                ts_rewrite,
                 ..
             } => fetch_batch_part(
                 &shard_id,
@@ -119,6 +121,7 @@ impl<T: Codec64 + Timestamp + Lattice> FetchData<T> {
                 read_metrics(&metrics.read),
                 &part_key,
                 &part_desc,
+                ts_rewrite.as_ref(),
             )
             .await
             .map_err(|blob_key| anyhow!("missing unleased key {blob_key}")),
@@ -139,6 +142,7 @@ impl<T: Codec64 + Timestamp + Lattice> FetchData<T> {
                     read_metrics(&part.metrics.read),
                     &part.key,
                     &part.desc,
+                    part.ts_rewrite.as_ref(),
                 )
                 .await
                 .map_err(|blob_key| anyhow!("missing unleased key {blob_key}"));
@@ -302,6 +306,7 @@ impl<T: Timestamp + Codec64 + Lattice, D: Codec64 + Semigroup> Consolidator<T, D
                         part_key: part.key.clone(),
                         part_desc: desc.clone(),
                         key_lower: part.key_lower.clone(),
+                        ts_rewrite: part.ts_rewrite.clone(),
                     },
                 };
                 (c_part, part.encoded_size_bytes)
@@ -970,6 +975,7 @@ mod tests {
                         key: PartialBatchKey(
                             "n0000000/p00000000-0000-0000-0000-000000000000".into(),
                         ),
+                        ts_rewrite: None,
                         encoded_size_bytes,
                         key_lower: vec![],
                         stats: None,

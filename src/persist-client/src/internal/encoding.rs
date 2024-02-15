@@ -31,6 +31,7 @@ use timely::PartialOrder;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::batch::{proto_batch, SingleTs};
 use crate::critical::CriticalReaderId;
 use crate::error::{CodecMismatch, CodecMismatchT};
 use crate::internal::metrics::Metrics;
@@ -40,9 +41,9 @@ use crate::internal::state::{
     IdempotencyToken, LeasedReaderState, OpaqueState, ProtoCriticalReaderState,
     ProtoHandleDebugState, ProtoHollowBatch, ProtoHollowBatchPart, ProtoHollowRollup,
     ProtoInlinedDiffs, ProtoLeasedReaderState, ProtoRollup, ProtoStateDiff, ProtoStateField,
-    ProtoStateFieldDiffType, ProtoStateFieldDiffs, ProtoTrace, ProtoU64Antichain,
-    ProtoU64Description, ProtoVersionedData, ProtoWriterState, State, StateCollections, TypedState,
-    WriterState,
+    ProtoStateFieldDiffType, ProtoStateFieldDiffs, ProtoTrace, ProtoTsRewrite, ProtoU64Antichain,
+    ProtoU64Description, ProtoVersionedData, ProtoWriterState, State, StateCollections, TsRewrite,
+    TypedState, WriterState,
 };
 use crate::internal::state_diff::{
     ProtoStateFieldDiff, ProtoStateFieldDiffsWriter, StateDiff, StateFieldDiff, StateFieldValDiff,
@@ -1107,6 +1108,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatch> for HollowBatch<T> {
                 .map(|key| HollowBatchPart {
                     key: PartialBatchKey(key),
                     encoded_size_bytes: 0,
+                    ts_rewrite: None,
                     key_lower: vec![],
                     stats: None,
                 }),
@@ -1125,6 +1127,7 @@ impl RustType<ProtoHollowBatchPart> for HollowBatchPart {
         ProtoHollowBatchPart {
             key: self.key.into_proto(),
             encoded_size_bytes: self.encoded_size_bytes.into_proto(),
+            ts_rewrite: self.ts_rewrite.into_proto(),
             key_lower: Bytes::copy_from_slice(&self.key_lower),
             key_stats: self.stats.into_proto(),
         }
@@ -1134,9 +1137,51 @@ impl RustType<ProtoHollowBatchPart> for HollowBatchPart {
         Ok(HollowBatchPart {
             key: proto.key.into_rust()?,
             encoded_size_bytes: proto.encoded_size_bytes.into_rust()?,
+            ts_rewrite: proto.ts_rewrite.into_rust()?,
             key_lower: proto.key_lower.into(),
             stats: proto.key_stats.into_rust()?,
         })
+    }
+}
+
+impl RustType<ProtoTsRewrite> for TsRewrite {
+    fn into_proto(&self) -> ProtoTsRewrite {
+        ProtoTsRewrite {
+            from: u64::from_le_bytes(self.from),
+            to: u64::from_le_bytes(self.to),
+        }
+    }
+
+    fn from_proto(proto: ProtoTsRewrite) -> Result<Self, TryFromProtoError> {
+        Ok(TsRewrite {
+            from: proto.from.to_le_bytes(),
+            to: proto.to.to_le_bytes(),
+        })
+    }
+}
+
+impl<T: Codec64> RustType<Option<proto_batch::SingleTs>> for SingleTs<T> {
+    fn into_proto(&self) -> Option<proto_batch::SingleTs> {
+        match self {
+            SingleTs::Empty => Some(proto_batch::SingleTs::Empty(())),
+            SingleTs::Single(x) => Some(proto_batch::SingleTs::Single(u64::from_le_bytes(
+                T::encode(x),
+            ))),
+            SingleTs::Multi => Some(proto_batch::SingleTs::Multi(())),
+            SingleTs::Rewrite(x) => Some(proto_batch::SingleTs::Rewrite(x.into_proto())),
+        }
+    }
+
+    fn from_proto(proto: Option<proto_batch::SingleTs>) -> Result<Self, TryFromProtoError> {
+        match proto {
+            Some(proto_batch::SingleTs::Empty(())) => Ok(SingleTs::Multi),
+            Some(proto_batch::SingleTs::Single(x)) => {
+                Ok(SingleTs::Single(T::decode(x.to_le_bytes())))
+            }
+            // Multi seems like a safe default for backward compatibility.
+            Some(proto_batch::SingleTs::Multi(())) | None => Ok(SingleTs::Multi),
+            Some(proto_batch::SingleTs::Rewrite(x)) => Ok(SingleTs::Rewrite(x.into_rust()?)),
+        }
     }
 }
 
@@ -1349,6 +1394,7 @@ mod tests {
             parts: vec![HollowBatchPart {
                 key: PartialBatchKey("a".into()),
                 encoded_size_bytes: 5,
+                ts_rewrite: None,
                 key_lower: vec![],
                 stats: None,
             }],
@@ -1368,6 +1414,7 @@ mod tests {
         expected.parts.push(HollowBatchPart {
             key: PartialBatchKey("b".into()),
             encoded_size_bytes: 0,
+            ts_rewrite: None,
             key_lower: vec![],
             stats: None,
         });

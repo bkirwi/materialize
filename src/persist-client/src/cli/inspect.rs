@@ -340,7 +340,7 @@ pub async fn blob_batch_part(
     let part = BlobTraceBatchPart::<u64>::decode(&part).expect("decodable");
     let desc = part.desc.clone();
 
-    let encoded_part = EncodedPart::new(&*key, part.desc.clone(), part);
+    let encoded_part = EncodedPart::new(&*key, part.desc.clone(), part, None);
     let mut out = BatchPartOutput {
         desc,
         updates: Vec::new(),

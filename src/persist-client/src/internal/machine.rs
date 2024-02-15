@@ -1236,7 +1236,7 @@ pub mod datadriven {
 
     use crate::batch::{
         validate_truncate_batch, Batch, BatchBuilder, BatchBuilderConfig, BatchBuilderInternal,
-        BLOB_TARGET_SIZE,
+        SingleTs, BLOB_TARGET_SIZE,
     };
     use crate::fetch::{fetch_batch_part, Cursor};
     use crate::internal::compact::{
@@ -1603,6 +1603,7 @@ pub mod datadriven {
                 &datadriven.client.metrics.read.batch_fetcher,
                 &part.key,
                 &batch.desc,
+                part.ts_rewrite.as_ref(),
             )
             .await
             .expect("invalid batch part");
@@ -1827,6 +1828,7 @@ pub mod datadriven {
                         &datadriven.client.metrics.read.batch_fetcher,
                         &part.key,
                         &batch.desc,
+                        part.ts_rewrite.as_ref(),
                     )
                     .await
                     .expect("invalid batch part");
@@ -1998,6 +2000,7 @@ pub mod datadriven {
                     datadriven.shard_id,
                     datadriven.client.cfg.build_version.clone(),
                     hollow,
+                    SingleTs::Multi,
                 )
             })
             .collect();

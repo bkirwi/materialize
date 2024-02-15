@@ -27,7 +27,7 @@ use mz_persist_types::{Codec, Codec64, Opaque};
 use proptest_derive::Arbitrary;
 use semver::Version;
 use serde::ser::SerializeStruct;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tracing::info;
@@ -169,6 +169,13 @@ pub struct HandleDebugState {
     pub purpose: String,
 }
 
+/// WIP
+#[derive(Arbitrary, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TsRewrite {
+    pub from: [u8; 8],
+    pub to: [u8; 8],
+}
+
 /// A subset of a [HollowBatch] corresponding 1:1 to a blob.
 #[derive(Arbitrary, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct HollowBatchPart {
@@ -176,6 +183,8 @@ pub struct HollowBatchPart {
     pub key: PartialBatchKey,
     /// The encoded size of this part.
     pub encoded_size_bytes: usize,
+    /// WIP T instead of encoded?
+    pub ts_rewrite: Option<TsRewrite>,
     /// A lower bound on the keys in the part. (By default, this the minimum
     /// possible key: `vec![]`.)
     #[serde(serialize_with = "serialize_part_bytes")]
@@ -1684,6 +1693,7 @@ pub(crate) mod tests {
                 .map(|x| HollowBatchPart {
                     key: PartialBatchKey((*x).to_owned()),
                     encoded_size_bytes: 0,
+                    ts_rewrite: None,
                     key_lower: vec![],
                     stats: None,
                 })

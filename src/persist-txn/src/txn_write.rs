@@ -131,14 +131,17 @@ where
                     let mut data_write = handle.datas.take_write(data_id).await;
                     let commit_ts = commit_ts.clone();
                     txn_batches_updates.push(async move {
-                        let mut batch = data_write.builder(Antichain::from_elem(T::minimum()));
+                        // HACK to test ts rewrite using persist-txn maelstrom impl
+                        let s3_ts = T::minimum();
+                        let mut batch = data_write.builder(Antichain::from_elem(s3_ts.clone()));
                         for (k, v, d) in updates.iter() {
-                            batch.add(k, v, &commit_ts, d).await.expect("valid usage");
+                            batch.add(k, v, &s3_ts, d).await.expect("valid usage");
                         }
-                        let batch = batch
+                        let mut batch = batch
                             .finish(Antichain::from_elem(commit_ts.step_forward()))
                             .await
                             .expect("valid usage");
+                        let () = batch.rewrite_ts(&commit_ts).expect("valid usage");
                         let batch = batch.into_transmittable_batch();
                         // The code to handle retracting applied batches assumes
                         // that the encoded representation of each is unique (it

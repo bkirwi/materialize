@@ -767,6 +767,7 @@ where
             leased_seqno: Some(self.lease_seqno()),
             filter_pushdown_audit: false,
             key_lower: part.key_lower,
+            ts_rewrite: part.ts_rewrite,
         }
     }
 
