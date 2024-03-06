@@ -218,9 +218,7 @@ Below are the recommended ways to work around this.
 As an example, we'll create a [counter load generator](https://materialize.com/docs/sql/create-source/load-generator/#creating-a-counter-load-generator) that emits a row every second:
 
 ```sql
-CREATE SOURCE counter
-  FROM LOAD GENERATOR COUNTER
-  WITH (SIZE = '3xsmall');
+CREATE SOURCE counter FROM LOAD GENERATOR COUNTER;
 ```
 
 ### Subscribing with `FETCH`
@@ -279,6 +277,7 @@ COPY (SUBSCRIBE (SELECT * FROM counter)) TO STDOUT;
 | [PHP](/integrations/php/#stream)|
 | [Python](/integrations/python/#stream)|
 | [Ruby](/integrations/ruby/#stream)|
+| [Rust](/integrations/rust/#stream)|
 
 ### Mapping rows to their updates
 
@@ -301,8 +300,6 @@ restructure it using the same feature-oriented approach as CREATE SOURCE/SINK.
 See #18829 for the design doc."
 
 ### Modifying the output format
-
-{{< alpha />}}
 
 #### `ENVELOPE UPSERT`
 
@@ -391,6 +388,8 @@ structure:
 column. Each progress row will have a `NULL` key and a `NULL` value.
 
 #### `ENVELOPE DEBEZIUM`
+
+{{< private-preview />}}
 
 To modify the output of `SUBSCRIBE` to support upserts using a
 [Debezium-style diff envelope](https://materialize.com/docs/sql/create-sink/#debezium-envelope)
@@ -486,6 +485,8 @@ before and after value.
 
 #### `WITHIN TIMESTAMP ORDER BY`
 
+{{< private-preview />}}
+
 To modify the ordering of the output of `SUBSCRIBE`, use `WITHIN TIMESTAMP ORDER
 BY`. This clause allows you to specify an `ORDER BY` expression which is used
 to sort the rows within each distinct timestamp.
@@ -515,3 +516,15 @@ When you're done, you can drop the `counter` load generator source:
 ```sql
 DROP SOURCE counter;
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- `USAGE` privileges on the schemas that all relations and types in the query are contained in.
+- `SELECT` privileges on all relations in the query.
+  - NOTE: if any item is a view, then the view owner must also have the necessary privileges to
+  execute the view definition. Even if the view owner is a _superuser_, they still must explicitly be
+    granted the necessary privileges.
+- `USAGE` privileges on all types used in the query.
+- `USAGE` privileges on the active cluster.

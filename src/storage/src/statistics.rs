@@ -10,34 +10,49 @@
 //! Helpers for managing storage statistics.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use mz_ore::metric;
 use mz_ore::metrics::{
-    CounterVecExt, DeleteOnDropCounter, DeleteOnDropGauge, GaugeVecExt, IntCounterVec,
+    CounterVecExt, DeleteOnDropCounter, DeleteOnDropGauge, GaugeVecExt, IntCounterVec, IntGaugeVec,
     MetricsRegistry, UIntGaugeVec,
 };
-use mz_repr::GlobalId;
-use mz_storage_client::client::{SinkStatisticsUpdate, SourceStatisticsUpdate};
-use prometheus::core::AtomicU64;
+use mz_repr::{GlobalId, Timestamp};
+use mz_storage_client::statistics::{
+    Gauge, SinkStatisticsUpdate, SkippableGauge, SourceStatisticsUpdate,
+};
+use mz_storage_types::sources::SourceEnvelope;
+use prometheus::core::{AtomicI64, AtomicU64};
+use serde::{Deserialize, Serialize};
 use timely::progress::frontier::Antichain;
-use timely::progress::Timestamp;
+use timely::PartialOrder;
 
-use crate::sink::metrics::SinkBaseMetrics;
-use crate::source::metrics::SourceBaseMetrics;
+// Note(guswynn): ordinarily these metric structs would be in the `metrics` modules, but we
+// put them here so they can be near the user-facing definitions as well.
 
 #[derive(Clone, Debug)]
-pub(crate) struct SourceStatisticsMetricsDefinitions {
-    pub(crate) snapshot_committed: UIntGaugeVec,
+pub(crate) struct SourceStatisticsMetricDefs {
+    // Counters
     pub(crate) messages_received: IntCounterVec,
     pub(crate) updates_staged: IntCounterVec,
     pub(crate) updates_committed: IntCounterVec,
     pub(crate) bytes_received: IntCounterVec,
-    pub(crate) envelope_state_bytes: UIntGaugeVec,
-    pub(crate) envelope_state_count: UIntGaugeVec,
+
+    // Gauges
+    pub(crate) snapshot_committed: UIntGaugeVec,
+    pub(crate) bytes_indexed: UIntGaugeVec,
+    pub(crate) records_indexed: UIntGaugeVec,
+    pub(crate) rehydration_latency_ms: IntGaugeVec,
+
+    pub(crate) offset_known: UIntGaugeVec,
+    pub(crate) offset_committed: UIntGaugeVec,
+    pub(crate) snapshot_records_known: UIntGaugeVec,
+    pub(crate) snapshot_records_staged: UIntGaugeVec,
 }
 
-impl SourceStatisticsMetricsDefinitions {
+impl SourceStatisticsMetricDefs {
     pub(crate) fn register_with(registry: &MetricsRegistry) -> Self {
         Self {
             snapshot_committed: registry.register(metric!(
@@ -65,15 +80,40 @@ impl SourceStatisticsMetricsDefinitions {
                 help: "The number of bytes worth of messages the worker has received from upstream. The way the bytes are counted is source-specific.",
                 var_labels: ["source_id", "worker_id", "parent_source_id"],
             )),
-            envelope_state_bytes: registry.register(metric!(
-                name: "mz_source_envelope_state_bytes",
+            bytes_indexed: registry.register(metric!(
+                name: "mz_source_bytes_indexed",
                 help: "The number of bytes of the source envelope state kept. This will be specific to the envelope in use.",
                 var_labels: ["source_id", "worker_id", "parent_source_id", "shard_id"],
             )),
-            envelope_state_count: registry.register(metric!(
-                name: "mz_source_envelope_state_count",
+            records_indexed: registry.register(metric!(
+                name: "mz_source_records_indexed",
                 help: "The number of records in the source envelope state. This will be specific to the envelope in use",
                 var_labels: ["source_id", "worker_id", "parent_source_id", "shard_id"],
+            )),
+            rehydration_latency_ms: registry.register(metric!(
+                name: "mz_source_rehydration_latency_ms",
+                help: "The amount of time in milliseconds it took for the worker to rehydrate the source envelope state. This will be specific to the envelope in use.",
+                var_labels: ["source_id", "worker_id", "parent_source_id", "shard_id", "envelope"],
+            )),
+            offset_known: registry.register(metric!(
+                name: "mz_source_offset_known",
+                help: "The total number of _values_ (source-defined unit) present in upstream.",
+                var_labels: ["source_id", "worker_id", "shard_id"],
+            )),
+            offset_committed: registry.register(metric!(
+                name: "mz_source_offset_committed",
+                help: "The total number of _values_ (source-defined unit) we have fully processed, and storage and committed.",
+                var_labels: ["source_id", "worker_id", "shard_id"],
+            )),
+            snapshot_records_known: registry.register(metric!(
+                name: "mz_source_snapshot_records_known",
+                help: "The total number of records in the source's snapshot",
+                var_labels: ["source_id", "worker_id", "shard_id"],
+            )),
+            snapshot_records_staged: registry.register(metric!(
+                name: "mz_source_snapshot_records_staged",
+                help: "The total number of records read from the source's snapshot",
+                var_labels: ["source_id", "worker_id", "shard_id"],
             )),
         }
     }
@@ -82,100 +122,123 @@ impl SourceStatisticsMetricsDefinitions {
 /// Prometheus metrics for user-facing source metrics.
 #[derive(Debug)]
 pub struct SourceStatisticsMetrics {
-    pub(crate) snapshot_committed: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+    // Counters
     pub(crate) messages_received: DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
     pub(crate) updates_staged: DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
     pub(crate) updates_committed: DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
     pub(crate) bytes_received: DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
-    pub(crate) envelope_state_bytes: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
-    pub(crate) envelope_state_count: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+
+    // Gauges
+    pub(crate) snapshot_committed: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+    pub(crate) bytes_indexed: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+    pub(crate) records_indexed: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+    pub(crate) rehydration_latency_ms: DeleteOnDropGauge<'static, AtomicI64, Vec<String>>,
+
+    pub(crate) offset_known: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+    pub(crate) offset_committed: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+
+    pub(crate) snapshot_records_known: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+    pub(crate) snapshot_records_staged: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
 }
 
 impl SourceStatisticsMetrics {
     pub(crate) fn new(
+        defs: &SourceStatisticsMetricDefs,
         id: GlobalId,
         worker_id: usize,
-        metrics: &SourceBaseMetrics,
         parent_source_id: GlobalId,
         shard_id: &mz_persist_client::ShardId,
+        envelope: SourceEnvelope,
     ) -> SourceStatisticsMetrics {
         let shard = shard_id.to_string();
+        let envelope = match envelope {
+            SourceEnvelope::None(_) => "none",
+            SourceEnvelope::Upsert(_) => "upsert",
+            SourceEnvelope::CdcV2 => "cdcv2",
+        };
 
         SourceStatisticsMetrics {
-            snapshot_committed: metrics
-                .source_statistics
-                .snapshot_committed
-                .get_delete_on_drop_gauge(vec![
-                    id.to_string(),
-                    worker_id.to_string(),
-                    parent_source_id.to_string(),
-                    shard.clone(),
-                ]),
-            messages_received: metrics
-                .source_statistics
-                .messages_received
-                .get_delete_on_drop_counter(vec![
-                    id.to_string(),
-                    worker_id.to_string(),
-                    parent_source_id.to_string(),
-                ]),
-            updates_staged: metrics
-                .source_statistics
-                .updates_staged
-                .get_delete_on_drop_counter(vec![
-                    id.to_string(),
-                    worker_id.to_string(),
-                    parent_source_id.to_string(),
-                    shard.clone(),
-                ]),
-            updates_committed: metrics
-                .source_statistics
-                .updates_committed
-                .get_delete_on_drop_counter(vec![
-                    id.to_string(),
-                    worker_id.to_string(),
-                    parent_source_id.to_string(),
-                    shard.clone(),
-                ]),
-            bytes_received: metrics
-                .source_statistics
-                .bytes_received
-                .get_delete_on_drop_counter(vec![
-                    id.to_string(),
-                    worker_id.to_string(),
-                    parent_source_id.to_string(),
-                ]),
-            envelope_state_bytes: metrics
-                .source_statistics
-                .envelope_state_bytes
-                .get_delete_on_drop_gauge(vec![
-                    id.to_string(),
-                    worker_id.to_string(),
-                    parent_source_id.to_string(),
-                    shard.clone(),
-                ]),
-            envelope_state_count: metrics
-                .source_statistics
-                .envelope_state_count
-                .get_delete_on_drop_gauge(vec![
-                    id.to_string(),
-                    worker_id.to_string(),
-                    parent_source_id.to_string(),
-                    shard,
-                ]),
+            snapshot_committed: defs.snapshot_committed.get_delete_on_drop_gauge(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+                shard.clone(),
+            ]),
+            messages_received: defs.messages_received.get_delete_on_drop_counter(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+            ]),
+            updates_staged: defs.updates_staged.get_delete_on_drop_counter(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+                shard.clone(),
+            ]),
+            updates_committed: defs.updates_committed.get_delete_on_drop_counter(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+                shard.clone(),
+            ]),
+            bytes_received: defs.bytes_received.get_delete_on_drop_counter(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+            ]),
+            bytes_indexed: defs.bytes_indexed.get_delete_on_drop_gauge(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+                shard.clone(),
+            ]),
+            records_indexed: defs.records_indexed.get_delete_on_drop_gauge(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+                shard.clone(),
+            ]),
+            rehydration_latency_ms: defs.rehydration_latency_ms.get_delete_on_drop_gauge(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+                shard.clone(),
+                envelope.to_string(),
+            ]),
+            offset_known: defs.offset_known.get_delete_on_drop_gauge(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+            ]),
+            offset_committed: defs.offset_committed.get_delete_on_drop_gauge(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+            ]),
+            snapshot_records_known: defs.snapshot_records_known.get_delete_on_drop_gauge(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+            ]),
+            snapshot_records_staged: defs.snapshot_records_staged.get_delete_on_drop_gauge(vec![
+                id.to_string(),
+                worker_id.to_string(),
+                parent_source_id.to_string(),
+            ]),
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SinkStatisticsMetricsDefinitions {
+pub(crate) struct SinkStatisticsMetricDefs {
+    // Counters
     pub(crate) messages_staged: IntCounterVec,
     pub(crate) messages_committed: IntCounterVec,
     pub(crate) bytes_staged: IntCounterVec,
     pub(crate) bytes_committed: IntCounterVec,
 }
 
-impl SinkStatisticsMetricsDefinitions {
+impl SinkStatisticsMetricDefs {
     pub(crate) fn register_with(registry: &MetricsRegistry) -> Self {
         Self {
             messages_staged: registry.register(metric!(
@@ -205,6 +268,7 @@ impl SinkStatisticsMetricsDefinitions {
 /// Prometheus metrics for user-facing sink metrics.
 #[derive(Debug)]
 pub struct SinkStatisticsMetrics {
+    // Counters
     pub(crate) messages_staged: DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
     pub(crate) messages_committed: DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
     pub(crate) bytes_staged: DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
@@ -213,29 +277,50 @@ pub struct SinkStatisticsMetrics {
 
 impl SinkStatisticsMetrics {
     pub(crate) fn new(
+        defs: &SinkStatisticsMetricDefs,
         id: GlobalId,
         worker_id: usize,
-        metrics: &SinkBaseMetrics,
     ) -> SinkStatisticsMetrics {
         SinkStatisticsMetrics {
-            messages_staged: metrics
-                .sink_statistics
+            messages_staged: defs
                 .messages_staged
                 .get_delete_on_drop_counter(vec![id.to_string(), worker_id.to_string()]),
-            messages_committed: metrics
-                .sink_statistics
+            messages_committed: defs
                 .messages_committed
                 .get_delete_on_drop_counter(vec![id.to_string(), worker_id.to_string()]),
-            bytes_staged: metrics
-                .sink_statistics
+            bytes_staged: defs
                 .bytes_staged
                 .get_delete_on_drop_counter(vec![id.to_string(), worker_id.to_string()]),
-            bytes_committed: metrics
-                .sink_statistics
+            bytes_committed: defs
                 .bytes_committed
                 .get_delete_on_drop_counter(vec![id.to_string(), worker_id.to_string()]),
         }
     }
+}
+
+/// Meta data needed to maintain source statistics.
+#[derive(Debug, Clone)]
+pub struct SourceStatisticsMetadata {
+    /// The resumption upper of the source.
+    resume_upper: Antichain<Timestamp>,
+    /// Time at which the source (more precisely: this metadata object) was created.
+    created_at: Instant,
+}
+
+impl SourceStatisticsMetadata {
+    /// Create a new `SourceStatisticsMetadata` object.
+    pub fn new(resume_upper: Antichain<Timestamp>) -> Self {
+        Self {
+            resume_upper,
+            created_at: Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StatsInner<Stats, Metrics> {
+    stats: Stats,
+    prom: Metrics,
 }
 
 /// A helper struct designed to make it easy for operators to update user-facing metrics.
@@ -250,61 +335,249 @@ impl SinkStatisticsMetrics {
 ///     - This may be fixed in the future when we write the metrics from storaged directly.
 ///     - The value also eventually converge to the same value.
 #[derive(Debug)]
-pub struct StorageStatistics<Stats, Metrics> {
-    // We just use `*StatisticsUpdate` for convenience here!
-    // The boolean its an initialization flag, to ensure we
-    // don't report a false `snapshot_committed` value before
-    // the `persist_sink` reports the current shard upper.
-    // TODO(guswynn): this boolean is kindof gross, it should
-    // probably be cleaned up.
-    //
+pub struct StorageStatistics<Stats, Metrics, Meta> {
     // Note also that the `DeleteOnDropCounter`'s in the `SourceStatisticsMetrics`
     // already are in an `Arc`, so this is a bit of extra wrapping, but the cost
     // shouldn't cost too much.
-    stats: Rc<RefCell<(bool, Stats, Metrics)>>,
+    stats: Rc<RefCell<StatsInner<Stats, Metrics>>>,
+    /// Meta data needed to maintain statistics.
+    meta: Meta,
 }
 
-impl<Stats, Metrics> Clone for StorageStatistics<Stats, Metrics> {
-    /// Return a snapshot of the stats data, if its been initialized.
+impl<Stats, Metrics, Meta: Clone> Clone for StorageStatistics<Stats, Metrics, Meta> {
     fn clone(&self) -> Self {
         Self {
             stats: Rc::clone(&self.stats),
+            meta: self.meta.clone(),
         }
     }
 }
 
-impl<Stats: Clone, Metrics> StorageStatistics<Stats, Metrics> {
-    /// Return a snapshot of the stats data, if its been initialized.
-    pub fn snapshot(&self) -> Option<Stats> {
-        let inner = self.stats.borrow();
-        inner.0.then(|| inner.1.clone())
+/// Statistics maintained for sources. Gauges can be uninitialized.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SourceStatisticsRecord {
+    id: GlobalId,
+    worker_id: usize,
+    // Counters
+    messages_received: u64,
+    bytes_received: u64,
+    updates_staged: u64,
+    updates_committed: u64,
+
+    // Gauges are always wrapped in an `Option` that represents if that gauge has been
+    // initialized by that worker.
+    records_indexed: Option<u64>,
+    bytes_indexed: Option<u64>,
+
+    // This field is nullable, so its value is an `Option`.
+    rehydration_latency_ms: Option<Option<i64>>,
+
+    // The following fields are able to be unset when shipped to the controller, so their
+    // values are `Option`'s
+    snapshot_records_known: Option<Option<u64>>,
+    snapshot_records_staged: Option<Option<u64>>,
+    snapshot_committed: Option<bool>,
+    offset_known: Option<Option<u64>>,
+    offset_committed: Option<Option<u64>>,
+}
+
+impl SourceStatisticsRecord {
+    fn clear(&mut self) {
+        self.messages_received = 0;
+        self.bytes_received = 0;
+        self.updates_staged = 0;
+        self.updates_committed = 0;
+
+        // These gauges MUST be initialized across all workers before we aggregate and
+        // report statistics.
+        self.rehydration_latency_ms = None;
+        self.snapshot_committed = None;
+
+        // We consider these gauges always initialized
+        self.bytes_indexed = Some(0);
+        self.records_indexed = Some(0);
+
+        // We don't yet populate these, so we consider the initialized (with an empty value).
+        self.snapshot_records_known = Some(None);
+        self.snapshot_records_staged = Some(None);
+        self.offset_known = Some(None);
+        self.offset_committed = Some(None);
+    }
+
+    /// Reset counters so that we continue to ship diffs to the controller.
+    fn reset_counters(&mut self) {
+        self.messages_received = 0;
+        self.bytes_received = 0;
+        self.updates_staged = 0;
+        self.updates_committed = 0;
+    }
+
+    /// Convert this record into an `SourceStatisticsUpdate` to be merged
+    /// across workers. Gauges must be initialized.
+    fn as_update(&self) -> SourceStatisticsUpdate {
+        let SourceStatisticsRecord {
+            id,
+            worker_id: _,
+            messages_received,
+            bytes_received,
+            updates_staged,
+            updates_committed,
+            records_indexed,
+            bytes_indexed,
+            rehydration_latency_ms,
+            snapshot_records_known,
+            snapshot_records_staged,
+            snapshot_committed,
+            offset_known,
+            offset_committed,
+        } = self.clone();
+
+        SourceStatisticsUpdate {
+            id,
+            messages_received: messages_received.into(),
+            bytes_received: bytes_received.into(),
+            updates_staged: updates_staged.into(),
+            updates_committed: updates_committed.into(),
+            records_indexed: Gauge::gauge(records_indexed.unwrap()),
+            bytes_indexed: Gauge::gauge(bytes_indexed.unwrap()),
+            rehydration_latency_ms: Gauge::gauge(rehydration_latency_ms.unwrap()),
+            snapshot_records_known: Gauge::gauge(snapshot_records_known.unwrap()),
+            snapshot_records_staged: Gauge::gauge(snapshot_records_staged.unwrap()),
+            snapshot_committed: Gauge::gauge(snapshot_committed.unwrap()),
+            offset_known: SkippableGauge::gauge(offset_known.unwrap()),
+            offset_committed: SkippableGauge::gauge(offset_committed.unwrap()),
+        }
     }
 }
 
-impl StorageStatistics<SourceStatisticsUpdate, SourceStatisticsMetrics> {
+/// Statistics maintained for sinks. Gauges can be uninitialized.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SinkStatisticsRecord {
+    id: GlobalId,
+    worker_id: usize,
+    // Counters
+    messages_staged: u64,
+    messages_committed: u64,
+    bytes_staged: u64,
+    bytes_committed: u64,
+}
+
+impl SinkStatisticsRecord {
+    fn clear(&mut self) {
+        self.messages_staged = 0;
+        self.messages_committed = 0;
+        self.bytes_staged = 0;
+        self.bytes_committed = 0;
+    }
+
+    /// Reset counters so that we continue to ship diffs to the controller.
+    fn reset_counters(&mut self) {
+        self.messages_staged = 0;
+        self.messages_committed = 0;
+        self.bytes_staged = 0;
+        self.bytes_committed = 0;
+    }
+
+    /// Convert this record into an `SinkStatisticsUpdate` to be merged
+    /// across workers. Gauges must be initialized.
+    fn as_update(&self) -> SinkStatisticsUpdate {
+        let SinkStatisticsRecord {
+            id,
+            worker_id: _,
+            messages_staged,
+            messages_committed,
+            bytes_staged,
+            bytes_committed,
+        } = self.clone();
+
+        SinkStatisticsUpdate {
+            id,
+            messages_staged: messages_staged.into(),
+            messages_committed: messages_committed.into(),
+            bytes_staged: bytes_staged.into(),
+            bytes_committed: bytes_committed.into(),
+        }
+    }
+}
+
+/// Statistics maintained for sources.
+pub type SourceStatistics =
+    StorageStatistics<SourceStatisticsRecord, SourceStatisticsMetrics, SourceStatisticsMetadata>;
+
+/// Statistics maintained for sinks.
+pub type SinkStatistics = StorageStatistics<SinkStatisticsRecord, SinkStatisticsMetrics, ()>;
+
+impl SourceStatistics {
     pub(crate) fn new(
         id: GlobalId,
         worker_id: usize,
-        metrics: &SourceBaseMetrics,
+        metrics: &SourceStatisticsMetricDefs,
         parent_source_id: GlobalId,
         shard_id: &mz_persist_client::ShardId,
+        envelope: SourceEnvelope,
+        resume_upper: Antichain<Timestamp>,
     ) -> Self {
         Self {
-            stats: Rc::new(RefCell::new((
-                false,
-                SourceStatisticsUpdate {
+            stats: Rc::new(RefCell::new(StatsInner {
+                stats: SourceStatisticsRecord {
                     id,
                     worker_id,
-                    snapshot_committed: false,
                     messages_received: 0,
                     updates_staged: 0,
                     updates_committed: 0,
                     bytes_received: 0,
-                    envelope_state_bytes: 0,
-                    envelope_state_count: 0,
+                    records_indexed: Some(0),
+                    bytes_indexed: Some(0),
+                    rehydration_latency_ms: None,
+                    snapshot_records_staged: Some(None),
+                    snapshot_records_known: Some(None),
+                    snapshot_committed: None,
+                    offset_known: Some(None),
+                    offset_committed: Some(None),
                 },
-                SourceStatisticsMetrics::new(id, worker_id, metrics, parent_source_id, shard_id),
-            ))),
+                prom: SourceStatisticsMetrics::new(
+                    metrics,
+                    id,
+                    worker_id,
+                    parent_source_id,
+                    shard_id,
+                    envelope,
+                ),
+            })),
+            meta: SourceStatisticsMetadata::new(resume_upper),
+        }
+    }
+
+    /// Clear the data, resetting gauges to uninitialized.
+    /// This does not reset prometheus gauges, which will be overwritten with new values.
+    pub fn clear(&self) {
+        let mut cur = self.stats.borrow_mut();
+        cur.stats.clear();
+    }
+
+    /// Get a snapshot of the data, returning `None` if all gauges are not initialized.
+    ///
+    /// This also resets counters, so that we continue to move diffs around.
+    pub fn snapshot(&mut self) -> Option<SourceStatisticsRecord> {
+        let mut cur = self.stats.borrow_mut();
+
+        match &cur.stats {
+            SourceStatisticsRecord {
+                records_indexed: Some(_),
+                bytes_indexed: Some(_),
+                rehydration_latency_ms: Some(_),
+                snapshot_records_known: Some(_),
+                snapshot_records_staged: Some(_),
+                snapshot_committed: Some(_),
+                offset_known: Some(_),
+                offset_committed: Some(_),
+                ..
+            } => {
+                let ret = Some(cur.stats.clone());
+                cur.stats.reset_counters();
+                ret
+            }
+            _ => None,
         }
     }
 
@@ -314,125 +587,180 @@ impl StorageStatistics<SourceStatisticsUpdate, SourceStatisticsMetrics> {
     /// - In sql, we ensure that we _never_ reset `snapshot_committed` to `false`, but gauges and
     /// counters are ordinarily reset to 0 in Prometheus, so on restarts this value may be inconsistent.
     // TODO(guswynn): Actually test that this initialization logic works.
-    pub fn initialize_snapshot_committed<T: Timestamp>(&self, upper: &Antichain<T>) {
+    pub fn initialize_snapshot_committed(&self, upper: &Antichain<Timestamp>) {
         self.update_snapshot_committed(upper);
-        self.stats.borrow_mut().0 = true;
     }
 
     /// Set the `snapshot_committed` stat based on the reported upper.
-    pub fn update_snapshot_committed<T: Timestamp>(&self, upper: &Antichain<T>) {
-        let value = *upper != Antichain::from_elem(T::minimum());
+    pub fn update_snapshot_committed(&self, upper: &Antichain<Timestamp>) {
+        let value = *upper != Antichain::from_elem(Timestamp::MIN);
         let mut cur = self.stats.borrow_mut();
-        cur.1.snapshot_committed = value;
-        cur.2.snapshot_committed.set(if value { 1 } else { 0 });
+        cur.stats.snapshot_committed = Some(value);
+        cur.prom.snapshot_committed.set(if value { 1 } else { 0 });
     }
 
     /// Increment the `messages_received` stat.
     pub fn inc_messages_received_by(&self, value: u64) {
         let mut cur = self.stats.borrow_mut();
-        cur.1.messages_received = cur.1.messages_received + value;
-        cur.2.messages_received.inc_by(value);
+        cur.stats.messages_received = cur.stats.messages_received + value;
+        cur.prom.messages_received.inc_by(value);
     }
 
     /// Increment the `updates` stat.
     pub fn inc_updates_staged_by(&self, value: u64) {
         let mut cur = self.stats.borrow_mut();
-        cur.1.updates_staged = cur.1.updates_staged + value;
-        cur.2.updates_staged.inc_by(value);
+        cur.stats.updates_staged = cur.stats.updates_staged + value;
+        cur.prom.updates_staged.inc_by(value);
     }
 
     /// Increment the `messages_committed` stat.
     pub fn inc_updates_committed_by(&self, value: u64) {
         let mut cur = self.stats.borrow_mut();
-        cur.1.updates_committed = cur.1.updates_committed + value;
-        cur.2.updates_committed.inc_by(value);
+        cur.stats.updates_committed = cur.stats.updates_committed + value;
+        cur.prom.updates_committed.inc_by(value);
     }
 
     /// Increment the `bytes_received` stat.
     pub fn inc_bytes_received_by(&self, value: u64) {
         let mut cur = self.stats.borrow_mut();
-        cur.1.bytes_received = cur.1.bytes_received + value;
-        cur.2.bytes_received.inc_by(value);
+        cur.stats.bytes_received = cur.stats.bytes_received + value;
+        cur.prom.bytes_received.inc_by(value);
     }
 
-    /// Update the `envelope_state_bytes` stat.
+    /// Update the `bytes_indexed` stat.
     /// A positive value will add and a negative value will subtract.
-    pub fn update_envelope_state_bytes_by(&self, value: i64) {
+    pub fn update_bytes_indexed_by(&self, value: i64) {
         let mut cur = self.stats.borrow_mut();
-        if let Some(updated) = cur.1.envelope_state_bytes.checked_add_signed(value) {
-            cur.1.envelope_state_bytes = updated;
-            cur.2.envelope_state_bytes.set(updated);
+        if let Some(updated) = cur
+            .stats
+            .bytes_indexed
+            .unwrap_or(0)
+            .checked_add_signed(value)
+        {
+            cur.stats.bytes_indexed = Some(updated);
+            cur.prom.bytes_indexed.set(updated);
         } else {
-            let envelope_state_bytes = cur.1.envelope_state_bytes;
+            let bytes_indexed = cur.stats.bytes_indexed.unwrap_or(0);
             tracing::warn!(
-                "Unexpected u64 overflow while updating envelope_state_bytes value {} with {}",
-                envelope_state_bytes,
+                "Unexpected u64 overflow while updating bytes_indexed value {} with {}",
+                bytes_indexed,
                 value
             );
-            cur.1.envelope_state_bytes = 0;
-            cur.2.envelope_state_bytes.set(0);
+            cur.stats.bytes_indexed = Some(0);
+            cur.prom.bytes_indexed.set(0);
         }
     }
 
-    /// Set the `envelope_state_bytes` to the given value
-    pub fn set_envelope_state_bytes(&self, value: i64) {
+    /// Set the `bytes_indexed` to the given value
+    pub fn set_bytes_indexed(&self, value: i64) {
         let mut cur = self.stats.borrow_mut();
         let value = if value < 0 {
-            tracing::warn!(
-                "Unexpected negative value for envelope_state_bytes {}",
-                value
-            );
+            tracing::warn!("Unexpected negative value for bytes_indexed {}", value);
             0
         } else {
             value.unsigned_abs()
         };
-        cur.1.envelope_state_bytes = value;
-        cur.2.envelope_state_bytes.set(value);
+        cur.stats.bytes_indexed = Some(value);
+        cur.prom.bytes_indexed.set(value);
     }
 
-    /// Update the `envelope_state_count` stat.
+    /// Update the `records_indexed` stat.
     /// A positive value will add and a negative value will subtract.
-    pub fn update_envelope_state_count_by(&self, value: i64) {
+    pub fn update_records_indexed_by(&self, value: i64) {
         let mut cur = self.stats.borrow_mut();
-        if let Some(updated) = cur.1.envelope_state_count.checked_add_signed(value) {
-            cur.1.envelope_state_count = updated;
-            cur.2.envelope_state_count.set(updated);
+        if let Some(updated) = cur
+            .stats
+            .records_indexed
+            .unwrap_or(0)
+            .checked_add_signed(value)
+        {
+            cur.stats.records_indexed = Some(updated);
+            cur.prom.records_indexed.set(updated);
         } else {
-            let envelope_state_count = cur.1.envelope_state_count;
+            let records_indexed = cur.stats.records_indexed.unwrap_or(0);
             tracing::warn!(
-                "Unexpected u64 overflow while updating envelope_state_count value {} with {}",
-                envelope_state_count,
+                "Unexpected u64 overflow while updating records_indexed value {} with {}",
+                records_indexed,
                 value
             );
-            cur.1.envelope_state_count = 0;
-            cur.2.envelope_state_count.set(0);
+            cur.stats.records_indexed = Some(0);
+            cur.prom.records_indexed.set(0);
         }
     }
 
-    /// Set the `envelope_state_count` to the given value
-    pub fn set_envelope_state_count(&self, value: i64) {
+    /// Set the `records_indexed` to the given value
+    pub fn set_records_indexed(&self, value: i64) {
         let mut cur = self.stats.borrow_mut();
         let value = if value < 0 {
-            tracing::warn!(
-                "Unexpected negative value for envelope_state_count {}",
-                value
-            );
+            tracing::warn!("Unexpected negative value for records_indexed {}", value);
             0
         } else {
             value.unsigned_abs()
         };
-        cur.1.envelope_state_count = value;
-        cur.2.envelope_state_count.set(value);
+        cur.stats.records_indexed = Some(value);
+        cur.prom.records_indexed.set(value);
+    }
+
+    /// Initialize the `rehydration_latency_ms` stat as `NULL`.
+    pub fn initialize_rehydration_latency_ms(&self) {
+        let mut cur = self.stats.borrow_mut();
+        cur.stats.rehydration_latency_ms = Some(None);
+    }
+
+    /// Set the `rehydration_latency_ms` stat based on the reported upper.
+    pub fn update_rehydration_latency_ms(&self, upper: &Antichain<Timestamp>) {
+        let mut cur = self.stats.borrow_mut();
+
+        if matches!(cur.stats.rehydration_latency_ms, Some(Some(_))) {
+            return; // source was already hydrated before
+        }
+        if !PartialOrder::less_than(&self.meta.resume_upper, upper) {
+            return; // source is not yet hydrated
+        }
+
+        let elapsed = self.meta.created_at.elapsed();
+        let value = elapsed
+            .as_millis()
+            .try_into()
+            .expect("Rehydration took more than ~584 million years!");
+        cur.stats.rehydration_latency_ms = Some(Some(value));
+        cur.prom.rehydration_latency_ms.set(value);
+    }
+
+    /// Set the `offset_known` stat to the given value.
+    pub fn set_offset_known(&self, value: u64) {
+        let mut cur = self.stats.borrow_mut();
+        cur.stats.offset_known = Some(Some(value));
+        cur.prom.offset_known.set(value);
+    }
+
+    /// Set the `offset_committed` stat to the given value.
+    pub fn set_offset_committed(&self, value: u64) {
+        let mut cur = self.stats.borrow_mut();
+        cur.stats.offset_committed = Some(Some(value));
+        cur.prom.offset_committed.set(value);
+    }
+
+    /// Set the `snapshot_records_known` stat to the given value.
+    pub fn set_snapshot_records_known(&self, value: u64) {
+        let mut cur = self.stats.borrow_mut();
+        cur.stats.snapshot_records_known = Some(Some(value));
+        cur.prom.snapshot_records_known.set(value);
+    }
+
+    /// Set the `snapshot_records_known` stat to the given value.
+    pub fn set_snapshot_records_staged(&self, value: u64) {
+        let mut cur = self.stats.borrow_mut();
+        cur.stats.snapshot_records_staged = Some(Some(value));
+        cur.prom.snapshot_records_staged.set(value);
     }
 }
 
-impl StorageStatistics<SinkStatisticsUpdate, SinkStatisticsMetrics> {
-    pub(crate) fn new(id: GlobalId, worker_id: usize, metrics: &SinkBaseMetrics) -> Self {
+impl SinkStatistics {
+    pub(crate) fn new(id: GlobalId, worker_id: usize, metrics: &SinkStatisticsMetricDefs) -> Self {
         Self {
-            stats: Rc::new(RefCell::new((
-                // We have no snapshot metrics for sinks as of now.
-                true,
-                SinkStatisticsUpdate {
+            stats: Rc::new(RefCell::new(StatsInner {
+                stats: SinkStatisticsRecord {
                     id,
                     worker_id,
                     messages_staged: 0,
@@ -440,36 +768,312 @@ impl StorageStatistics<SinkStatisticsUpdate, SinkStatisticsMetrics> {
                     bytes_staged: 0,
                     bytes_committed: 0,
                 },
-                SinkStatisticsMetrics::new(id, worker_id, metrics),
-            ))),
+                prom: SinkStatisticsMetrics::new(metrics, id, worker_id),
+            })),
+            meta: (),
         }
     }
 
-    /// Increment the `messages_received` stat.
+    /// Clear the data, resetting gauges to uninitialized.
+    /// This does not reset prometheus gauges, which will be overwritten with new values.
+    pub fn clear(&self) {
+        let mut cur = self.stats.borrow_mut();
+        cur.stats.clear()
+    }
+
+    /// Get a snapshot of the data, returning `None` if all gauges are not initialized.
+    ///
+    /// This also resets counters, so that we continue to move diffs around.
+    pub fn snapshot(&mut self) -> Option<SinkStatisticsRecord> {
+        let mut cur = self.stats.borrow_mut();
+
+        match &cur.stats {
+            SinkStatisticsRecord { .. } => {
+                let ret = Some(cur.stats.clone());
+                cur.stats.reset_counters();
+                ret
+            }
+        }
+    }
+
+    /// Increment the `messages_staged` stat.
     pub fn inc_messages_staged_by(&self, value: u64) {
         let mut cur = self.stats.borrow_mut();
-        cur.1.messages_staged = cur.1.messages_staged + value;
-        cur.2.messages_staged.inc_by(value);
+        cur.stats.messages_staged = cur.stats.messages_staged + value;
+        cur.prom.messages_staged.inc_by(value);
     }
 
-    /// Increment the `messages_received` stat.
+    /// Increment the `bytes_received` stat.
     pub fn inc_bytes_staged_by(&self, value: u64) {
         let mut cur = self.stats.borrow_mut();
-        cur.1.bytes_staged = cur.1.bytes_staged + value;
-        cur.2.bytes_staged.inc_by(value);
+        cur.stats.bytes_staged = cur.stats.bytes_staged + value;
+        cur.prom.bytes_staged.inc_by(value);
     }
 
-    /// Increment the `messages_received` stat.
+    /// Increment the `messages_committed` stat.
     pub fn inc_messages_committed_by(&self, value: u64) {
         let mut cur = self.stats.borrow_mut();
-        cur.1.messages_committed = cur.1.messages_committed + value;
-        cur.2.messages_committed.inc_by(value);
+        cur.stats.messages_committed = cur.stats.messages_committed + value;
+        cur.prom.messages_committed.inc_by(value);
     }
 
-    /// Increment the `messages_received` stat.
+    /// Increment the `bytes_committed` stat.
     pub fn inc_bytes_committed_by(&self, value: u64) {
         let mut cur = self.stats.borrow_mut();
-        cur.1.bytes_committed = cur.1.bytes_committed + value;
-        cur.2.bytes_committed.inc_by(value);
+        cur.stats.bytes_committed = cur.stats.bytes_committed + value;
+        cur.prom.bytes_committed.inc_by(value);
+    }
+}
+
+/// A structure that keeps track of _local_ statistics, as well as aggregating
+/// statistics into a single worker (currently worker 0).
+///
+/// This is because we ONLY want to emit statistics for _gauge-style-statistics_ when
+/// ALL workers have caught up to the _currently running instance of a source/sink_ and have
+/// reported an accurate gauge. This prevents issues like 1 worker reporting
+/// `snapshot_committed=true` before the others workers have caught up to report that they haven't
+/// finished snapshotting.
+///
+/// The API flow is:
+/// - Initialize sources/sinks with `initialize_source` or `initialize_sink`. This advances the
+/// local epoch.
+/// - Advance the _global epoch_ with `advance_global_epoch`. This should always be called strictly
+/// before reinitializing objects.
+/// - Emit a snapshot of local data with `emit_local`, which can be broadcasted to other workers.
+/// - Ingest data from other workers with `ingest`.
+/// - Emit a `snapshot` of _global data_ (i.e. skipping objects that don't have all workers caught
+/// up) with `snapshot`.
+///
+/// All functions can and should be called from ALL workers.
+///
+/// Note that we hand-roll a statistics epoch here, but in the future, when the storage
+/// _controller_ has top-level support for _dataflow epochs_, this logic can be entirely moved
+/// there.
+pub struct AggregatedStatistics {
+    worker_id: usize,
+    worker_count: usize,
+    local_source_statistics: BTreeMap<GlobalId, (usize, SourceStatistics)>,
+    local_sink_statistics: BTreeMap<GlobalId, (usize, SinkStatistics)>,
+
+    global_source_statistics: BTreeMap<GlobalId, (usize, Vec<Option<SourceStatisticsUpdate>>)>,
+    global_sink_statistics: BTreeMap<GlobalId, (usize, Vec<Option<SinkStatisticsUpdate>>)>,
+}
+
+impl AggregatedStatistics {
+    /// Initialize a new `AggregatedStatistics`.
+    pub fn new(worker_id: usize, worker_count: usize) -> Self {
+        AggregatedStatistics {
+            worker_id,
+            worker_count,
+            local_source_statistics: Default::default(),
+            local_sink_statistics: Default::default(),
+            global_source_statistics: Default::default(),
+            global_sink_statistics: Default::default(),
+        }
+    }
+
+    /// Get a `SourceStatistics` for an id, if it exists.
+    pub fn get_source(&self, id: &GlobalId) -> Option<&SourceStatistics> {
+        self.local_source_statistics.get(id).map(|(_, s)| s)
+    }
+
+    /// Get a `SinkStatistics` for an id, if it exists.
+    pub fn get_sink(&self, id: &GlobalId) -> Option<&SinkStatistics> {
+        self.local_sink_statistics.get(id).map(|(_, s)| s)
+    }
+
+    /// Deinitialize an object. Other methods other than `initialize_source` and `initialize_sink`
+    /// will never overwrite this.
+    pub fn deinitialize(&mut self, id: GlobalId) {
+        self.local_source_statistics.remove(&id);
+        self.local_sink_statistics.remove(&id);
+        self.global_source_statistics.remove(&id);
+        self.global_sink_statistics.remove(&id);
+    }
+
+    /// Advance the _global epoch_ for statistics. Local statistics before this epoch will be
+    /// ignored.
+    pub fn advance_global_epoch(&mut self, id: GlobalId) {
+        if self.worker_id == 0 {
+            self.global_source_statistics
+                .entry(id)
+                .and_modify(|(ref mut epoch, ref mut stats)| {
+                    *epoch += 1;
+                    *stats = vec![None; self.worker_count];
+                });
+            self.global_sink_statistics
+                .entry(id)
+                .and_modify(|(ref mut epoch, ref mut stats)| {
+                    *epoch += 1;
+                    *stats = vec![None; self.worker_count];
+                });
+        }
+    }
+
+    /// Re-initialize a source. If it already exists, then its local epoch is advanced.
+    pub fn initialize_source<F: FnOnce() -> SourceStatistics>(&mut self, id: GlobalId, stats: F) {
+        self.local_source_statistics
+            .entry(id)
+            .and_modify(|(ref mut epoch, ref mut stats)| {
+                *epoch += 1;
+                stats.clear()
+            })
+            .or_insert_with(|| (0, stats()));
+
+        if self.worker_id == 0 {
+            self.global_source_statistics
+                .entry(id)
+                .or_insert_with(|| (0, vec![None; self.worker_count]));
+        }
+    }
+
+    /// Re-initialize a sink. If it already exists, then its local epoch is advanced.
+    pub fn initialize_sink<F: FnOnce() -> SinkStatistics>(&mut self, id: GlobalId, stats: F) {
+        self.local_sink_statistics
+            .entry(id)
+            .and_modify(|(ref mut epoch, ref mut stats)| {
+                *epoch += 1;
+                stats.clear()
+            })
+            .or_insert_with(|| (0, stats()));
+        if self.worker_id == 0 {
+            self.global_sink_statistics
+                .entry(id)
+                .or_insert_with(|| (0, vec![None; self.worker_count]));
+        }
+    }
+
+    /// Ingest data from other workers.
+    pub fn ingest(
+        &mut self,
+        source_statistics: Vec<(usize, SourceStatisticsRecord)>,
+        sink_statistics: Vec<(usize, SinkStatisticsRecord)>,
+    ) {
+        // Currently, only worker 0 ingest data from other workers.
+        if self.worker_id == 0 {
+            for (epoch, stat) in source_statistics {
+                self.global_source_statistics.entry(stat.id).and_modify(
+                    |(global_epoch, ref mut stats)| {
+                        if epoch >= *global_epoch {
+                            match &mut stats[stat.worker_id] {
+                                None => {
+                                    stats[stat.worker_id] = Some(stat.as_update());
+                                }
+                                Some(occupied) => occupied.incorporate(stat.as_update()),
+                            }
+                        }
+                    },
+                );
+            }
+
+            for (epoch, stat) in sink_statistics {
+                self.global_sink_statistics.entry(stat.id).and_modify(
+                    |(global_epoch, ref mut stats)| {
+                        if epoch >= *global_epoch {
+                            match &mut stats[stat.worker_id] {
+                                None => {
+                                    stats[stat.worker_id] = Some(stat.as_update());
+                                }
+                                Some(occupied) => occupied.incorporate(stat.as_update()),
+                            }
+                        }
+                    },
+                );
+            }
+        }
+    }
+
+    fn _emit_local(
+        &mut self,
+    ) -> (
+        Vec<(usize, SourceStatisticsRecord)>,
+        Vec<(usize, SinkStatisticsRecord)>,
+    ) {
+        let sources = self
+            .local_source_statistics
+            .values_mut()
+            .flat_map(|(epoch, s)| s.snapshot().map(|v| (*epoch, v)))
+            .collect();
+
+        let sinks = self
+            .local_sink_statistics
+            .values_mut()
+            .flat_map(|(epoch, s)| s.snapshot().map(|v| (*epoch, v)))
+            .collect();
+
+        (sources, sinks)
+    }
+
+    /// Emit a snapshot of this workers local data.
+    pub fn emit_local(
+        &mut self,
+    ) -> (
+        Vec<(usize, SourceStatisticsRecord)>,
+        Vec<(usize, SinkStatisticsRecord)>,
+    ) {
+        // As an optimization, worker 0 does not broadcast it data. It ingests
+        // it in `snapshot`.
+        if self.worker_id == 0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        self._emit_local()
+    }
+
+    /// Emit a _global_ snapshot of data. This does not include objects whose workers have not
+    /// initialized gauges for the current epoch.
+    pub fn snapshot(&mut self) -> (Vec<SourceStatisticsUpdate>, Vec<SinkStatisticsUpdate>) {
+        if !self.worker_id == 0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        let (sources, sinks) = self._emit_local();
+        self.ingest(sources, sinks);
+
+        let sources = self
+            .global_source_statistics
+            .iter_mut()
+            .filter_map(|(_, (_, s))| {
+                if s.iter().all(|s| s.is_some()) {
+                    let ret = Some(SourceStatisticsUpdate::summarize(|| {
+                        s.iter().filter_map(Option::as_ref)
+                    }));
+
+                    // Reset the counters so we only report diffs.
+                    s.iter_mut().for_each(|s| {
+                        if let Some(s) = s {
+                            s.reset_counters();
+                        }
+                    });
+                    ret
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let sinks = self
+            .global_sink_statistics
+            .iter_mut()
+            .filter_map(|(_, (_, s))| {
+                if s.iter().all(|s| s.is_some()) {
+                    let ret = Some(SinkStatisticsUpdate::summarize(|| {
+                        s.iter().filter_map(Option::as_ref)
+                    }));
+
+                    // Reset the counters so we only report diffs.
+                    s.iter_mut().for_each(|s| {
+                        if let Some(s) = s {
+                            s.reset_counters();
+                        }
+                    });
+                    ret
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        (sources, sinks)
     }
 }

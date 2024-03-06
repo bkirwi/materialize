@@ -12,12 +12,12 @@ mode cockroach
 reset-server
 
 simple conn=mz_system,user=mz_system
-ALTER SYSTEM SET enable_rbac_checks = true
+ALTER SYSTEM SET enable_connection_validation_syntax TO true;
 ----
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-ALTER SYSTEM SET enable_ld_rbac_checks = true
+ALTER SYSTEM SET enable_rbac_checks = true
 ----
 COMPLETE 0
 
@@ -32,7 +32,7 @@ ALTER SYSTEM SET enable_logical_compaction_window = true
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-ALTER ROLE materialize CREATEDB CREATECLUSTER CREATEROLE;
+GRANT ALL PRIVILEGES ON SYSTEM TO materialize;
 ----
 COMPLETE 0
 
@@ -116,7 +116,12 @@ s1
 # Test user made objects
 
 simple conn=mz_system,user=mz_system
-CREATE ROLE joe CREATEDB CREATECLUSTER;
+CREATE ROLE joe;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO joe;
 ----
 COMPLETE 0
 
@@ -156,12 +161,12 @@ GRANT CREATE ON SCHEMA materialize.public TO joe;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO materialize;
+GRANT CREATE ON CLUSTER quickstart TO materialize;
 ----
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO joe;
+GRANT CREATE ON CLUSTER quickstart TO joe;
 ----
 COMPLETE 0
 
@@ -268,7 +273,7 @@ SELECT mz_roles.name
 materialize
 
 statement ok
-ALTER INDEX mt_ind SET (LOGICAL COMPACTION WINDOW = 0)
+ALTER INDEX mt_ind SET (RETAIN HISTORY = FOR 0)
 
 statement ok
 ALTER INDEX mt_ind RENAME TO ICs
@@ -299,12 +304,12 @@ statement error must be owner of INDEX materialize.public.jt_ind
 ALTER INDEX jt_ind OWNER TO group_materialize
 
 statement error must be owner of INDEX materialize.public.jt_ind
-ALTER INDEX jt_ind SET (LOGICAL COMPACTION WINDOW = 0)
+ALTER INDEX jt_ind SET (RETAIN HISTORY = FOR 0)
 
 ## Sources
 
 statement ok
-CREATE SOURCE ms FROM LOAD GENERATOR COUNTER WITH (SIZE '1');
+CREATE SOURCE ms FROM LOAD GENERATOR COUNTER;
 
 query T
 SELECT mz_roles.name
@@ -337,16 +342,13 @@ SELECT mz_roles.name
 group_materialize
 
 statement ok
-ALTER SOURCE ms SET (SIZE = '4')
-
-statement ok
 ALTER SOURCE ms RENAME TO ICs
 
 statement ok
 DROP SOURCE ICs
 
 simple conn=joe,user=joe
-CREATE SOURCE js FROM LOAD GENERATOR COUNTER WITH (SIZE '1');
+CREATE SOURCE js FROM LOAD GENERATOR COUNTER;
 ----
 COMPLETE 0
 
@@ -375,7 +377,7 @@ ALTER SOURCE js RENAME TO cool
 statement error must be owner of SOURCE materialize.public.js
 ALTER SOURCE js OWNER TO group_materialize
 
-statement error must be owner of SOURCE materialize.public.js
+statement error db error: ERROR: Expected one of IGNORE or TIMELINE or TIMESTAMP or RETAIN, found SIZE
 ALTER SOURCE js SET (SIZE = '4')
 
 ## Views
@@ -523,7 +525,7 @@ ALTER MATERIALIZED VIEW jmv OWNER TO group_materialize
 ## Connections
 
 statement ok
-CREATE CONNECTION mc TO KAFKA (BROKER 'localhost:9092');
+CREATE CONNECTION mc TO KAFKA (BROKER 'localhost:9092', SECURITY PROTOCOL PLAINTEXT) WITH (VALIDATE = false);
 
 query T
 SELECT mz_roles.name
@@ -554,13 +556,13 @@ statement ok
 DROP CONNECTION ICs
 
 statement ok
-CREATE CONNECTION mssh TO SSH TUNNEL (HOST 'ssh-bastion-host', USER 'mz', PORT 22);
+CREATE CONNECTION mssh TO SSH TUNNEL (HOST 'ssh-bastion-host', USER 'mz', PORT 22) WITH (VALIDATE = false);
 
 statement ok
 ALTER CONNECTION mssh ROTATE KEYS
 
 simple conn=joe,user=joe
-CREATE CONNECTION jc TO KAFKA (BROKER 'localhost:9092');
+CREATE CONNECTION jc TO KAFKA (BROKER 'localhost:9092', SECURITY PROTOCOL PLAINTEXT) WITH (VALIDATE = false);
 ----
 COMPLETE 0
 
@@ -582,7 +584,7 @@ statement error must be owner of CONNECTION materialize.public.jc
 ALTER CONNECTION jc OWNER TO group_materialize
 
 simple conn=joe,user=joe
-CREATE CONNECTION jssh TO SSH TUNNEL (HOST 'ssh-bastion-host', USER 'mz', PORT 22);
+CREATE CONNECTION jssh TO SSH TUNNEL (HOST 'ssh-bastion-host', USER 'mz', PORT 22) WITH (VALIDATE = false);
 ----
 COMPLETE 0
 
@@ -854,7 +856,7 @@ SELECT mz_roles.name
   LEFT JOIN mz_roles ON mz_cluster_replicas.owner_id = mz_roles.id
   WHERE mz_cluster_replicas.name = 'mr1'
 ----
-materialize
+group_materialize
 
 statement ok
 DROP CLUSTER mclus
@@ -899,10 +901,18 @@ COMPLETE 0
 statement error must be owner of CLUSTER jclus
 ALTER CLUSTER jclus OWNER TO group_materialize
 
+simple conn=joe,user=joe
+DROP CLUSTER jclus;
+----
+COMPLETE 0
+
 ## Cluster Replicas
 
 statement ok
-CREATE CLUSTER REPLICA default.mr2 SIZE '1';
+CREATE CLUSTER mclus REPLICAS (mr1 (SIZE '1'));
+
+statement ok
+CREATE CLUSTER REPLICA mclus.mr2 SIZE '1';
 
 query T
 SELECT mz_roles.name
@@ -912,11 +922,11 @@ SELECT mz_roles.name
 ----
 materialize
 
-statement error must be a member of "group_no_one"
-ALTER CLUSTER REPLICA default.mr2 OWNER TO group_no_one
+statement error altering the owner of a cluster replica is not supported
+ALTER CLUSTER REPLICA mclus.mr2 OWNER TO group_no_one
 
-statement ok
-ALTER CLUSTER REPLICA default.mr2 OWNER TO group_materialize
+statement error altering the owner of a cluster replica is not supported
+ALTER CLUSTER REPLICA mclus.mr2 OWNER TO group_materialize
 
 query T
 SELECT mz_roles.name
@@ -924,13 +934,43 @@ SELECT mz_roles.name
   LEFT JOIN mz_roles ON mz_cluster_replicas.owner_id = mz_roles.id
   WHERE mz_cluster_replicas.name = 'mr2'
 ----
+materialize
+
+statement ok
+ALTER CLUSTER REPLICA mclus.mr2 RENAME TO mr3
+
+query T
+SELECT mz_roles.name
+  FROM mz_cluster_replicas
+  LEFT JOIN mz_roles ON mz_cluster_replicas.owner_id = mz_roles.id
+  WHERE mz_cluster_replicas.name = 'mr3'
+----
+materialize
+
+statement ok
+ALTER CLUSTER mclus OWNER TO group_materialize
+
+query T
+SELECT mz_roles.name
+  FROM mz_cluster_replicas
+  LEFT JOIN mz_roles ON mz_cluster_replicas.owner_id = mz_roles.id
+  WHERE mz_cluster_replicas.name = 'mr3'
+----
 group_materialize
 
 statement ok
-DROP CLUSTER REPLICA default.mr2
+DROP CLUSTER REPLICA mclus.mr3
+
+statement ok
+DROP CLUSTER mclus
 
 simple conn=joe,user=joe
-CREATE CLUSTER REPLICA default.jr2 SIZE '1';
+CREATE CLUSTER jclus REPLICAS (jr1 (SIZE '1'));
+----
+COMPLETE 0
+
+simple conn=joe,user=joe
+CREATE CLUSTER REPLICA jclus.jr2 SIZE '1';
 ----
 COMPLETE 0
 
@@ -942,35 +982,31 @@ SELECT mz_roles.name
 ----
 joe
 
-statement error must be owner of CLUSTER REPLICA default.jr2
-DROP CLUSTER REPLICA default.jr2
+statement error must be owner of CLUSTER REPLICA jclus.jr2
+DROP CLUSTER REPLICA jclus.jr2
 
-statement error must be owner of CLUSTER REPLICA default.jr2
-ALTER CLUSTER REPLICA default.jr2 OWNER TO group_materialize
+statement error must be owner of CLUSTER REPLICA jclus.jr2
+ALTER CLUSTER REPLICA jclus.jr2 RENAME TO jr3
 
-statement error db error: ERROR: must be owner of CLUSTER REPLICA default\.jr2
-ALTER CLUSTER REPLICA default.jr2 RENAME TO jr3
+statement error altering the owner of a cluster replica is not supported
+ALTER CLUSTER REPLICA jclus.jr2 OWNER TO group_materialize
 
 simple conn=joe,user=joe
-ALTER CLUSTER REPLICA default.jr2 RENAME TO jr3
+DROP CLUSTER REPLICA jclus.jr2;
 ----
 COMPLETE 0
+
+simple conn=joe,user=joe
+DROP CLUSTER jclus;
+----
+COMPLETE 0
+
+## Clean up
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER jclus TO materialize;
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM joe;
 ----
 COMPLETE 0
-
-statement ok
-CREATE CLUSTER REPLICA jclus.mr_cross SIZE '1';
-
-query T
-SELECT mz_roles.name
-  FROM mz_cluster_replicas
-  LEFT JOIN mz_roles ON mz_cluster_replicas.owner_id = mz_roles.id
-  WHERE mz_cluster_replicas.name = 'mr_cross'
-----
-materialize
 
 # Renaming does not change owner
 
@@ -1003,7 +1039,12 @@ materialize
 ## Tables
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1016,7 +1057,7 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
@@ -1030,12 +1071,13 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: owner of table t
-owner: privileges on table t granted by owner
-owner: privileges granted on table t to owner
-owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: owner of TABLE "materialize.public.t"
+owner: privileges on TABLE "materialize.public.t" granted by owner
+owner: privileges granted on TABLE "materialize.public.t" to owner
+owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner1,user=owner
 DROP TABLE t;
@@ -1046,9 +1088,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1061,7 +1104,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1071,7 +1119,12 @@ DROP ROLE owner
 ## Indexes
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1084,7 +1137,7 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
@@ -1102,15 +1155,16 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: owner of table t
-owner: privileges on table t granted by owner
-owner: privileges granted on table t to owner
-owner: owner of index ind
-owner: privileges on index ind granted by owner
-owner: privileges granted on index ind to owner
-owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: owner of TABLE "materialize.public.t"
+owner: privileges on TABLE "materialize.public.t" granted by owner
+owner: privileges granted on TABLE "materialize.public.t" to owner
+owner: owner of INDEX "materialize.public.ind"
+owner: privileges on INDEX "materialize.public.ind" granted by owner
+owner: privileges granted on INDEX "materialize.public.ind" to owner
+owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner2,user=owner
 DROP INDEX ind;
@@ -1126,9 +1180,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1141,7 +1196,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1151,7 +1211,12 @@ DROP ROLE owner
 ## Sources
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1164,12 +1229,12 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
 simple conn=owner3,user=owner
-create SOURCE s FROM LOAD GENERATOR COUNTER WITH (SIZE '1');
+create SOURCE s FROM LOAD GENERATOR COUNTER;
 ----
 COMPLETE 0
 
@@ -1177,19 +1242,17 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: owner of source s_progress
-owner: privileges on source s_progress granted by owner
-owner: privileges granted on source s_progress to owner
-owner: owner of source s
-owner: privileges on source s granted by owner
-owner: privileges granted on source s to owner
-owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
-owner: owner of cluster materialize_public_s
-owner: privileges on cluster materialize_public_s granted by owner
-owner: privileges granted on cluster materialize_public_s to owner
-owner: owner of cluster replica linked
+DETAIL: owner: owner of SOURCE "materialize.public.s_progress"
+owner: privileges granted on SOURCE "materialize.public.s_progress" to mz_support
+owner: privileges on SOURCE "materialize.public.s_progress" granted by owner
+owner: privileges granted on SOURCE "materialize.public.s_progress" to owner
+owner: owner of SOURCE "materialize.public.s"
+owner: privileges on SOURCE "materialize.public.s" granted by owner
+owner: privileges granted on SOURCE "materialize.public.s" to owner
+owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner3,user=owner
 DROP SOURCE s;
@@ -1200,9 +1263,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1215,7 +1279,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1225,7 +1294,12 @@ DROP ROLE owner
 ## Views
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1238,7 +1312,7 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
@@ -1251,12 +1325,13 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: owner of view v
-owner: privileges on view v granted by owner
-owner: privileges granted on view v to owner
-owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: owner of VIEW "materialize.public.v"
+owner: privileges on VIEW "materialize.public.v" granted by owner
+owner: privileges granted on VIEW "materialize.public.v" to owner
+owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner4,user=owner
 DROP VIEW v;
@@ -1267,9 +1342,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1282,7 +1358,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1292,7 +1373,12 @@ DROP ROLE owner
 ## Materialized Views
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1305,7 +1391,7 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
@@ -1318,12 +1404,13 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: owner of materialized view mvv
-owner: privileges on materialized view mvv granted by owner
-owner: privileges granted on materialized view mvv to owner
-owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: owner of MATERIALIZED VIEW "materialize.public.mvv"
+owner: privileges on MATERIALIZED VIEW "materialize.public.mvv" granted by owner
+owner: privileges granted on MATERIALIZED VIEW "materialize.public.mvv" to owner
+owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner5,user=owner
 DROP MATERIALIZED VIEW mvv;
@@ -1334,9 +1421,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1349,7 +1437,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1359,7 +1452,12 @@ DROP ROLE owner
 ## Connections
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1372,12 +1470,12 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
 simple conn=owner6,user=owner
-CREATE CONNECTION c TO KAFKA (BROKER 'localhost:9092');
+CREATE CONNECTION c TO KAFKA (BROKER 'localhost:9092', SECURITY PROTOCOL PLAINTEXT) WITH (VALIDATE = false);
 ----
 COMPLETE 0
 
@@ -1385,12 +1483,13 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: owner of connection c
-owner: privileges on connection c granted by owner
-owner: privileges granted on connection c to owner
-owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: owner of CONNECTION "materialize.public.c"
+owner: privileges on CONNECTION "materialize.public.c" granted by owner
+owner: privileges granted on CONNECTION "materialize.public.c" to owner
+owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner6,user=owner
 DROP CONNECTION c;
@@ -1401,9 +1500,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1416,7 +1516,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1426,7 +1531,12 @@ DROP ROLE owner
 ## Types
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1439,7 +1549,7 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
@@ -1452,13 +1562,14 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: owner of type ty
-owner: privileges on type ty granted by owner
-owner: privileges granted on type ty to owner
-owner: privileges granted on type ty to public
-owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: owner of TYPE "materialize.public.ty"
+owner: privileges on TYPE "materialize.public.ty" granted by owner
+owner: privileges granted on TYPE "materialize.public.ty" to owner
+owner: privileges granted on TYPE "materialize.public.ty" to public
+owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner7,user=owner
 DROP TYPE ty;
@@ -1469,9 +1580,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1484,7 +1596,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1494,7 +1611,12 @@ DROP ROLE owner
 ## Secrets
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1507,7 +1629,7 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
@@ -1520,12 +1642,13 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: owner of secret se
-owner: privileges on secret se granted by owner
-owner: privileges granted on secret se to owner
-owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: owner of SECRET "materialize.public.se"
+owner: privileges on SECRET "materialize.public.se" granted by owner
+owner: privileges granted on SECRET "materialize.public.se" to owner
+owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner8,user=owner
 DROP SECRET se;
@@ -1536,9 +1659,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1551,7 +1675,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1561,7 +1690,12 @@ DROP ROLE owner
 ## Databases
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1574,7 +1708,7 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
@@ -1587,16 +1721,19 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: owner of database db
-owner: privileges on database db granted by owner
-owner: privileges granted on database db to owner
-owner: owner of schema public
-owner: privileges on schema public granted by owner
-owner: privileges granted on schema public to owner
-owner: privileges granted on schema public to public
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: owner of DATABASE "db"
+owner: privileges granted on DATABASE "db" to mz_support
+owner: privileges on DATABASE "db" granted by owner
+owner: privileges granted on DATABASE "db" to owner
+owner: owner of SCHEMA "db.public"
+owner: privileges granted on SCHEMA "db.public" to mz_support
+owner: privileges on SCHEMA "db.public" granted by owner
+owner: privileges granted on SCHEMA "db.public" to owner
+owner: privileges granted on SCHEMA "db.public" to public
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner9,user=owner
 DROP DATABASE db;
@@ -1607,9 +1744,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1622,7 +1760,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1632,7 +1775,12 @@ DROP ROLE owner
 ## Schemas
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1645,7 +1793,7 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
@@ -1658,12 +1806,14 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: owner of schema sc
-owner: privileges on schema sc granted by owner
-owner: privileges granted on schema sc to owner
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: owner of SCHEMA "materialize.sc"
+owner: privileges granted on SCHEMA "materialize.sc" to mz_support
+owner: privileges on SCHEMA "materialize.sc" granted by owner
+owner: privileges granted on SCHEMA "materialize.sc" to owner
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner10,user=owner
 DROP SCHEMA sc;
@@ -1674,9 +1824,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1689,7 +1840,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1699,7 +1855,12 @@ DROP ROLE owner
 ## Clusters
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1712,7 +1873,7 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
@@ -1725,13 +1886,15 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
-owner: owner of cluster clus
-owner: privileges on cluster clus granted by owner
-owner: privileges granted on cluster clus to owner
-owner: owner of cluster replica r1
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: owner of CLUSTER "clus"
+owner: privileges granted on CLUSTER "clus" to mz_support
+owner: privileges on CLUSTER "clus" granted by owner
+owner: privileges granted on CLUSTER "clus" to owner
+owner: owner of CLUSTER REPLICA "r1"
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner11,user=owner
 DROP CLUSTER clus;
@@ -1742,9 +1905,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1757,7 +1921,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1767,7 +1936,12 @@ DROP ROLE owner
 ## Cluster Replicas
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1779,13 +1953,13 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 ----
 COMPLETE 0
 
-simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+simple conn=owner12,user=owner
+CREATE CLUSTER clus REPLICAS (r1 (SIZE '1'));
 ----
 COMPLETE 0
 
 simple conn=owner12,user=owner
-CREATE CLUSTER REPLICA default.r2 SIZE '1';
+CREATE CLUSTER REPLICA clus.r2 SIZE '1';
 ----
 COMPLETE 0
 
@@ -1793,13 +1967,18 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
-owner: owner of cluster replica r2
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: owner of CLUSTER "clus"
+owner: privileges granted on CLUSTER "clus" to mz_support
+owner: privileges on CLUSTER "clus" granted by owner
+owner: privileges granted on CLUSTER "clus" to owner
+owner: owner of CLUSTER REPLICA "r1"
+owner: owner of CLUSTER REPLICA "r2"
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner12,user=owner
-DROP CLUSTER REPLICA default.r2;
+DROP CLUSTER REPLICA clus.r2;
 ----
 COMPLETE 0
 
@@ -1807,9 +1986,19 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: owner of CLUSTER "clus"
+owner: privileges granted on CLUSTER "clus" to mz_support
+owner: privileges on CLUSTER "clus" granted by owner
+owner: privileges granted on CLUSTER "clus" to owner
+owner: owner of CLUSTER REPLICA "r1"
+owner: privileges on SYSTEM granted by mz_system
+
+simple conn=owner12,user=owner
+DROP CLUSTER clus;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1822,7 +2011,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1832,7 +2026,12 @@ DROP ROLE owner
 ## Multiple Objects
 
 statement ok
-CREATE ROLE owner CREATEDB CREATECLUSTER
+CREATE ROLE owner
+
+simple conn=mz_system,user=mz_system
+GRANT CREATECLUSTER, CREATEDB ON SYSTEM TO owner;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO owner;
@@ -1845,7 +2044,7 @@ GRANT CREATE ON SCHEMA materialize.public TO owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-GRANT CREATE ON CLUSTER default TO owner;
+GRANT CREATE ON CLUSTER quickstart TO owner;
 ----
 COMPLETE 0
 
@@ -1863,15 +2062,16 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: owner of table t
-owner: privileges on table t granted by owner
-owner: privileges granted on table t to owner
-owner: owner of view v
-owner: privileges on view v granted by owner
-owner: privileges granted on view v to owner
-owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: owner of TABLE "materialize.public.t"
+owner: privileges on TABLE "materialize.public.t" granted by owner
+owner: privileges granted on TABLE "materialize.public.t" to owner
+owner: owner of VIEW "materialize.public.v"
+owner: privileges on VIEW "materialize.public.v" granted by owner
+owner: privileges granted on VIEW "materialize.public.v" to owner
+owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner13,user=owner
 DROP TABLE t
@@ -1882,12 +2082,13 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: owner of view v
-owner: privileges on view v granted by owner
-owner: privileges granted on view v to owner
-owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: owner of VIEW "materialize.public.v"
+owner: privileges on VIEW "materialize.public.v" granted by owner
+owner: privileges granted on VIEW "materialize.public.v" to owner
+owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=owner13,user=owner
 DROP VIEW v
@@ -1898,9 +2099,10 @@ simple conn=materialize,user=materialize
 DROP ROLE owner
 ----
 db error: ERROR: role "owner" cannot be dropped because some objects depend on it
-DETAIL: owner: privileges on database materialize granted by mz_system
-owner: privileges on schema public granted by mz_system
-owner: privileges on cluster default granted by mz_system
+DETAIL: owner: privileges on DATABASE "materialize" granted by mz_system
+owner: privileges on SCHEMA "materialize.public" granted by mz_system
+owner: privileges on CLUSTER "quickstart" granted by mz_system
+owner: privileges on SYSTEM granted by mz_system
 
 simple conn=mz_system,user=mz_system
 REVOKE CREATE ON DATABASE materialize FROM owner;
@@ -1913,7 +2115,12 @@ REVOKE CREATE ON SCHEMA materialize.public FROM owner;
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
-REVOKE CREATE ON CLUSTER default FROM owner;
+REVOKE CREATE ON CLUSTER quickstart FROM owner;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATECLUSTER, CREATEDB ON SYSTEM FROM owner;
 ----
 COMPLETE 0
 
@@ -1930,7 +2137,7 @@ db error: ERROR: system cluster 'mz_system' cannot be modified
 simple conn=mz_system,user=mz_system
 ALTER CLUSTER REPLICA mz_system.r1 OWNER TO mz_system
 ----
-db error: ERROR: system cluster 'mz_system' cannot be modified
+db error: ERROR: altering the owner of a cluster replica is not supported
 
 simple conn=mz_system,user=mz_system
 ALTER SCHEMA mz_catalog OWNER TO mz_system
@@ -2041,7 +2248,7 @@ CREATE INDEX i1 ON t (a);
 db error: ERROR: must be owner of TABLE materialize.public.t
 
 simple conn=mz_system,user=mz_system
-CREATE INDEX i1 IN CLUSTER default ON t (a);
+CREATE INDEX i1 IN CLUSTER quickstart ON t (a);
 ----
 COMPLETE 0
 
@@ -2086,7 +2293,141 @@ DROP TABLE t
 ----
 COMPLETE 0
 
+# Test that linked replica, and subsource owners are consistent with their linked
+# object and primary source owners.
+
+statement ok
+CREATE SOURCE s FROM LOAD GENERATOR AUCTION FOR ALL TABLES
+
+query TT
+SELECT mz_sources.name, mz_roles.name
+  FROM mz_sources
+  LEFT JOIN mz_roles ON mz_sources.owner_id = mz_roles.id
+  WHERE mz_sources.name IN ('s', 's_progress', 'accounts', 'auctions', 'bids', 'organizations', 'users')
+  ORDER BY mz_sources.name
+----
+accounts       materialize
+auctions       materialize
+bids           materialize
+organizations  materialize
+s              materialize
+s_progress     materialize
+users          materialize
+
+query TT
+SELECT mz_clusters.name, mz_roles.name
+  FROM mz_clusters
+  LEFT JOIN mz_roles ON mz_clusters.owner_id = mz_roles.id
+  WHERE mz_clusters.name = 'materialize_public_s'
+----
+
+
+query TT
+SELECT mz_cluster_replicas.name, mz_roles.name
+  FROM mz_cluster_replicas
+  LEFT JOIN mz_clusters ON mz_cluster_replicas.cluster_id = mz_clusters.id
+  LEFT JOIN mz_roles ON mz_cluster_replicas.owner_id = mz_roles.id
+  WHERE mz_clusters.name = 'materialize_public_s' AND mz_cluster_replicas.name = 'linked'
+----
+
+
+statement error db error: ERROR: unknown cluster 'materialize_public_s'
+ALTER CLUSTER materialize_public_s OWNER TO joe
+
+statement error altering the owner of a cluster replica is not supported
+ALTER CLUSTER REPLICA materialize_public_s.linked OWNER TO joe
+
+statement error cannot ALTER this type of source
+ALTER SOURCE accounts OWNER TO joe
+
+statement error cannot ALTER this type of source
+ALTER SOURCE s_progress OWNER TO joe
+
+query TT
+SELECT mz_sources.name, mz_roles.name
+  FROM mz_sources
+  LEFT JOIN mz_roles ON mz_sources.owner_id = mz_roles.id
+  WHERE mz_sources.name IN ('s', 's_progress', 'accounts', 'auctions', 'bids', 'organizations', 'users')
+  ORDER BY mz_sources.name
+----
+accounts       materialize
+auctions       materialize
+bids           materialize
+organizations  materialize
+s              materialize
+s_progress     materialize
+users          materialize
+
+query TT
+SELECT mz_clusters.name, mz_roles.name
+  FROM mz_clusters
+  LEFT JOIN mz_roles ON mz_clusters.owner_id = mz_roles.id
+  WHERE mz_clusters.name = 'materialize_public_s'
+----
+
+
+query TT
+SELECT mz_cluster_replicas.name, mz_roles.name
+  FROM mz_cluster_replicas
+  LEFT JOIN mz_clusters ON mz_cluster_replicas.cluster_id = mz_clusters.id
+  LEFT JOIN mz_roles ON mz_cluster_replicas.owner_id = mz_roles.id
+  WHERE mz_clusters.name = 'materialize_public_s' AND mz_cluster_replicas.name = 'linked'
+----
+
+
+simple conn=mz_system,user=mz_system
+ALTER SOURCE s OWNER TO joe
+----
+COMPLETE 0
+
+query TT
+SELECT mz_sources.name, mz_roles.name
+  FROM mz_sources
+  LEFT JOIN mz_roles ON mz_sources.owner_id = mz_roles.id
+  WHERE mz_sources.name IN ('s', 's_progress', 'accounts', 'auctions', 'bids', 'organizations', 'users')
+  ORDER BY mz_sources.name
+----
+accounts       joe
+auctions       joe
+bids           joe
+organizations  joe
+s              joe
+s_progress     joe
+users          joe
+
+query TT
+SELECT mz_clusters.name, mz_roles.name
+  FROM mz_clusters
+  LEFT JOIN mz_roles ON mz_clusters.owner_id = mz_roles.id
+  WHERE mz_clusters.name = 'materialize_public_s'
+----
+
+
+query TT
+SELECT mz_cluster_replicas.name, mz_roles.name
+  FROM mz_cluster_replicas
+  LEFT JOIN mz_clusters ON mz_cluster_replicas.cluster_id = mz_clusters.id
+  LEFT JOIN mz_roles ON mz_cluster_replicas.owner_id = mz_roles.id
+  WHERE mz_clusters.name = 'materialize_public_s' AND mz_cluster_replicas.name = 'linked'
+----
+
+
+simple conn=mz_system,user=mz_system
+DROP SOURCE s
+----
+COMPLETE 0
+
 # Test DROP OWNED
+
+simple conn=mz_system,user=mz_system
+REVOKE ALL PRIVILEGES ON SYSTEM FROM materialize;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+GRANT CREATEDB, CREATECLUSTER ON SYSTEM TO materialize;
+----
+COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 GRANT CREATE ON DATABASE materialize TO PUBLIC;
@@ -2151,6 +2492,12 @@ SELECT name, unnest(privileges)::text FROM mz_views WHERE name = 'v'
 v  mz_system=r/mz_system
 v  materialize=r/mz_system
 
+query T
+SELECT privileges::text FROM mz_system_privileges
+----
+mz_system=RBN/mz_system
+materialize=BN/mz_system
+
 simple conn=mz_system,user=mz_system
 DROP OWNED BY materialize;
 ----
@@ -2181,12 +2528,22 @@ SELECT name, unnest(privileges)::text FROM mz_views WHERE name = 'v'
 ----
 v  mz_system=r/mz_system
 
+query T
+SELECT privileges::text FROM mz_system_privileges
+----
+mz_system=RBN/mz_system
+
 simple conn=mz_system,user=mz_system
 DROP VIEW v;
 ----
 COMPLETE 0
 
 ## Test invalid revokes
+
+simple conn=mz_system,user=mz_system
+GRANT CREATEDB, CREATECLUSTER ON SYSTEM TO materialize;
+----
+COMPLETE 0
 
 statement ok
 CREATE DATABASE db
@@ -2337,14 +2694,26 @@ DROP OWNED BY materialize;
 db error: ERROR: schema "materialize.s" cannot be dropped without CASCADE while it contains non-owned objects
 
 simple conn=mz_system,user=mz_system
-CREATE VIEW v AS SELECT * FROM t;
+CREATE VIEW v1 AS SELECT * FROM t;
 ----
 COMPLETE 0
 
 simple conn=mz_system,user=mz_system
 DROP OWNED BY materialize;
 ----
-db error: ERROR: cannot drop "materialize.public.t" without CASCADE: still depended upon by non-owned catalog items "materialize.public.v"
+db error: ERROR: cannot drop table "materialize.public.t": still depended upon by view "materialize.public.v1"
+HINT: Use DROP ... CASCADE to drop the dependent objects too.
+
+simple conn=mz_system,user=mz_system
+CREATE VIEW v2 AS SELECT * FROM t;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+DROP OWNED BY materialize;
+----
+db error: ERROR: cannot drop table "materialize.public.t": still depended upon by view "materialize.public.v1", view "materialize.public.v2"
+HINT: Use DROP ... CASCADE to drop the dependent objects too.
 
 simple conn=mz_system,user=mz_system
 CREATE MATERIALIZED VIEW mv IN CLUSTER c AS SELECT 1;
@@ -2354,7 +2723,8 @@ COMPLETE 0
 simple conn=mz_system,user=mz_system
 DROP OWNED BY materialize;
 ----
-db error: ERROR: cannot drop cluster "c" without CASCADE while it contains active objects
+db error: ERROR: cannot drop cluster "c": still depended upon by materialized view "materialize.public.mv"
+HINT: Use DROP ... CASCADE to drop the dependent objects too.
 
 simple conn=mz_system,user=mz_system
 DROP OWNED BY materialize CASCADE;
@@ -2381,6 +2751,11 @@ query T
 SELECT name FROM mz_cluster_replicas WHERE name = 'replica1'
 ----
 
+simple conn=mz_system,user=mz_system
+REVOKE CREATEDB, CREATECLUSTER ON SYSTEM FROM materialize;
+----
+COMPLETE 0
+
 ## Test dropping temporary objects
 
 statement ok
@@ -2403,6 +2778,98 @@ DROP OWNED BY PUBLIC;
 ----
 db error: ERROR: role name "public" is reserved
 DETAIL: The role "public" and the prefixes "mz_" and "pg_" are reserved for system roles.
+
+simple conn=mz_system,user=mz_system
+GRANT ALL PRIVILEGES ON SYSTEM TO materialize;
+----
+COMPLETE 0
+
+## Testing dropping a cluster with bound objects
+
+statement ok
+CREATE CLUSTER c REPLICAS (r1 (SIZE '1'));
+
+statement ok
+CREATE MATERIALIZED VIEW mv IN CLUSTER c AS SELECT 1;
+
+query T
+SELECT name FROM mz_clusters WHERE name = 'c'
+----
+c
+
+query T
+SELECT name FROM mz_materialized_views WHERE name = 'mv'
+----
+mv
+
+statement ok
+DROP OWNED BY materialize
+
+query T
+SELECT name FROM mz_clusters WHERE name = 'c'
+----
+
+query T
+SELECT name FROM mz_materialized_views WHERE name = 'mv'
+----
+
+statement ok
+CREATE CLUSTER c REPLICAS (r1 (SIZE '1'));
+
+statement ok
+GRANT CREATE ON CLUSTER c TO joe
+
+simple conn=mz_system,user=mz_system
+GRANT CREATE ON SCHEMA public TO joe
+----
+COMPLETE 0
+
+simple conn=joe,user=joe
+CREATE MATERIALIZED VIEW mv IN CLUSTER c AS SELECT 1;
+----
+COMPLETE 0
+
+query T
+SELECT name FROM mz_clusters WHERE name = 'c'
+----
+c
+
+query T
+SELECT name FROM mz_materialized_views WHERE name = 'mv'
+----
+mv
+
+statement error cannot drop cluster "c": still depended upon by materialized view "materialize.public.mv"
+DROP OWNED BY materialize
+
+query T
+SELECT name FROM mz_clusters WHERE name = 'c'
+----
+c
+
+query T
+SELECT name FROM mz_materialized_views WHERE name = 'mv'
+----
+mv
+
+statement ok
+DROP OWNED BY materialize CASCADE
+
+query T
+SELECT name FROM mz_clusters WHERE name = 'c'
+----
+
+query T
+SELECT name FROM mz_materialized_views WHERE name = 'mv'
+----
+
+simple conn=mz_system,user=mz_system
+REVOKE CREATE ON SCHEMA public FROM joe
+----
+COMPLETE 0
+
+statement ok
+DROP OWNED BY materialize CASCADE
 
 # Test REASSIGN OWNED
 
@@ -2562,10 +3029,5 @@ DETAIL: The role "public" and the prefixes "mz_" and "pg_" are reserved for syst
 
 simple conn=mz_system,user=mz_system
 ALTER SYSTEM SET enable_rbac_checks TO false;
-----
-COMPLETE 0
-
-simple conn=mz_system,user=mz_system
-ALTER SYSTEM SET enable_ld_rbac_checks TO false;
 ----
 COMPLETE 0

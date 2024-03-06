@@ -29,7 +29,7 @@ use mz_expr::{Id, JoinInputMapper, MirRelationExpr, MirScalarExpr, RECURSION_LIM
 use mz_ore::stack::{CheckedRecursion, RecursionGuard};
 use mz_repr::{Row, RowPacker};
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Hoist literal values from maps wherever possible.
 #[derive(Debug)]
@@ -52,16 +52,15 @@ impl CheckedRecursion for LiteralLifting {
 }
 
 impl crate::Transform for LiteralLifting {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "literal_lifting")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         let literals = self.action(relation, &mut BTreeMap::new())?;
         if !literals.is_empty() {
@@ -229,7 +228,7 @@ impl LiteralLifting {
                         Ok(Vec::new())
                     }
                 }
-                MirRelationExpr::Get { id, typ } => {
+                MirRelationExpr::Get { id, typ, .. } => {
                     // A get expression may need to have literal expressions appended to it.
                     let literals = gets.get(id).cloned().unwrap_or_else(Vec::new);
                     if !literals.is_empty() {
@@ -268,7 +267,7 @@ impl LiteralLifting {
                     limits: _,
                     body,
                 } => {
-                    let recursive_ids = MirRelationExpr::recursive_ids(ids, values)?;
+                    let recursive_ids = MirRelationExpr::recursive_ids(ids, values);
 
                     // Extend the context with empty `literals` vectors for all
                     // recursive IDs.
@@ -666,7 +665,7 @@ impl LiteralLifting {
                     input,
                     group_key,
                     order_key,
-                    limit: _,
+                    limit,
                     offset: _,
                     monotonic: _,
                     expected_group_size: _,
@@ -679,6 +678,16 @@ impl LiteralLifting {
                         let input_arity = input.arity();
                         group_key.retain(|c| *c < input_arity);
                         order_key.retain(|o| o.column < input_arity);
+                        // Inline literals into the limit expression.
+                        if let Some(limit) = limit {
+                            limit.visit_mut_post(&mut |e| {
+                                if let MirScalarExpr::Column(c) = e {
+                                    if *c >= input_arity {
+                                        *e = literals[*c - input_arity].clone();
+                                    }
+                                }
+                            })?;
+                        }
                     }
                     Ok(literals)
                 }

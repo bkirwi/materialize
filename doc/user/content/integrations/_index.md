@@ -41,10 +41,11 @@ Kafka is supported as a [**source**](/get-started/key-concepts/#sources), with f
 | Service                               | Support level                   | Notes                                                                                                                                                                                                                                                                                                                                                      |             |
 | ------------------------------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
 | Apache Kafka                          | {{< supportLevel production >}} | See the [source](/sql/create-source/kafka/) and [sink](/sql/create-sink/kafka) documentation for more details.                                                                                                                                                                                                                                      |             |
-| Confluent Cloud                       | {{< supportLevel production >}} | Use [`SASL/PLAIN` authentication](/sql/create-connection/#kafka-auth-sasl-options), to securely connect to a Confluent Cloud cluster. See the [Confluent Cloud guide](/integrations/confluent-cloud) for a step-by-step breakdown of the integration.                                                                                                                   |             |
+| Confluent Cloud                       | {{< supportLevel production >}} | Use SASL authentication to securely connect to a Confluent Cloud cluster. See the [Confluent Cloud guide](/integrations/confluent-cloud) for a step-by-step breakdown of the integration.                                                                                                                   |             |
 | Amazon MSK (Managed Streaming for Apache Kafka) | {{< supportLevel production >}} | See the [source documentation](/sql/create-source/kafka/) for more details, and the [Amazon MSK guide](/integrations/aws-msk/) for a step-by-step breakdown of the integration.                                                                                                                                                                               |             |
 | Upstash Kafka                         | {{< supportLevel production >}} | See the [source documentation](/sql/create-source/kafka/) for more details, and the [Upstash Kafka guide](/integrations/upstash-kafka/) for a step-by-step breakdown of the integration.                                                                                                                                                                               |             |
-| Heroku Kafka                          | {{< supportLevel alpha >}}      | Use [`SSL` authentication](/sql/create-connection/#kafka-auth-ssl-options) and the Heroku-provided provided keys and certificates for security, and the `KAFKA_URL` as the broker address (replacing `kafka+ssl://` with `ssl://`). Heroku is not supported as a sink yet ([#8378](https://github.com/MaterializeInc/materialize/issues/8378#issuecomment-1061317275)). | [](#notify) |
+| Heroku Kafka                          | {{< supportLevel alpha >}}      | Use SSL authentication and the Heroku-provided provided keys and certificates for security, and the `KAFKA_URL` as the broker address, after removing `kafka+ssl://`. |
+| WarpStream                            | {{< supportLevel beta >}}       | See the [WarpStream guide](/integrations/warpstream/) for a step-by-step breakdown of the integration.                                                                                                                                                                                                                                                    |             |
 
 ### Redpanda
 
@@ -52,8 +53,8 @@ Being Kafka API-compatible, Redpanda is supported as a [**source**](/get-started
 
 | Service        | Support level             | Notes                                                                                                                                                                                                                                                                                                                                 |             |
 | -------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| Redpanda       | {{< supportLevel beta >}} | See the [source](/sql/create-source/kafka/) and [sink](/sql/create-sink/kafka) documentation for more details.                                                                                                                                                                                                                 | [](#notify) |
-| Redpanda Cloud | {{< supportLevel beta >}} | Use [`SASL` authentication](/sql/create-connection/#kafka-auth-sasl-options) to securely connect to Redpanda Cloud clusters. See the [Redpanda documentation](https://docs.redpanda.com/docs/security/acls/#acls) for more details, and the [Redpanda Cloud guide](/integrations/redpanda-cloud/) for a step-by-step breakdown of the integration. | [](#notify) |
+| Redpanda       | {{< supportLevel production >}} | See the [source](/sql/create-source/kafka/) and [sink](/sql/create-sink/kafka) documentation for more details.                                                                                                                                                                                                                 | [](#notify) |
+| Redpanda Cloud | {{< supportLevel production >}} | Use SASL authentication to securely connect to Redpanda Cloud clusters. See the [Redpanda documentation](https://docs.redpanda.com/docs/security/acls/#acls) for more details, and the [Redpanda Cloud guide](/integrations/redpanda-cloud/) for a step-by-step breakdown of the integration. | [](#notify) |
 
 ### Kinesis Data Streams
 
@@ -81,7 +82,7 @@ PostgreSQL 11+ is supported as a [**source**](/get-started/key-concepts/#sources
 
 | Service                         | Support level                    | Notes                                                                                                                                                                                                                                                                                         |             |
 | ------------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| PostgreSQL _(direct)_           | {{< supportLevel production >}}        | See the [source documentation](/sql/create-source/postgres/) for more details, and the relevant integration guide for step-by-step instructions:<p></p><ul><li>[Amazon RDS for PostgreSQL](/ingest-data/postgres-amazon-rds)</li><li>[Amazon Aurora for PostgreSQL](/ingest-data/postgres-amazon-aurora)</li><li>[Azure DB for PostgreSQL](/ingest-data/postgres-azure-db)</li><li>[Google Cloud SQL for PostgreSQL](/ingest-data/postgres-google-cloud-sql)</li><li>[Self-hosted PostgreSQL](/ingest-data/postgres-self-hosted)</li></ul> |
+| PostgreSQL _(direct)_           | {{< supportLevel production >}}        | See the [source documentation](/sql/create-source/postgres/) for more details, and the relevant integration guide for step-by-step instructions:<p></p><ul><li>[Amazon RDS for PostgreSQL](/ingest-data/postgres-amazon-rds)</li><li>[Amazon Aurora for PostgreSQL](/ingest-data/postgres-amazon-aurora)</li><li>[Azure DB for PostgreSQL](/ingest-data/postgres-azure-db)</li><li>[Google Cloud SQL for PostgreSQL](/ingest-data/postgres-google-cloud-sql)</li><li>[AlloyDB for PostgreSQL](/ingest-data/postgres-alloydb)</li><li>[Self-hosted PostgreSQL](/ingest-data/postgres-self-hosted)</li></ul> |
 | PostgreSQL _(via Debezium)_     | {{< supportLevel production >}}  | See the [PostgreSQL guide](/ingest-data/cdc-postgres-kafka-debezium/) for a step-by-step breakdown of the integration. |
 
 ### MySQL
@@ -104,7 +105,7 @@ Debezium has an extensive ecosystem of connectors, but each database has its own
 | Service                     | Support level                    | Notes                                                                                                                                                                                                                                                                                                                                                                                                                        |             |
 | --------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
 | MongoDB _(via Debezium)_    | {{< supportLevel researching >}} | Not supported yet {{% gh 7289 %}}. Subscribe via "Notify Me" to register interest.                                                                                                                                                                                                                                                                                                                                           | [](#notify) |
-| SQL Server _(via Debezium)_ | {{< supportLevel alpha >}}       | Supported with known limitations {{% gh 8054 %}}. See the [Debezium documentation](https://debezium.io/documentation/reference/stable/connectors/sqlserver.html) for details on how to configure a SQL Server instance for [CDC](https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-overview). | [](#notify) |
+| SQL Server _(via Debezium)_ | {{< supportLevel alpha >}}       | Supported with known limitations {{% gh 8054 %}}. See the [SQL Server CDC guide](/integrations/cdc-sql-server/) for a step-by-step breakdown of the integration.                                                                                                                                                                                                                                                             | [](#notify) |
 
 👋 _Is there another database you'd like to use with Materialize? Submit a [feature request](https://github.com/MaterializeInc/materialize/issues/new?assignees=&labels=A-integration&template=02-feature.yml)._
 
@@ -137,18 +138,6 @@ Materialize integrates with dbt through the [`dbt-materialize`](https://github.c
 | dbt Core  | {{< supportLevel beta >}}        | See the [dbt documentation](https://docs.getdbt.com/reference/warehouse-profiles/materialize-profile) for more details, and the [dbt + Materialize guide](/integrations/dbt/) for a step-by-step breakdown of the integration. | [](#notify) |
 | dbt Cloud | {{< supportLevel in-progress >}} | Not supported yet. We are working with the dbt community to bring native Materialize support to dbt Cloud soon.                                                                                                                | [](#notify) |
 
-### SQL clients
-
-| Service      | Support level                    | Notes                                                                                                                                                                                                                                                                             |             |
-| ------------ | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| psql         | {{< supportLevel production >}}  | See [SQL Clients](/integrations/#sql-clients) for more details. Some backslash meta-commands are not yet supported {{% gh 9721 %}}.
-| DBeaver      | {{< supportLevel production >}}  | Connect using the [PostgreSQL database driver](https://hevodata.com/learn/dbeaver-postgresql/#a5).                                                                                                                                                                                |             |
-| DataGrip IDE | {{< supportLevel beta >}}        | Connect using the [PostgreSQL database driver](https://www.jetbrains.com/datagrip/features/postgresql/) with [introspection disabled](https://intellij-support.jetbrains.com/hc/en-us/community/posts/360010694760-How-to-turn-off-automatic-database-introspection-in-Datagrip). |             |
-| pgAdmin      | {{< supportLevel in-progress >}} | Not supported yet {{% gh 5874 %}}. Subscribe via "Notify Me" to register interest.                                                                                                                                                                                                | [](#notify) |
-| TablePlus    | {{< supportLevel alpha >}}       | Connect using the [PostgreSQL database driver](https://tableplus.com/blog/2019/09/jdbc-connection-strings.html).                                                                                                                                                                  | [](#notify) |
-
-👋 _Is there another SQL client you'd like to use with Materialize? Submit a [feature request](https://github.com/MaterializeInc/materialize/issues/new?assignees=&labels=A-integration&template=02-feature.yml)._
-
 ### Terraform
 
 Materialize maintains a
@@ -164,6 +153,29 @@ While Materialize offers support for its provider, Materialize does not offer
 support for these modules.
 {{</ note >}}
 
+### SQL clients
+
+| Service      | Support level                    | Notes                                                                                                                                                                                                                                                                             |             |
+| ------------ | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| psql         | {{< supportLevel production >}}  | See [SQL Clients](/integrations/sql-clients/#psql) for more details. Some backslash meta-commands are not yet supported {{% gh 9721 %}}.
+| DBeaver      | {{< supportLevel production >}}  | Connect using the [Materialize database driver](/integrations/sql-clients/#dbeaver). See [SQL Clients](/integrations/sql-clients/#dbeaver) for more details.                   |
+| DataGrip IDE | {{< supportLevel beta >}}        | Connect using the [PostgreSQL database driver](https://www.jetbrains.com/datagrip/features/postgresql/). See [SQL Clients](/integrations/sql-clients/#datagrip) for more details.
+| PopSQL       | {{< supportLevel beta >}}        | Connect using a [Materialize connection](https://docs.popsql.com/docs/connecting-to-materialize). See [SQL Clients](/integrations/sql-clients/#popsql) for more details.
+| pgAdmin      | {{< supportLevel in-progress >}} | Not supported yet {{% gh 5874 %}}. Subscribe via "Notify Me" to register interest. | [](#notify) |
+| TablePlus    | {{< supportLevel alpha >}}       | Connect using the [PostgreSQL database driver](https://tableplus.com/blog/2019/09/jdbc-connection-strings.html). See [SQL Clients](/integrations/sql-clients/#tableplus) for more details.
+| VSCode       | {{< supportLevel production >}}  | Connect using the [Materialize extension for VS Code](https://github.com/MaterializeInc/vscode-extension).
+
+👋 _Is there another SQL client you'd like to use with Materialize? Submit a [feature request](https://github.com/MaterializeInc/materialize/issues/new?assignees=&labels=A-integration&template=02-feature.yml)._
+
+### Monitoring
+
+| Service      | Support level                    | Notes                                                                                                                                                                                                                                                                             |             |
+| ------------ | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| Datadog      | {{< supportLevel production >}}  | See the [Datadog guide](/manage/monitor/datadog/) for a step-by-step breakdown of the integration.
+| Grafana      | {{< supportLevel production >}}  | See the [Grafana guide](/manage/monitor/grafana/) for a step-by-step breakdown of the integration.                                                                                                                                                                                              |             |
+
+👋 _Is there another SQL client you'd like to use with Materialize? Submit a [feature request](https://github.com/MaterializeInc/materialize/issues/new?assignees=&labels=A-integration&template=02-feature.yml)._
+
 ## Client libraries and ORMs
 
 Applications can use any common language-specific PostgreSQL drivers and PostgreSQL-compatible ORMs to interact with Materialize and **create relations**, **execute queries** and **stream out results**.
@@ -174,14 +186,15 @@ Client libraries and ORM frameworks tend to run complex introspection queries th
 
 ### Client libraries {#libraries-and-drivers}
 
-| Language | Support level                   | Tested drivers                                             | Notes                                                 |
-| -------- | ------------------------------- | ---------------------------------------------------------- | ----------------------------------------------------- |
-| Go       | {{< supportLevel production >}} | [`pgx`](https://github.com/jackc/pgx)                      | See the [Go cheatsheet](/integrations/golang/).       |
-| Java     | {{< supportLevel production >}} | [PostgreSQL JDBC driver](https://jdbc.postgresql.org/)     | See the [Java cheatsheet](/integrations/java-jdbc/).  |
-| Node.js  | {{< supportLevel production >}} | [`node-postgres`](https://node-postgres.com/)              | See the [Node.js cheatsheet](/integrations/node-js/). |
-| PHP      | {{< supportLevel production >}} | [`pdo_pgsql`](https://www.php.net/manual/en/ref.pgsql.php) | See the [PHP cheatsheet](/integrations/php/).         |
-| Python   | {{< supportLevel production >}} | [`psycopg2`](https://pypi.org/project/psycopg2/)           | See the [Python cheatsheet](/integrations/python/).   |
-| Ruby     | {{< supportLevel production >}} | [`pg` gem](https://rubygems.org/gems/pg/)                  | See the [Ruby cheatsheet](/integrations/ruby/).       |
+| Language | Support level                   | Tested drivers                                                  | Notes                                                 |
+| -------- | ------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------- |
+| Go       | {{< supportLevel production >}} | [`pgx`](https://github.com/jackc/pgx)                           | See the [Go cheatsheet](/integrations/golang/).       |
+| Java     | {{< supportLevel production >}} | [PostgreSQL JDBC driver](https://jdbc.postgresql.org/)          | See the [Java cheatsheet](/integrations/java-jdbc/).  |
+| Node.js  | {{< supportLevel production >}} | [`node-postgres`](https://node-postgres.com/)                   | See the [Node.js cheatsheet](/integrations/node-js/). |
+| PHP      | {{< supportLevel production >}} | [`pdo_pgsql`](https://www.php.net/manual/en/ref.pgsql.php)      | See the [PHP cheatsheet](/integrations/php/).         |
+| Python   | {{< supportLevel production >}} | [`psycopg2`](https://pypi.org/project/psycopg2/)                | See the [Python cheatsheet](/integrations/python/).   |
+| Ruby     | {{< supportLevel production >}} | [`pg` gem](https://rubygems.org/gems/pg/)                       | See the [Ruby cheatsheet](/integrations/ruby/).       |
+| Rust     | {{< supportLevel production >}} | [`postgres-openssl`](https://crates.io/crates/postgres-openssl) | See the [Rust cheatsheet](/integrations/rust/).       |
 
 ### ORM frameworks
 
@@ -202,23 +215,22 @@ The level of support for these tools will improve as we extend the coverage of `
 
 | Service  | Support level                    | Notes                                                                              |             |
 | -------- | -------------------------------- | ---------------------------------------------------------------------------------- | ----------- |
-| FiveTran | {{< supportLevel researching >}} | Not supported yet {{% gh 5188 %}}. Subscribe via "Notify Me" to register interest. | [](#notify) |
+| Fivetran | {{< supportLevel researching >}} | Not supported yet {{% gh 5188 %}}. Subscribe via "Notify Me" to register interest. | [](#notify) |
 | Stitch   | {{< supportLevel researching >}} | Not supported yet. Subscribe via "Notify Me" to register interest.                 | [](#notify) |
 | Meltano  | {{< supportLevel researching >}} | Not supported yet. Subscribe via "Notify Me" to register interest.                 | [](#notify) |
 | Airbyte  | {{< supportLevel researching >}} | Not supported yet. Subscribe via "Notify Me" to register interest.                 | [](#notify) |
 
 ### Business Intelligence (BI)
 
-| Service            | Support level                    | Notes                                                                                                                                                                                                               |             |
-| ------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| Metabase           | {{< supportLevel beta >}}        | Connect using the [PostgreSQL database driver](https://www.metabase.com/docs/latest/administration-guide/databases/postgresql.html). See the [Metabase integration page](/integrations/metabase/) for more details. | [](#notify) |
-| Superset           | {{< supportLevel alpha >}}       | Connect using the [PostgreSQL database driver](https://superset.apache.org/docs/databases/postgres/).                                                                                                               | [](#notify) |
-| Preset             | {{< supportLevel alpha >}}       | Connect using the [PostgreSQL database driver](https://superset.apache.org/docs/databases/postgres/).                                                                                                               | [](#notify) |
-| Looker             | {{< supportLevel alpha >}}       | Connect using the [PostgreSQL database driver](https://superset.apache.org/docs/databases/postgres/).                                                                                                               | [](#notify) |
-| Google Data Studio | {{< supportLevel alpha >}}       | Connect using the [PostgreSQL database driver](https://support.google.com/datastudio/answer/7288010?hl#how-to-connect-to-postgresql&zippy=%2Cin-this-article).                                                      | [](#notify) |
-| Tableau            | {{< supportLevel researching >}} | Not supported yet. Subscribe via "Notify Me" to register interest.                                                                                                                                                  | [](#notify) |
-| Microsoft Power BI | {{< supportLevel researching >}} | Not supported yet. Subscribe via "Notify Me" to register interest.                                                                                                                                                  | [](#notify) |
-| Mode Analytics     | {{< supportLevel researching >}} | Not supported yet. Subscribe via "Notify Me" to register interest.                                                                                                                                                  | [](#notify) |
+| Service            | Support level              | Notes                                                                                                                                                                                                                                                                                               |             |
+| ------------------ | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| Metabase           | {{< supportLevel beta >}}  | Connect using the [PostgreSQL database driver](https://www.metabase.com/docs/latest/administration-guide/databases/postgresql.html). See the [Metabase integration page](/integrations/metabase/) for more details.                                                                                 | [](#notify) |
+| Superset           | {{< supportLevel alpha >}} | Connect using the [PostgreSQL database driver](https://superset.apache.org/docs/databases/postgres/).                                                                                                                                                                                               | [](#notify) |
+| Preset             | {{< supportLevel alpha >}} | Connect using the [PostgreSQL database driver](https://superset.apache.org/docs/databases/postgres/).                                                                                                                                                                                               | [](#notify) |
+| Looker             | {{< supportLevel alpha >}} | Connect using the [PostgreSQL database driver](https://cloud.google.com/looker/docs/db-config-postgresql). See the [Looker integration page](/integrations/looker/) for more details.                                                                                                               | [](#notify) |
+| Google Data Studio | {{< supportLevel alpha >}} | Connect using the [PostgreSQL database driver](https://support.google.com/datastudio/answer/7288010?hl#how-to-connect-to-postgresql&zippy=%2Cin-this-article).                                                                                                                                      | [](#notify) |
+| Tableau            | {{< supportLevel alpha >}} | Connect using the [JDBC driver for PostgreSQL](https://help.tableau.com/current/pro/desktop/en-us/examples_postgresql.htm). See the [Tableau integration page](/integrations/tableau/) for more details.                                                                                            | [](#notify) |
+| Microsoft Power BI | {{< supportLevel alpha >}} | Connect using the [PostgreSQL database driver](https://learn.microsoft.com/en-us/power-query/connectors/postgresql). See the [Power BI integration page](/integrations/power-bi/) for more details.                                                                                                 | [](#notify) |
 
 ### Headless BI
 
@@ -230,14 +242,15 @@ The level of support for these tools will improve as we extend the coverage of `
 
 | Service   | Support level                    | Notes                                                                               |             |
 | --------- | -------------------------------- | ----------------------------------------------------------------------------------- | ----------- |
-| Census    | {{< supportLevel researching >}} | Not supported yet. Subscribe via "Notify Me" to register interest.                  | [](#notify) |
-| Hightouch | {{< supportLevel in-progress >}} | Connect using a [PostgreSQL source](https://hightouch.io/docs/sources/postgresql/). | [](#notify) |
+| Census    | {{< supportLevel alpha >}}       | Connect using the [Materialize source](https://docs.getcensus.com/sources/materialize). See the [Census integration page](/manage/reverse-etl/census/) for more details.                 | |
+| Hightouch | {{< supportLevel in-progress >}} | Connect using the [Materialize source](https://hightouch.com/integrations/sources/materialize). | [](#notify) |
 
 ### Data collaboration
 
 | Service | Support level              | Notes                                                                                                                                |             |
 | ------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------- |
-| Hex     | {{< supportLevel alpha >}} | Connect using a [PostgreSQL connection](https://learn.hex.tech/docs/connect-to-data/data-connections/overview#add-a-new-connection). | [](#notify) |
+| Deepnote   | {{< supportLevel production >}} | Connect using the [Materialize connection](https://deepnote.com/docs/materialize). See the [Deepnote integration page](https://materialize.com/docs/serve-results/deepnote/).                            |
+| Hex     | {{< supportLevel beta >}}  | Connect using the [Materialize connection](https://learn.hex.tech/docs/connect-to-data/data-connections/overview). |                 |
 | Retool  | {{< supportLevel alpha >}} | Connect using the [PostgreSQL integration](https://retool.com/integrations/postgresql).                                              | [](#notify) |
 
 👋 _Is there another tool you'd like to use with Materialize? Submit a [feature request](https://github.com/MaterializeInc/materialize/issues/new?assignees=&labels=A-integration&template=02-feature.yml)._

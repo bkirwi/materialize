@@ -8,8 +8,6 @@ menu:
 
 `ALTER ... OWNER` updates the owner of an item.
 
-{{< alpha />}}
-
 ## Syntax
 
 {{< diagram "alter-owner.svg" >}}
@@ -35,6 +33,16 @@ ALTER TABLE t OWNER TO joe;
 ```sql
 ALTER CLUSTER REPLICA production.r1 OWNER TO admin;
 ```
+
+## Privileges
+
+The privileges required to execute this statement are:
+
+- Role membership in `new_owner`.
+- Ownership of the object being altered.
+- `CREATE` privileges on the containing cluster if the object is a cluster replica.
+- `CREATE` privileges on the containing database if the object is a schema.
+- `CREATE` privileges on the containing schema if the object is namespaced by a schema.
 
 ## See also
 

@@ -14,16 +14,10 @@ mode cockroach
 # Start from a pristine state
 reset-server
 
-simple conn=mz_system,user=mz_system
-ALTER SYSTEM SET enable_managed_clusters = true;
-----
-COMPLETE 0
-
-
 statement ok
 CREATE CLUSTER foo SIZE '1'
 
-statement error db error: ERROR: Expected one of OWNER or RENAME or RESET or SET, found dot
+statement error db error: ERROR: Expected one of OWNER or RENAME or RESET or SET or SWAP, found dot
 ALTER CLUSTER foo.bar SET (SIZE '2')
 
 statement ok
@@ -61,15 +55,15 @@ SELECT id, name, managed, replication_factor, size FROM mz_clusters
 ----
 s1  mz_system  false  NULL  NULL
 s2  mz_introspection  false  NULL  NULL
-u1  default  false  NULL  NULL
+u1  quickstart  true  1  2
 
 
 query T rowsort
-SHOW CLUSTERS
+SELECT name FROM (SHOW CLUSTERS)
 ----
 mz_system
 mz_introspection
-default
+quickstart
 
 # Test invalid option combinations.
 
@@ -130,9 +124,9 @@ CREATE CLUSTER baz REPLICAS (), INTROSPECTION INTERVAL 1
 query TTT
 SELECT cluster, replica, size FROM (SHOW CLUSTER REPLICAS) ORDER BY 1, 2, 3
 ----
-default  r1  1
-mz_introspection  r1  1
-mz_system  r1  1
+mz_introspection  r1  2
+mz_system  r1  2
+quickstart  r1  2
 
 statement error db error: ERROR: unknown cluster replica size abc
 CREATE CLUSTER foo SIZE 'abc', REPLICATION FACTOR 3
@@ -143,12 +137,12 @@ CREATE CLUSTER foo SIZE '1', REPLICATION FACTOR 3
 query TTT
 SELECT cluster, replica, size FROM (SHOW CLUSTER REPLICAS) ORDER BY 1, 2, 3
 ----
-default  r1  1
 foo  r1  1
 foo  r2  1
 foo  r3  1
-mz_introspection  r1  1
-mz_system  r1  1
+mz_introspection  r1  2
+mz_system  r1  2
+quickstart  r1  2
 
 query TTTTT rowsort
 SELECT id, name, managed, replication_factor, size FROM mz_clusters WHERE name LIKE 'foo'
@@ -161,12 +155,12 @@ ALTER CLUSTER foo SET (MANAGED = false)
 query TTT
 SELECT cluster, replica, size FROM (SHOW CLUSTER REPLICAS) ORDER BY 1, 2, 3
 ----
-default  r1  1
 foo  r1  1
 foo  r2  1
 foo  r3  1
-mz_introspection  r1  1
-mz_system  r1  1
+mz_introspection  r1  2
+mz_system  r1  2
+quickstart  r1  2
 
 query TTTTT rowsort
 SELECT id, name, managed, replication_factor, size FROM mz_clusters WHERE name LIKE 'foo'
@@ -188,12 +182,12 @@ ALTER CLUSTER foo SET (MANAGED, SIZE '1')
 query TTT
 SELECT cluster, replica, size FROM (SHOW CLUSTER REPLICAS) ORDER BY 1, 2, 3
 ----
-default  r1  1
 foo  r1  1
 foo  r2  1
 foo  r3  1
-mz_introspection  r1  1
-mz_system  r1  1
+mz_introspection  r1  2
+mz_system  r1  2
+quickstart  r1  2
 
 query TTTTT rowsort
 SELECT id, name, managed, replication_factor, size FROM mz_clusters WHERE name LIKE 'foo'
@@ -203,14 +197,14 @@ u5  foo  true  3  1
 query TTT
 SELECT mz_clusters.name, mz_cluster_replicas.name, mz_cluster_replicas.id FROM mz_cluster_replicas JOIN mz_clusters ON mz_cluster_replicas.cluster_id = mz_clusters.id ORDER BY 1, 2
 ----
-default  r1  u1
-foo  r1  u5
-foo  r2  u6
-foo  r3  u7
-mz_introspection  r1  u3
-mz_system  r1  u2
+foo  r1  u3
+foo  r2  u4
+foo  r3  u5
+mz_introspection  r1  s2
+mz_system  r1  s1
+quickstart  r1  u1
 
-statement error db error: ERROR: cannot modify managed cluster foo
+statement error db error: ERROR: cannot drop replica of managed cluster
 DROP CLUSTER REPLICA foo.r1
 
 statement error db error: ERROR: cannot modify managed cluster foo
@@ -222,10 +216,10 @@ ALTER CLUSTER foo SET (REPLICATION FACTOR 1)
 query TTT
 SELECT cluster, replica, size FROM (SHOW CLUSTER REPLICAS) ORDER BY 1, 2, 3
 ----
-default  r1  1
 foo  r1  1
-mz_introspection  r1  1
-mz_system  r1  1
+mz_introspection  r1  2
+mz_system  r1  2
+quickstart  r1  2
 
 query TTTTT rowsort
 SELECT id, name, managed, replication_factor, size FROM mz_clusters WHERE name LIKE 'foo'
@@ -235,17 +229,17 @@ u5  foo  true  1  1
 statement ok
 ALTER CLUSTER foo SET (REPLICATION FACTOR 2)
 
-statement error db error: ERROR: cannot create source in cluster with more than one replica
+statement error cannot create source in cluster with more than one replica
 CREATE SOURCE loadgen IN CLUSTER foo FROM LOAD GENERATOR COUNTER
 
 query TTT
 SELECT cluster, replica, size FROM (SHOW CLUSTER REPLICAS) ORDER BY 1, 2, 3
 ----
-default  r1  1
 foo  r1  1
 foo  r2  1
-mz_introspection  r1  1
-mz_system  r1  1
+mz_introspection  r1  2
+mz_system  r1  2
+quickstart  r1  2
 
 query TTTTT rowsort
 SELECT id, name, managed, replication_factor, size FROM mz_clusters WHERE name LIKE 'foo'
@@ -258,10 +252,10 @@ ALTER CLUSTER foo RESET (REPLICATION FACTOR)
 query TTT
 SELECT cluster, replica, size FROM (SHOW CLUSTER REPLICAS) ORDER BY 1, 2, 3
 ----
-default  r1  1
 foo  r1  1
-mz_introspection  r1  1
-mz_system  r1  1
+mz_introspection  r1  2
+mz_system  r1  2
+quickstart  r1  2
 
 query TTTTT rowsort
 SELECT id, name, managed, replication_factor, size FROM mz_clusters WHERE name LIKE 'foo'
@@ -274,10 +268,10 @@ ALTER CLUSTER foo SET (SIZE '2')
 query TTT
 SELECT cluster, replica, size FROM (SHOW CLUSTER REPLICAS) ORDER BY 1, 2, 3
 ----
-default  r1  1
 foo  r1  2
-mz_introspection  r1  1
-mz_system  r1  1
+mz_introspection  r1  2
+mz_system  r1  2
+quickstart  r1  2
 
 query TTTTT rowsort
 SELECT id, name, managed, replication_factor, size FROM mz_clusters WHERE name LIKE 'foo'
@@ -290,17 +284,17 @@ ALTER CLUSTER foo SET (SIZE '1', REPLICATION FACTOR 1)
 query TTT
 SELECT cluster, replica, size FROM (SHOW CLUSTER REPLICAS) ORDER BY 1, 2, 3
 ----
-default  r1  1
 foo  r1  1
-mz_introspection  r1  1
-mz_system  r1  1
+mz_introspection  r1  2
+mz_system  r1  2
+quickstart  r1  2
 
 query TTTTT rowsort
 SELECT id, name, managed, replication_factor, size FROM mz_clusters WHERE name LIKE 'foo'
 ----
 u5  foo  true  1  1
 
-statement error db error: ERROR: cannot modify managed cluster foo
+statement error db error: ERROR: cannot drop replica of managed cluster
 DROP CLUSTER REPLICA foo.r1
 
 statement ok
@@ -310,13 +304,13 @@ statement error db error: ERROR: unknown cluster replica size invalid_size
 ALTER CLUSTER foo SET (SIZE invalid_size)
 
 statement ok
-DROP CLUSTER REPLICA IF EXISTS default.bar
+DROP CLUSTER REPLICA IF EXISTS quickstart.bar
 
 statement ok
 DROP CLUSTER REPLICA IF EXISTS bar.foo
 
 statement ok
-DROP CLUSTER REPLICA IF EXISTS default.foo
+DROP CLUSTER REPLICA IF EXISTS quickstart.foo
 
 statement error db error: ERROR: CLUSTER foo has no CLUSTER REPLICA named "r1"
 DROP CLUSTER REPLICA foo.r1
@@ -325,16 +319,16 @@ DROP CLUSTER REPLICA foo.r1
 query TTT
 SELECT cluster, replica, size FROM (SHOW CLUSTER REPLICAS) ORDER BY 1, 2, 3
 ----
-default  r1  1
-mz_introspection  r1  1
-mz_system  r1  1
+mz_introspection  r1  2
+mz_system  r1  2
+quickstart  r1  2
 
 query TTTTTTT
 SELECT r.name, r.size, s.processes, s.cpu_nano_cores, s.memory_bytes, s.workers, s.credits_per_hour FROM mz_cluster_replicas r JOIN mz_internal.mz_cluster_replica_sizes s ON r.size = s.size ORDER BY r.name
 ----
-r1  1  1  18446744073709000000  18446744073709551615  1  1
-r1  1  1  18446744073709000000  18446744073709551615  1  1
-r1  1  1  18446744073709000000  18446744073709551615  1  1
+r1  2  1  18446744073709000000  18446744073709551615  2  1
+r1  2  1  18446744073709000000  18446744073709551615  2  1
+r1  2  1  18446744073709000000  18446744073709551615  2  1
 
 statement ok
 DROP CLUSTER foo CASCADE
@@ -393,7 +387,7 @@ CREATE CLUSTER foo SIZE '1', replication factor 1
 statement ok
 CREATE SOURCE loadgen IN CLUSTER foo FROM LOAD GENERATOR COUNTER
 
-statement error db error: ERROR: cannot create more than one replica of a cluster containing sources or sinks
+statement error cannot create more than one replica of a cluster containing sources or sinks
 ALTER CLUSTER foo SET (REPLICATION FACTOR 2)
 
 statement ok
@@ -405,22 +399,41 @@ DROP CLUSTER foo CASCADE
 statement error db error: ERROR: unknown cluster replica size invalid_size
 CREATE CLUSTER foo SIZE invalid_size, REPLICATION FACTOR 0
 
+# Test for #20195 . Without the fix, this query will hang indefinitely
+statement error db error: ERROR: creating cluster replica would violate max_replicas_per_cluster limit \(desired: 9999999, limit: 5, current: 0\)
+CREATE CLUSTER foo SIZE '1', replication factor 9999999;
+
 simple conn=mz_system,user=mz_system
-ALTER SYSTEM SET enable_managed_clusters = false;
+ALTER SYSTEM SET enable_disk_cluster_replicas = true;
 ----
 COMPLETE 0
 
-statement error db error: ERROR: managed clusters is not supported
-CREATE CLUSTER foo MANAGED, SIZE '1'
+statement ok
+CREATE CLUSTER foo REPLICAS (r1 (SIZE '1'), r2 (SIZE '1', DISK))
+
+statement error db error: ERROR: Cluster replicas with DISK true do not match expected DISK false
+ALTER CLUSTER foo SET (MANAGED, DISK=False, SIZE '1')
 
 statement ok
-CREATE CLUSTER foo REPLICAS ()
+DROP CLUSTER foo
 
-statement error db error: ERROR: managed clusters is not supported
-ALTER CLUSTER foo RESET (MANAGED)
+statement ok
+CREATE CLUSTER foo REPLICAS (r1 (SIZE '1'))
 
-statement error db error: ERROR: managed clusters is not supported
-ALTER CLUSTER foo SET (MANAGED)
+statement error db error: ERROR: Cluster replicas with DISK true do not match expected DISK false
+ALTER CLUSTER foo SET (MANAGED, SIZE '1', DISK=False)
+
+statement ok
+DROP CLUSTER foo
+
+statement ok
+CREATE CLUSTER foo REPLICAS (r1 (SIZE '1', DISK), r2 (SIZE '1', DISK))
+
+statement ok
+ALTER CLUSTER foo SET (MANAGED, SIZE '1', DISK)
+
+statement ok
+DROP CLUSTER foo
 
 # Restore pristine server state
 reset-server

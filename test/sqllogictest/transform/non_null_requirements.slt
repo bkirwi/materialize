@@ -7,11 +7,6 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-simple conn=mz_system,user=mz_system
-ALTER SYSTEM SET enable_with_mutually_recursive = true
-----
-COMPLETE 0
-
 #
 # Test various cases of literal lifting
 #
@@ -27,7 +22,7 @@ CREATE TABLE t1 (f1 INTEGER, f2 INTEGER);
 # Simplify non-nullable trees with multiple non-recursive bindings defined under
 # a single`WITH MUTUALLY RECURSIVE` block
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 WITH MUTUALLY RECURSIVE
   c0(x INT, y INT, z INT) AS (
     SELECT *, null::int FROM t1
@@ -46,7 +41,7 @@ Explained Query:
   With Mutually Recursive
     cte l0 =
       Map (42) // { arity: 3 }
-        Distinct group_by=[#0, #1] monotonic // { arity: 2 }
+        Distinct project=[#0, #1] monotonic // { arity: 2 }
           Project (#0, #1) // { arity: 2 }
             Get l0 // { arity: 3 }
 

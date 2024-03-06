@@ -11,7 +11,7 @@
 //!
 //! Every Materialize deployment has a pre-installed [`mz_introspection`] cluster, which
 //! has several indexes to speed up common introspection queries. We also have a special
-//! `mz_introspection` role, which can be used by support teams to diagnose a deployment.
+//! `mz_support` role, which can be used by support teams to diagnose a deployment.
 //! For each of these use cases, we have some special restrictions we want to apply. The
 //! logic around these restrictions is defined here.
 //!
@@ -21,26 +21,52 @@
 use mz_expr::CollectionPlan;
 use mz_repr::GlobalId;
 use mz_sql::catalog::SessionCatalog;
-use mz_sql::plan::{Plan, SubscribeFrom};
+use mz_sql::plan::{
+    ExplainPlanPlan, ExplainTimestampPlan, Explainee, ExplaineeStatement, Plan, SubscribeFrom,
+};
 use smallvec::SmallVec;
 
-use crate::catalog::builtin::{MZ_INTROSPECTION_CLUSTER, MZ_INTROSPECTION_ROLE};
-use crate::catalog::Catalog;
+use crate::catalog::ConnCatalog;
 use crate::coord::TargetCluster;
 use crate::notice::AdapterNotice;
 use crate::session::Session;
-use crate::{rbac, AdapterError};
+use crate::AdapterError;
+use mz_catalog::builtin::MZ_INTROSPECTION_CLUSTER;
 
 /// Checks whether or not we should automatically run a query on the `mz_introspection`
 /// cluster, as opposed to whatever the current default cluster is.
 pub fn auto_run_on_introspection<'a, 's, 'p>(
-    catalog: &'a Catalog,
+    catalog: &'a ConnCatalog<'a>,
     session: &'s Session,
     plan: &'p Plan,
 ) -> TargetCluster {
-    let depends_on = match plan {
-        Plan::Peek(plan) => plan.source.depends_on(),
-        Plan::Subscribe(plan) => plan.from.depends_on(),
+    let (depends_on, could_run_expensive_function) = match plan {
+        Plan::Select(plan) => (
+            plan.source.depends_on(),
+            plan.source.could_run_expensive_function(),
+        ),
+        Plan::ShowColumns(plan) => (
+            plan.select_plan.source.depends_on(),
+            plan.select_plan.source.could_run_expensive_function(),
+        ),
+        Plan::Subscribe(plan) => (
+            plan.from.depends_on(),
+            match &plan.from {
+                SubscribeFrom::Id(_) => false,
+                SubscribeFrom::Query { expr, desc: _ } => expr.could_run_expensive_function(),
+            },
+        ),
+        Plan::ExplainPlan(ExplainPlanPlan {
+            explainee: Explainee::Statement(ExplaineeStatement::Select { plan, .. }),
+            ..
+        }) => (
+            plan.source.depends_on(),
+            plan.source.could_run_expensive_function(),
+        ),
+        Plan::ExplainTimestamp(ExplainTimestampPlan { raw_plan, .. }) => (
+            raw_plan.depends_on(),
+            raw_plan.could_run_expensive_function(),
+        ),
         Plan::CreateConnection(_)
         | Plan::CreateDatabase(_)
         | Plan::CreateSchema(_)
@@ -56,6 +82,7 @@ pub fn auto_run_on_introspection<'a, 's, 'p>(
         | Plan::CreateMaterializedView(_)
         | Plan::CreateIndex(_)
         | Plan::CreateType(_)
+        | Plan::Comment(_)
         | Plan::DiscardTemp
         | Plan::DiscardAll
         | Plan::DropObjects(_)
@@ -64,6 +91,7 @@ pub fn auto_run_on_introspection<'a, 's, 'p>(
         | Plan::ShowAllVariables
         | Plan::ShowCreate(_)
         | Plan::ShowVariable(_)
+        | Plan::InspectShard(_)
         | Plan::SetVariable(_)
         | Plan::ResetVariable(_)
         | Plan::SetTransaction(_)
@@ -71,18 +99,26 @@ pub fn auto_run_on_introspection<'a, 's, 'p>(
         | Plan::CommitTransaction(_)
         | Plan::AbortTransaction(_)
         | Plan::CopyFrom(_)
-        | Plan::CopyRows(_)
-        | Plan::Explain(_)
+        | Plan::CopyTo(_)
+        | Plan::ExplainPlan(_)
+        | Plan::ExplainPushdown(_)
+        | Plan::ExplainSinkSchema(_)
         | Plan::Insert(_)
         | Plan::AlterNoop(_)
         | Plan::AlterClusterRename(_)
+        | Plan::AlterClusterSwap(_)
         | Plan::AlterClusterReplicaRename(_)
         | Plan::AlterCluster(_)
         | Plan::AlterIndexSetOptions(_)
         | Plan::AlterIndexResetOptions(_)
-        | Plan::AlterSink(_)
+        | Plan::AlterConnection(_)
         | Plan::AlterSource(_)
+        | Plan::PurifiedAlterSource { .. }
+        | Plan::AlterSetCluster(_)
         | Plan::AlterItemRename(_)
+        | Plan::AlterItemSwap(_)
+        | Plan::AlterSchemaRename(_)
+        | Plan::AlterSchemaSwap(_)
         | Plan::AlterSecret(_)
         | Plan::AlterSystemSet(_)
         | Plan::AlterSystemReset(_)
@@ -97,13 +133,13 @@ pub fn auto_run_on_introspection<'a, 's, 'p>(
         | Plan::Execute(_)
         | Plan::Deallocate(_)
         | Plan::Raise(_)
-        | Plan::RotateKeys(_)
         | Plan::GrantRole(_)
         | Plan::RevokeRole(_)
         | Plan::GrantPrivileges(_)
         | Plan::RevokePrivileges(_)
         | Plan::AlterDefaultPrivileges(_)
         | Plan::ReassignOwned(_)
+        | Plan::ValidateConnection(_)
         | Plan::SideEffectingFunc(_) => return TargetCluster::Active,
     };
 
@@ -117,25 +153,28 @@ pub fn auto_run_on_introspection<'a, 's, 'p>(
         return TargetCluster::Active;
     }
 
-    // Check to make sure our iterator contains atleast one element, this prevents us
-    // from always running empty queries on the mz_introspection cluster.
+    // These dependencies are just existing dataflows that are referenced in the plan.
     let mut depends_on = depends_on.into_iter().peekable();
-    let non_empty = depends_on.peek().is_some();
+    let has_dependencies = depends_on.peek().is_some();
 
     // Make sure we only depend on the system catalog, and nothing we depend on is a
     // per-replica object, that requires being run a specific replica.
     let valid_dependencies = depends_on.all(|id| {
-        let entry = catalog.get_entry(&id);
+        let entry = catalog.state().get_entry(&id);
         let schema = &entry.name().qualifiers.schema_spec;
 
         let system_only = catalog.state().is_system_schema_specifier(schema);
-        let non_replica = catalog.introspection_dependencies(id).is_empty();
+        let non_replica = catalog.state().introspection_dependencies(id).is_empty();
 
         system_only && non_replica
     });
 
-    if non_empty && valid_dependencies {
-        let intros_cluster = catalog.resolve_builtin_cluster(&MZ_INTROSPECTION_CLUSTER);
+    if (has_dependencies && valid_dependencies)
+        || (!has_dependencies && !could_run_expensive_function)
+    {
+        let intros_cluster = catalog
+            .state()
+            .resolve_builtin_cluster(&MZ_INTROSPECTION_CLUSTER);
         tracing::debug!("Running on '{}' cluster", MZ_INTROSPECTION_CLUSTER.name);
 
         // If we're running on a different cluster than the active one, notify the user.
@@ -151,11 +190,11 @@ pub fn auto_run_on_introspection<'a, 's, 'p>(
 /// Checks if we're currently running on the [`MZ_INTROSPECTION_CLUSTER`], and if so, do
 /// we depend on any objects that we're not allowed to query from the cluster.
 pub fn check_cluster_restrictions(
+    cluster: &str,
     catalog: &impl SessionCatalog,
     plan: &Plan,
 ) -> Result<(), AdapterError> {
     // We only impose restrictions if the current cluster is the introspection cluster.
-    let cluster = catalog.active_cluster();
     if cluster != MZ_INTROSPECTION_CLUSTER.name {
         return Ok(());
     }
@@ -173,7 +212,7 @@ pub fn check_cluster_restrictions(
             SubscribeFrom::Id(id) => Box::new(std::iter::once(id)),
             SubscribeFrom::Query { ref expr, .. } => Box::new(expr.depends_on().into_iter()),
         },
-        Plan::Peek(plan) => Box::new(plan.source.depends_on().into_iter()),
+        Plan::Select(plan) => Box::new(plan.source.depends_on().into_iter()),
         _ => return Ok(()),
     };
 
@@ -200,122 +239,4 @@ pub fn check_cluster_restrictions(
     } else {
         Ok(())
     }
-}
-
-/// TODO(jkosh44) This function will verify the privileges for the mz_introspection user.
-///  All of the privileges are hard coded into this function. In the future if we ever add
-///  a more robust privileges framework, then this function should be replaced with that
-///  framework.
-pub fn user_privilege_hack(
-    catalog: &impl SessionCatalog,
-    session: &Session,
-    plan: &Plan,
-    depends_on: &Vec<GlobalId>,
-) -> Result<(), AdapterError> {
-    if session.user().name != MZ_INTROSPECTION_ROLE.name {
-        return Ok(());
-    }
-
-    match plan {
-        // **Special Cases**
-        //
-        // Generally we want to prevent the mz_introspection user from being able to
-        // access user objects. But there are a few special cases where we permit
-        // limited access, which are:
-        //   * SHOW CREATE ... commands, which are very useful for debugging, see
-        //     <https://github.com/MaterializeInc/materialize/issues/18027> for more
-        //     details.
-        //
-        Plan::ShowCreate(_) => {
-            return Ok(());
-        }
-
-        Plan::Subscribe(_)
-        | Plan::Peek(_)
-        | Plan::CopyFrom(_)
-        | Plan::Explain(_)
-        | Plan::ShowAllVariables
-        | Plan::ShowVariable(_)
-        | Plan::SetVariable(_)
-        | Plan::ResetVariable(_)
-        | Plan::SetTransaction(_)
-        | Plan::StartTransaction(_)
-        | Plan::CommitTransaction(_)
-        | Plan::AbortTransaction(_)
-        | Plan::EmptyQuery
-        | Plan::Declare(_)
-        | Plan::Fetch(_)
-        | Plan::Close(_)
-        | Plan::Prepare(_)
-        | Plan::Execute(_)
-        | Plan::Deallocate(_)
-        | Plan::SideEffectingFunc(_) => {}
-
-        Plan::CreateConnection(_)
-        | Plan::CreateDatabase(_)
-        | Plan::CreateSchema(_)
-        | Plan::CreateRole(_)
-        | Plan::CreateCluster(_)
-        | Plan::CreateClusterReplica(_)
-        | Plan::CreateSource(_)
-        | Plan::CreateSources(_)
-        | Plan::CreateSecret(_)
-        | Plan::CreateSink(_)
-        | Plan::CreateTable(_)
-        | Plan::CreateView(_)
-        | Plan::CreateMaterializedView(_)
-        | Plan::CreateIndex(_)
-        | Plan::CreateType(_)
-        | Plan::DiscardTemp
-        | Plan::DiscardAll
-        | Plan::DropObjects(_)
-        | Plan::DropOwned(_)
-        | Plan::Insert(_)
-        | Plan::AlterNoop(_)
-        | Plan::AlterClusterRename(_)
-        | Plan::AlterClusterReplicaRename(_)
-        | Plan::AlterCluster(_)
-        | Plan::AlterIndexSetOptions(_)
-        | Plan::AlterIndexResetOptions(_)
-        | Plan::AlterRole(_)
-        | Plan::AlterSink(_)
-        | Plan::AlterSource(_)
-        | Plan::AlterItemRename(_)
-        | Plan::AlterSecret(_)
-        | Plan::AlterSystemSet(_)
-        | Plan::AlterSystemReset(_)
-        | Plan::AlterSystemResetAll(_)
-        | Plan::AlterOwner(_)
-        | Plan::ReadThenWrite(_)
-        | Plan::Raise(_)
-        | Plan::RotateKeys(_)
-        | Plan::GrantRole(_)
-        | Plan::RevokeRole(_)
-        | Plan::GrantPrivileges(_)
-        | Plan::RevokePrivileges(_)
-        | Plan::AlterDefaultPrivileges(_)
-        | Plan::CopyRows(_)
-        | Plan::ReassignOwned(_) => {
-            return Err(AdapterError::Unauthorized(
-                rbac::UnauthorizedError::MzIntrospection {
-                    action: plan.name().to_string(),
-                },
-            ))
-        }
-    }
-
-    for id in depends_on {
-        let item = catalog.get_item(id);
-        let full_name = catalog.resolve_full_name(item.name());
-        if !catalog.is_system_schema(&full_name.schema) {
-            return Err(AdapterError::Unauthorized(
-                rbac::UnauthorizedError::Privilege {
-                    object_type: item.item_type().into(),
-                    object_name: full_name.to_string(),
-                },
-            ));
-        }
-    }
-
-    Ok(())
 }

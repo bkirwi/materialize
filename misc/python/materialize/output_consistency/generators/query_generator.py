@@ -7,8 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-from typing import List, Optional
 
+from materialize.output_consistency.common import probability
 from materialize.output_consistency.common.configuration import (
     ConsistencyTestConfiguration,
 )
@@ -18,7 +18,9 @@ from materialize.output_consistency.execution.value_storage_layout import (
 )
 from materialize.output_consistency.expression.expression import Expression
 from materialize.output_consistency.ignore_filter.inconsistency_ignore_filter import (
-    InconsistencyIgnoreFilter,
+    GenericInconsistencyIgnoreFilter,
+)
+from materialize.output_consistency.ignore_filter.internal_output_inconsistency_ignore_filter import (
     YesIgnore,
 )
 from materialize.output_consistency.input_data.test_input_data import (
@@ -40,7 +42,7 @@ class QueryGenerator:
         config: ConsistencyTestConfiguration,
         randomized_picker: RandomizedPicker,
         input_data: ConsistencyTestInputData,
-        ignore_filter: InconsistencyIgnoreFilter,
+        ignore_filter: GenericInconsistencyIgnoreFilter,
     ):
         self.config = config
         self.randomized_picker = randomized_picker
@@ -49,19 +51,19 @@ class QueryGenerator:
 
         self.count_pending_expressions = 0
         # ONE query PER expression using the storage layout specified in the expression, expressions presumably fail
-        self.any_layout_presumably_failing_expressions: List[Expression] = []
+        self.any_layout_presumably_failing_expressions: list[Expression] = []
         # ONE query FOR ALL expressions accessing the horizontal storage layout; expressions presumably succeed and do
         # not contain aggregations
-        self.horizontal_layout_normal_expressions: List[Expression] = []
+        self.horizontal_layout_normal_expressions: list[Expression] = []
         # ONE query FOR ALL expressions accessing the horizontal storage layout and applying aggregations; expressions
         # presumably succeed
-        self.horizontal_layout_aggregate_expressions: List[Expression] = []
+        self.horizontal_layout_aggregate_expressions: list[Expression] = []
         # ONE query FOR ALL expressions accessing the vertical storage layout; expressions presumably succeed and do not
         # contain aggregations
-        self.vertical_layout_normal_expressions: List[Expression] = []
+        self.vertical_layout_normal_expressions: list[Expression] = []
         # ONE query FOR ALL expressions accessing the vertical storage layout and applying aggregations; expressions
         # presumably succeed
-        self.vertical_layout_aggregate_expressions: List[Expression] = []
+        self.vertical_layout_aggregate_expressions: list[Expression] = []
 
     def push_expression(self, expression: Expression) -> None:
         if expression.is_expect_error:
@@ -92,7 +94,7 @@ class QueryGenerator:
     def consume_queries(
         self,
         logger: ConsistencyTestLogger,
-    ) -> List[QueryTemplate]:
+    ) -> list[QueryTemplate]:
         queries = []
         queries.extend(
             self._create_multi_column_queries(
@@ -143,11 +145,11 @@ class QueryGenerator:
     def _create_multi_column_queries(
         self,
         logger: ConsistencyTestLogger,
-        expressions: List[Expression],
+        expressions: list[Expression],
         expect_error: bool,
         storage_layout: ValueStorageLayout,
         contains_aggregations: bool,
-    ) -> List[QueryTemplate]:
+    ) -> list[QueryTemplate]:
         """Creates queries not exceeding the maximum column count"""
         if len(expressions) == 0:
             return []
@@ -170,6 +172,7 @@ class QueryGenerator:
             query = QueryTemplate(
                 expect_error,
                 expression_chunk,
+                None,
                 storage_layout,
                 contains_aggregations,
                 row_selection,
@@ -180,13 +183,18 @@ class QueryGenerator:
         return queries
 
     def _create_single_column_queries(
-        self, logger: ConsistencyTestLogger, expressions: List[Expression]
-    ) -> List[QueryTemplate]:
+        self, logger: ConsistencyTestLogger, expressions: list[Expression]
+    ) -> list[QueryTemplate]:
         """Creates one query per expression"""
 
         queries = []
         for expression in expressions:
-            row_selection = self._select_rows(expression.storage_layout)
+            storage_layout = expression.storage_layout
+
+            if storage_layout == ValueStorageLayout.ANY:
+                storage_layout = ValueStorageLayout.VERTICAL
+
+            row_selection = self._select_rows(storage_layout)
 
             ignore_verdict = self.ignore_filter.shall_ignore_expression(
                 expression, row_selection
@@ -199,8 +207,9 @@ class QueryGenerator:
                 QueryTemplate(
                     expression.is_expect_error,
                     [expression],
-                    expression.storage_layout,
-                    False,
+                    None,
+                    storage_layout,
+                    expression.is_aggregate,
                     row_selection,
                 )
             )
@@ -208,16 +217,20 @@ class QueryGenerator:
         return queries
 
     def _select_rows(self, storage_layout: ValueStorageLayout) -> DataRowSelection:
-        if storage_layout == ValueStorageLayout.HORIZONTAL:
+        if storage_layout == ValueStorageLayout.ANY:
+            raise RuntimeError("Unresolved storage layout")
+        elif storage_layout == ValueStorageLayout.HORIZONTAL:
             return ALL_ROWS_SELECTION
         elif storage_layout == ValueStorageLayout.VERTICAL:
-            if self.randomized_picker.random_boolean(0.8):
-                # In 80% of the cases, try to pick two or three rows
+            if self.randomized_picker.random_boolean(
+                probability.RESTRICT_VERTICAL_LAYOUT_TO_2_OR_3_ROWS
+            ):
+                # With some probability, try to pick two or three rows
                 max_number_of_rows_to_select = self.randomized_picker.random_number(
                     2, 3
                 )
             else:
-                # In 20% of the cases, pick an arbitrary number of rows
+                # With some probability, pick an arbitrary number of rows
                 max_number_of_rows_to_select = self.randomized_picker.random_number(
                     0, self.vertical_storage_row_count
                 )
@@ -232,10 +245,10 @@ class QueryGenerator:
     def _remove_known_inconsistencies(
         self,
         logger: ConsistencyTestLogger,
-        expressions: List[Expression],
+        expressions: list[Expression],
         row_selection: DataRowSelection,
-    ) -> List[Expression]:
-        indices_to_remove = []
+    ) -> list[Expression]:
+        indices_to_remove: list[int] = []
 
         for index, expression in enumerate(expressions):
             ignore_verdict = self.ignore_filter.shall_ignore_expression(
@@ -254,7 +267,7 @@ class QueryGenerator:
         self,
         logger: ConsistencyTestLogger,
         expression: Expression,
-        reason: Optional[str],
+        reason: str | None,
     ) -> None:
         if self.config.verbose_output:
             reason_desc = f" ({reason})" if reason else ""

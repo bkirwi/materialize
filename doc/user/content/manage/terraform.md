@@ -30,7 +30,6 @@ terraform {
   required_providers {
     materialize = {
       source = "MaterializeInc/materialize"
-      version = "0.0.5"
     }
   }
 }
@@ -50,21 +49,19 @@ Materialize recommends saving sensitive input variables as environment variables
 to avoid checking secrets into source control. In Terraform, you can export your Materialize app password as a [Terraform environment variable](https://developer.hashicorp.com/terraform/cli/config/environment-variables#tf_var_name) with the `TF_VAR_<name>` format.
 
 ```shell
-export TF_VAR_MZ_PW=<app_password>
+export TF_VAR_MZ_PASSWORD=<app_password>
 ```
 
 In the `main.tf` file, add the provider configuration and any variable
 references:
 
 ```hcl
-variable "MZ_PW" {}
+variable "MZ_PASSWORD" {}
 
 provider "materialize" {
-  host     = <hostname>
-  username = <username>
-  password = var.MZ_PW
-  port     = 6875
-  database = <database>
+  password       = var.MZ_PASSWORD
+  default_region = <region>
+  database       = <database>
 }
 ```
 
@@ -149,6 +146,8 @@ resources and then use the Materialize provider to build Materialize-specific
 objects. A few use cases are captured in the sections below:
 
 ### AWS PrivateLink
+
+{{< public-preview />}}
 
 To get data into Materialize, you need a connection to allow your data source to
 communicate with Materialize. One option to connect securely to Materialize is
@@ -251,7 +250,7 @@ resource "materialize_connection_postgres" "example_postgres_connection" {
 resource "materialize_source_postgres" "example_source_postgres" {
   name        = "source_postgres"
   schema_name = "schema"
-  size        = "3xsmall"
+  cluster_name = "quickstart"
   postgres_connection {
     name = "pg_connection"
     # Optional parameters
@@ -265,6 +264,47 @@ resource "materialize_source_postgres" "example_source_postgres" {
   }
 }
 ```
+
+## External Secret Stores
+
+Materialize does not directly integrate with external secret stores, but it's possible to manage this integration via Terraform.
+
+The [secret stores demo](https://github.com/MaterializeInc/demos/tree/main/integrations/terraform/secret-stores) shows how to handle [secrets](/sql/create-secret) and sensitive data with some popular secret stores. By utilizing Terraform's infrastructure-as-code model, you can automate and simplify both the initial setup and ongoing management of secret stores with Materialize.
+
+A popular secret store is [HashiCorp Vault](https://www.vaultproject.io/). To use Vault with Materialize, you'll need to install the Terraform Vault provider:
+
+```hcl
+terraform {
+  required_providers {
+    vault = {
+      source  = "hashicorp/vault"
+      version = "~> 3.15"
+    }
+  }
+}
+
+provider "vault" {
+  address = "https://vault.example.com"
+  token   = "your-vault-token"
+}
+```
+
+Next, fetch a secret from Vault and use it to create a new Materialize secret:
+
+```hcl
+data "vault_generic_secret" "materialize_password" {
+  path = "secret/materialize"
+}
+
+resource "materialize_secret" "example_secret" {
+  name  = "pgpass"
+  value = data.vault_generic_secret.materialize_password.data["pgpass"]
+}
+```
+
+In this example, the `vault_generic_secret` data source retrieves a secret from Vault, which is then used as the value for a new `materialize_secret` resource.
+
+You can find examples of using other popular secret stores providers in the [secret stores demo](https://github.com/MaterializeInc/demos/tree/main/integrations/terraform/secret-stores).
 
 ## Contributing
 

@@ -10,28 +10,34 @@
 //! Various utility methods used by the [`Coordinator`]. Ideally these are all
 //! put in more meaningfully named modules.
 
+use mz_adapter_types::connection::ConnectionId;
+use mz_ore::now::EpochMillis;
 use mz_repr::{GlobalId, ScalarType};
-use mz_sql::names::Aug;
-use mz_sql::plan::StatementDesc;
-use mz_sql_parser::ast::{Raw, Statement};
+use mz_sql::names::{Aug, ResolvedIds};
+use mz_sql::plan::{Params, StatementDesc};
+use mz_sql::session::metadata::SessionMetadata;
+use mz_sql_parser::ast::display::AstDisplay;
+use mz_sql_parser::ast::{Raw, Statement, StatementKind};
 
+use crate::active_compute_sink::{ActiveComputeSink, ActiveComputeSinkRetireReason};
 use crate::catalog::Catalog;
+use crate::coord::appends::BuiltinTableAppendNotify;
 use crate::coord::Coordinator;
 use crate::session::{Session, TransactionStatus};
-use crate::subscribe::ActiveSubscribe;
 use crate::util::describe;
 use crate::{metrics, AdapterError, ExecuteContext, ExecuteResponse};
 
 impl Coordinator {
     pub(crate) fn plan_statement(
-        &mut self,
-        session: &mut Session,
+        &self,
+        session: &Session,
         stmt: mz_sql::ast::Statement<Aug>,
         params: &mz_sql::plan::Params,
+        resolved_ids: &ResolvedIds,
     ) -> Result<mz_sql::plan::Plan, AdapterError> {
         let pcx = session.pcx();
         let catalog = self.catalog().for_session(session);
-        let plan = mz_sql::plan::plan(Some(pcx), &catalog, stmt, params)?;
+        let plan = mz_sql::plan::plan(Some(pcx), &catalog, stmt, params, resolved_ids)?;
         Ok(plan)
     }
 
@@ -40,12 +46,15 @@ impl Coordinator {
         mut ctx: ExecuteContext,
         name: String,
         stmt: Statement<Raw>,
-        param_types: Vec<Option<ScalarType>>,
+        sql: String,
+        params: Params,
     ) {
         let catalog = self.owned_catalog();
+        let now = self.now();
         mz_ore::task::spawn(|| "coord::declare", async move {
-            let result = Self::declare_inner(ctx.session_mut(), &catalog, name, stmt, param_types)
-                .map(|()| ExecuteResponse::DeclaredCursor);
+            let result =
+                Self::declare_inner(ctx.session_mut(), &catalog, name, stmt, sql, params, now)
+                    .map(|()| ExecuteResponse::DeclaredCursor);
             ctx.retire(result);
         });
     }
@@ -55,15 +64,26 @@ impl Coordinator {
         catalog: &Catalog,
         name: String,
         stmt: Statement<Raw>,
-        param_types: Vec<Option<ScalarType>>,
+        sql: String,
+        params: Params,
+        now: EpochMillis,
     ) -> Result<(), AdapterError> {
+        let param_types = params
+            .types
+            .iter()
+            .map(|ty| Some(ty.clone()))
+            .collect::<Vec<_>>();
         let desc = describe(catalog, stmt.clone(), &param_types, session)?;
-        let params = vec![];
-        let result_formats = vec![mz_pgrepr::Format::Text; desc.arity()];
+        let params = params.datums.into_iter().zip(params.types).collect();
+        let result_formats = vec![mz_pgwire_common::Format::Text; desc.arity()];
+        let redacted_sql = stmt.to_ast_string_redacted();
+        let logging =
+            session.mint_logging(sql, redacted_sql, now, Some(StatementKind::from(&stmt)));
         session.set_portal(
             name,
             desc,
             Some(stmt),
+            logging,
             params,
             result_formats,
             catalog.transient_revision(),
@@ -71,6 +91,7 @@ impl Coordinator {
         Ok(())
     }
 
+    #[mz_ore::instrument(level = "debug")]
     pub(crate) fn describe(
         catalog: &Catalog,
         session: &Session,
@@ -125,7 +146,7 @@ impl Coordinator {
         if let Some(revision) = Self::verify_statement_revision(
             self.catalog(),
             session,
-            portal.stmt.as_ref(),
+            portal.stmt.as_deref(),
             &portal.desc,
             portal.catalog_revision,
         )? {
@@ -157,7 +178,9 @@ impl Coordinator {
                 desc.param_types.iter().map(|ty| Some(ty.clone())).collect(),
             )?;
             if &current_desc != desc {
-                Err(AdapterError::ChangedPlan)
+                Err(AdapterError::ChangedPlan(format!(
+                    "cached plan must not change result type",
+                )))
             } else {
                 Ok(Some(current_revision))
             }
@@ -168,61 +191,112 @@ impl Coordinator {
 
     /// Handle removing in-progress transaction state regardless of the end action
     /// of the transaction.
-    pub(crate) fn clear_transaction(
+    pub(crate) async fn clear_transaction(
         &mut self,
         session: &mut Session,
     ) -> TransactionStatus<mz_repr::Timestamp> {
-        let conn_meta = self
-            .active_conns
-            .get_mut(session.conn_id())
-            .expect("must exist for active session");
-        let drop_sinks = std::mem::take(&mut conn_meta.drop_sinks);
-        self.drop_compute_sinks(drop_sinks);
-
-        // Release this transaction's compaction hold on collections.
-        if let Some(txn_reads) = self.txn_reads.remove(session.conn_id()) {
-            self.release_read_hold(&txn_reads);
-        }
-
+        self.clear_connection(session.conn_id()).await;
         session.clear_transaction()
     }
 
-    /// Handle adding metadata associated with a SUBSCRIBE query.
-    pub(crate) async fn add_active_subscribe(
-        &mut self,
-        id: GlobalId,
-        active_subscribe: ActiveSubscribe,
-    ) {
-        let update = self
-            .catalog()
-            .state()
-            .pack_subscribe_update(id, &active_subscribe, 1);
-        self.send_builtin_table_updates(vec![update]).await;
+    /// Clears coordinator state for a connection.
+    pub(crate) async fn clear_connection(&mut self, conn_id: &ConnectionId) {
+        self.retire_compute_sinks_for_conn(conn_id, ActiveComputeSinkRetireReason::Finished)
+            .await;
 
-        let session_type = metrics::session_type_label_value(&active_subscribe.user);
-        self.metrics
-            .active_subscribes
-            .with_label_values(&[session_type])
-            .inc();
-
-        self.active_subscribes.insert(id, active_subscribe);
+        // Release this transaction's compaction hold on collections.
+        if let Some(txn_reads) = self.txn_read_holds.remove(conn_id) {
+            self.release_read_holds(txn_reads);
+        }
     }
 
-    /// Handle removing metadata associated with a SUBSCRIBE query.
-    pub(crate) async fn remove_active_subscribe(&mut self, id: GlobalId) {
-        if let Some(active_subscribe) = self.active_subscribes.remove(&id) {
-            let update = self
-                .catalog()
-                .state()
-                .pack_subscribe_update(id, &active_subscribe, -1);
-            self.send_builtin_table_updates(vec![update]).await;
+    /// Adds coordinator bookkeeping for an active compute sink.
+    ///
+    /// This is a low-level method. The caller is responsible for installing the
+    /// sink in the controller.
+    pub(crate) async fn add_active_compute_sink(
+        &mut self,
+        id: GlobalId,
+        active_sink: ActiveComputeSink,
+    ) -> BuiltinTableAppendNotify {
+        let user = self.active_conns()[active_sink.connection_id()].user();
+        let session_type = metrics::session_type_label_value(user);
 
-            let session_type = metrics::session_type_label_value(&active_subscribe.user);
-            self.metrics
-                .active_subscribes
-                .with_label_values(&[session_type])
-                .dec();
+        self.active_conns
+            .get_mut(active_sink.connection_id())
+            .expect("must exist for active sessions")
+            .drop_sinks
+            .insert(id);
+
+        let ret_fut = match &active_sink {
+            ActiveComputeSink::Subscribe(active_subscribe) => {
+                let update = self
+                    .catalog()
+                    .state()
+                    .pack_subscribe_update(id, active_subscribe, 1);
+
+                self.metrics
+                    .active_subscribes
+                    .with_label_values(&[session_type])
+                    .inc();
+
+                self.builtin_table_update().execute(vec![update]).await
+            }
+            ActiveComputeSink::CopyTo(_) => {
+                self.metrics
+                    .active_copy_tos
+                    .with_label_values(&[session_type])
+                    .inc();
+                Box::pin(std::future::ready(()))
+            }
+        };
+        self.active_compute_sinks.insert(id, active_sink);
+        ret_fut
+    }
+
+    /// Removes coordinator bookkeeping for an active compute sink.
+    ///
+    /// This is a low-level method. The caller is responsible for dropping the
+    /// sink from the controller. Consider calling `drop_compute_sink` or
+    /// `retire_compute_sink` instead.
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn remove_active_compute_sink(
+        &mut self,
+        id: GlobalId,
+    ) -> Option<ActiveComputeSink> {
+        if let Some(sink) = self.active_compute_sinks.remove(&id) {
+            let user = self.active_conns()[sink.connection_id()].user();
+            let session_type = metrics::session_type_label_value(user);
+
+            self.active_conns
+                .get_mut(sink.connection_id())
+                .expect("must exist for active compute sink")
+                .drop_sinks
+                .remove(&id);
+
+            match &sink {
+                ActiveComputeSink::Subscribe(active_subscribe) => {
+                    let update =
+                        self.catalog()
+                            .state()
+                            .pack_subscribe_update(id, active_subscribe, -1);
+                    self.builtin_table_update().blocking(vec![update]).await;
+
+                    self.metrics
+                        .active_subscribes
+                        .with_label_values(&[session_type])
+                        .dec();
+                }
+                ActiveComputeSink::CopyTo(_) => {
+                    self.metrics
+                        .active_copy_tos
+                        .with_label_values(&[session_type])
+                        .dec();
+                }
+            }
+            Some(sink)
+        } else {
+            None
         }
-        // Note: Drop sinks are removed at commit time.
     }
 }

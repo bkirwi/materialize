@@ -6,14 +6,10 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
-from typing import Set
 
-from attr import dataclass
 
-from materialize.output_consistency.enum.enum_constant import EnumConstant
-from materialize.output_consistency.execution.evaluation_strategy import (
-    EvaluationStrategyKey,
-)
+from __future__ import annotations
+
 from materialize.output_consistency.expression.expression import Expression
 from materialize.output_consistency.expression.expression_characteristics import (
     ExpressionCharacteristics,
@@ -21,15 +17,16 @@ from materialize.output_consistency.expression.expression_characteristics import
 from materialize.output_consistency.expression.expression_with_args import (
     ExpressionWithArgs,
 )
-from materialize.output_consistency.input_data.return_specs.number_return_spec import (
-    NumericReturnTypeSpec,
+from materialize.output_consistency.ignore_filter.ignore_verdict import (
+    IgnoreVerdict,
+    NoIgnore,
 )
 from materialize.output_consistency.operation.operation import (
     DbFunction,
-    DbFunctionWithCustomPattern,
     DbOperation,
     DbOperationOrFunction,
 )
+from materialize.output_consistency.query.query_template import QueryTemplate
 from materialize.output_consistency.selection.selection import DataRowSelection
 from materialize.output_consistency.validation.validation_message import (
     ValidationError,
@@ -37,28 +34,16 @@ from materialize.output_consistency.validation.validation_message import (
 )
 
 
-@dataclass
-class IgnoreVerdict:
-    ignore: bool
-
-
-@dataclass(frozen=True)
-class YesIgnore(IgnoreVerdict):
-    reason: str
-    ignore: bool = True
-
-
-@dataclass(frozen=True)
-class NoIgnore(IgnoreVerdict):
-    ignore: bool = False
-
-
-class InconsistencyIgnoreFilter:
+class GenericInconsistencyIgnoreFilter:
     """Allows specifying and excluding expressions with known output inconsistencies"""
 
-    def __init__(self) -> None:
-        self.pre_execution_filter = PreExecutionInconsistencyIgnoreFilter()
-        self.post_execution_filter = PostExecutionInconsistencyIgnoreFilter()
+    def __init__(
+        self,
+        pre_execution_filter: PreExecutionInconsistencyIgnoreFilterBase,
+        post_execution_filter: PostExecutionInconsistencyIgnoreFilterBase,
+    ):
+        self.pre_execution_filter = pre_execution_filter
+        self.post_execution_filter = post_execution_filter
 
     def shall_ignore_expression(
         self, expression: Expression, row_selection: DataRowSelection
@@ -73,7 +58,7 @@ class InconsistencyIgnoreFilter:
         return self.post_execution_filter.shall_ignore_error(error)
 
 
-class PreExecutionInconsistencyIgnoreFilter:
+class PreExecutionInconsistencyIgnoreFilterBase:
     def shall_ignore_expression(
         self, expression: Expression, row_selection: DataRowSelection
     ) -> IgnoreVerdict:
@@ -107,7 +92,6 @@ class PreExecutionInconsistencyIgnoreFilter:
         expression: ExpressionWithArgs,
         row_selection: DataRowSelection,
     ) -> IgnoreVerdict:
-
         expression_characteristics = (
             expression.recursively_collect_involved_characteristics(row_selection)
         )
@@ -142,97 +126,82 @@ class PreExecutionInconsistencyIgnoreFilter:
         self,
         expression: ExpressionWithArgs,
         operation: DbOperationOrFunction,
-        _all_involved_characteristics: Set[ExpressionCharacteristics],
+        _all_involved_characteristics: set[ExpressionCharacteristics],
     ) -> IgnoreVerdict:
-        if operation.is_aggregation:
-            for arg in expression.args:
-                if arg.is_leaf():
-                    continue
-
-                arg_type_spec = arg.resolve_return_type_spec()
-                if (
-                    isinstance(arg_type_spec, NumericReturnTypeSpec)
-                    and not arg_type_spec.only_integer
-                ):
-                    # tracked with https://github.com/MaterializeInc/materialize/issues/19592
-                    return YesIgnore("#19592")
-
         return NoIgnore()
 
     def _matches_problematic_function_invocation(
         self,
         db_function: DbFunction,
         expression: ExpressionWithArgs,
-        all_involved_characteristics: Set[ExpressionCharacteristics],
+        all_involved_characteristics: set[ExpressionCharacteristics],
     ) -> IgnoreVerdict:
-        # Note that function names are always provided in lower case.
-        if db_function.function_name in {
-            "sum",
-            "avg",
-            "stddev_samp",
-            "stddev_pop",
-            "var_samp",
-            "var_pop",
-        }:
-            if ExpressionCharacteristics.MAX_VALUE in all_involved_characteristics:
-                # tracked with https://github.com/MaterializeInc/materialize/issues/19511
-                return YesIgnore("#19511")
-
-            if (
-                ExpressionCharacteristics.DECIMAL in all_involved_characteristics
-                and ExpressionCharacteristics.TINY_VALUE in all_involved_characteristics
-            ):
-                # tracked with https://github.com/MaterializeInc/materialize/issues/19511
-                return YesIgnore("#19511")
-
-        if db_function.function_name in {"regexp_match"}:
-            if len(expression.args) == 3 and isinstance(
-                expression.args[2], EnumConstant
-            ):
-                # This is a regexp_match function call with case-insensitive configuration.
-                # https://github.com/MaterializeInc/materialize/issues/18494
-                return YesIgnore("#18494")
-
-        if db_function.function_name in {"array_agg", "string_agg"} and not isinstance(
-            db_function, DbFunctionWithCustomPattern
-        ):
-            # The unordered variants are to be ignored.
-            # https://github.com/MaterializeInc/materialize/issues/19832
-            return YesIgnore("#19832")
-
         return NoIgnore()
 
     def _matches_problematic_operation_invocation(
         self,
         db_operation: DbOperation,
         expression: ExpressionWithArgs,
-        all_involved_characteristics: Set[ExpressionCharacteristics],
+        all_involved_characteristics: set[ExpressionCharacteristics],
     ) -> IgnoreVerdict:
-        # https://github.com/MaterializeInc/materialize/issues/18494
-        if db_operation.pattern in {"$ ~* $", "$ !~* $"}:
-            return YesIgnore("#18494")
-
         return NoIgnore()
 
 
-class PostExecutionInconsistencyIgnoreFilter:
+class PostExecutionInconsistencyIgnoreFilterBase:
     def shall_ignore_error(self, error: ValidationError) -> IgnoreVerdict:
+        query_template = error.query_execution.query_template
+        contains_aggregation = query_template.contains_aggregations
+
         if error.error_type == ValidationErrorType.SUCCESS_MISMATCH:
-            outcome_by_strategy_id = error.query_execution.get_outcome_by_strategy_key()
+            return self._shall_ignore_success_mismatch(
+                error, query_template, contains_aggregation
+            )
 
-            dfr_successful = outcome_by_strategy_id[
-                EvaluationStrategyKey.DATAFLOW_RENDERING
-            ].successful
-            ctf_successful = outcome_by_strategy_id[
-                EvaluationStrategyKey.CONSTANT_FOLDING
-            ].successful
+        if error.error_type == ValidationErrorType.ERROR_MISMATCH:
+            return self._shall_ignore_error_mismatch(
+                error, query_template, contains_aggregation
+            )
 
-            if (
-                error.query_execution.query_template.contains_aggregations
-                and not dfr_successful
-                and ctf_successful
-            ):
-                # see https://github.com/MaterializeInc/materialize/issues/19662
-                return YesIgnore("#19662")
+        if error.error_type == ValidationErrorType.CONTENT_MISMATCH:
+            return self._shall_ignore_content_mismatch(
+                error, query_template, contains_aggregation
+            )
 
+        if error.error_type == ValidationErrorType.ROW_COUNT_MISMATCH:
+            return self._shall_ignore_error_mismatch(
+                error, query_template, contains_aggregation
+            )
+
+        raise RuntimeError(f"Unexpected validation error type: {error.error_type}")
+
+    def _shall_ignore_success_mismatch(
+        self,
+        error: ValidationError,
+        query_template: QueryTemplate,
+        contains_aggregation: bool,
+    ) -> IgnoreVerdict:
+        return NoIgnore()
+
+    def _shall_ignore_error_mismatch(
+        self,
+        error: ValidationError,
+        query_template: QueryTemplate,
+        contains_aggregation: bool,
+    ) -> IgnoreVerdict:
+        return NoIgnore()
+
+    def _shall_ignore_content_mismatch(
+        self,
+        error: ValidationError,
+        query_template: QueryTemplate,
+        contains_aggregation: bool,
+    ) -> IgnoreVerdict:
+        return NoIgnore()
+
+    def _shall_ignore_row_count_mismatch(
+        self,
+        error: ValidationError,
+        query_template: QueryTemplate,
+        contains_aggregation: bool,
+    ) -> IgnoreVerdict:
         return NoIgnore()

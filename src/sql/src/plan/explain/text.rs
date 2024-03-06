@@ -21,10 +21,11 @@
 use itertools::Itertools;
 use std::fmt;
 
+use mz_expr::explain::{fmt_text_constant_rows, HumanizedExplain, HumanizerMode};
 use mz_expr::virtual_syntax::{AlgExcept, Except};
 use mz_expr::{Id, WindowFrame};
 use mz_ore::str::{separated, IndentLike};
-use mz_repr::explain::text::{fmt_text_constant_rows, DisplayText};
+use mz_repr::explain::text::DisplayText;
 use mz_repr::explain::{CompactScalarSeq, Indices, PlanRenderingContext};
 
 use crate::plan::{AggregateExpr, Hir, HirRelationExpr, HirScalarExpr, JoinKind, WindowExprType};
@@ -74,12 +75,20 @@ impl HirRelationExpr {
         ctx: &mut PlanRenderingContext<'_, HirRelationExpr>,
     ) -> fmt::Result {
         use HirRelationExpr::*;
+
+        let mode = HumanizedExplain::new(ctx.config.redacted);
+
         match &self {
             Constant { rows, .. } => {
                 if !rows.is_empty() {
                     writeln!(f, "{}Constant", ctx.indent)?;
                     ctx.indented(|ctx| {
-                        fmt_text_constant_rows(f, rows.iter().map(|row| (row, &1)), &mut ctx.indent)
+                        fmt_text_constant_rows(
+                            f,
+                            rows.iter().map(|row| (row, &1)),
+                            &mut ctx.indent,
+                            ctx.config.redacted,
+                        )
                     })?;
                 } else {
                     writeln!(f, "{}Constant <empty>", ctx.indent)?;
@@ -229,7 +238,8 @@ impl HirRelationExpr {
                     write!(f, " group_by=[{}]", group_by)?;
                 }
                 if order_key.len() > 0 {
-                    let order_by = separated(", ", order_key);
+                    let order_by = mode.seq(order_key, None);
+                    let order_by = separated(", ", order_by);
                     write!(f, " order_by=[{}]", order_by)?;
                 }
                 if let Some(limit) = limit {
@@ -350,6 +360,14 @@ impl fmt::Display for HirScalarExpr {
                             Some(&value_window_expr.window_frame),
                         )
                     }
+                    WindowExprType::Aggregate(aggregate_window_expr) => {
+                        write!(f, "{}", aggregate_window_expr.aggregate_expr)?;
+                        (
+                            &aggregate_window_expr.order_by,
+                            false,
+                            Some(&aggregate_window_expr.window_frame),
+                        )
+                    }
                 };
 
                 // Reconstruct the ORDER BY (see comment on `WindowExpr.order_by`).
@@ -382,11 +400,11 @@ impl fmt::Display for HirScalarExpr {
                 // This is close to the SQL syntax, but we are adding some [] to make it easier to
                 // read.
                 write!(f, " over (")?;
-                if !expr.partition.is_empty() {
+                if !expr.partition_by.is_empty() {
                     write!(
                         f,
                         "partition by [{}] ",
-                        separated(", ", expr.partition.iter())
+                        separated(", ", expr.partition_by.iter())
                     )?;
                 }
                 write!(f, "order by [{}]", separated(", ", order_by.iter()))?;
@@ -445,13 +463,13 @@ impl fmt::Display for AggregateExpr {
             return write!(f, "count(*)");
         }
 
-        write!(
-            f,
-            "{}({}",
-            self.func.clone().into_expr(),
-            if self.distinct { "distinct " } else { "" }
-        )?;
+        // TODO(cloud#8196)
+        let mode = HumanizedExplain::new(false);
+        let func = self.func.clone().into_expr();
+        let func = mode.expr(&func, None);
+        let distinct = if self.distinct { "distinct " } else { "" };
 
+        write!(f, "{}({}", func, distinct)?;
         self.expr.fmt(f)?;
         write!(f, ")")
     }

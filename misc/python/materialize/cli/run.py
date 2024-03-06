@@ -11,6 +11,7 @@
 
 import argparse
 import os
+import shlex
 import shutil
 import signal
 import sys
@@ -20,7 +21,8 @@ from urllib.parse import urlparse
 
 import psutil
 
-from materialize import ROOT, rustc_flags, spawn, ui
+from materialize import MZ_ROOT, rustc_flags, spawn, ui
+from materialize.mzcompose import DEFAULT_SYSTEM_PARAMETERS
 from materialize.ui import UIError
 
 KNOWN_PROGRAMS = ["environmentd", "sqllogictest"]
@@ -120,6 +122,16 @@ def main() -> int:
         default=False,
         action="store_true",
     )
+    parser.add_argument(
+        "--wrapper",
+        help="Wrapper command for the program",
+    )
+    parser.add_argument(
+        "--monitoring",
+        help="Automatically send monitoring data.",
+        default=False,
+        action="store_true",
+    )
     args = parser.parse_intermixed_args()
 
     # Handle `+toolchain` like rustup.
@@ -128,15 +140,16 @@ def main() -> int:
         args.channel = args.args[0]
         del args.args[0]
 
+    env = dict(os.environ)
     if args.program in KNOWN_PROGRAMS:
-        build_retcode = _build(args, extra_programs=[args.program])
+        (build_retcode, built_programs) = _build(args, extra_programs=[args.program])
         if args.build_only:
             return build_retcode
 
         if args.release:
-            path = ROOT / "target" / "release" / args.program
+            artifact_path = MZ_ROOT / "target" / "release"
         else:
-            path = ROOT / "target" / "debug" / args.program
+            artifact_path = MZ_ROOT / "target" / "debug"
 
         if args.disable_mac_codesigning:
             if sys.platform != "darwin":
@@ -144,17 +157,24 @@ def main() -> int:
             else:
                 print("Disabled macOS Codesigning")
         elif sys.platform == "darwin":
-            _macos_codesign(path)
+            for program in built_programs:
+                path = artifact_path / program
+                _macos_codesign(str(path))
 
-        command = [str(path)]
+        if args.wrapper:
+            command = shlex.split(args.wrapper)
+        else:
+            command = []
+        command.append(str(artifact_path / args.program))
         if args.tokio_console:
             command += ["--tokio-console-listen-addr=127.0.0.1:6669"]
         if args.program == "environmentd":
             _handle_lingering_services(kill=args.reset)
-            mzdata = ROOT / "mzdata"
+            mzdata = MZ_ROOT / "mzdata"
+            scratch = MZ_ROOT / "scratch"
             db = urlparse(args.postgres).path.removeprefix("/")
             _run_sql(args.postgres, f"CREATE DATABASE IF NOT EXISTS {db}")
-            for schema in ["consensus", "adapter", "storage"]:
+            for schema in ["consensus", "adapter", "tsoracle", "storage"]:
                 if args.reset:
                     _run_sql(args.postgres, f"DROP SCHEMA IF EXISTS {schema} CASCADE")
                 _run_sql(args.postgres, f"CREATE SCHEMA IF NOT EXISTS {schema}")
@@ -164,9 +184,14 @@ def main() -> int:
             # opposite order.
             if args.reset:
                 # Remove everything in the `mzdata`` directory *except* for
-                # the `prometheus` directory.
+                # the `prometheus` directory and all contents of `tempo`.
                 paths = list(mzdata.glob("prometheus/*"))
-                paths.extend(p for p in mzdata.glob("*") if p.name != "prometheus")
+                paths.extend(
+                    p
+                    for p in mzdata.glob("*")
+                    if p.name != "prometheus" and p.name != "tempo"
+                )
+                paths.extend(p for p in scratch.glob("*"))
                 for path in paths:
                     print(f"Removing {path}...")
                     if path.is_dir():
@@ -175,6 +200,7 @@ def main() -> int:
                         path.unlink()
 
             mzdata.mkdir(exist_ok=True)
+            scratch.mkdir(exist_ok=True)
             environment_file = mzdata / "environment-id"
             try:
                 environment_id = environment_file.read_text().rstrip()
@@ -191,20 +217,29 @@ def main() -> int:
                 f"--orchestrator-process-secrets-directory={mzdata}/secrets",
                 "--orchestrator-process-tcp-proxy-listen-addr=0.0.0.0",
                 f"--orchestrator-process-prometheus-service-discovery-directory={mzdata}/prometheus",
+                f"--orchestrator-process-scratch-directory={scratch}",
+                "--secrets-controller=local-file",
                 f"--persist-consensus-url={args.postgres}?options=--search_path=consensus",
                 f"--persist-blob-url=file://{mzdata}/persist/blob",
                 f"--adapter-stash-url={args.postgres}?options=--search_path=adapter",
+                f"--timestamp-oracle-url={args.postgres}?options=--search_path=tsoracle",
                 f"--storage-stash-url={args.postgres}?options=--search_path=storage",
                 f"--environment-id={environment_id}",
                 "--bootstrap-role=materialize",
                 *args.args,
             ]
+            if args.monitoring:
+                command += ["--opentelemetry-endpoint=http://localhost:4317"]
         elif args.program == "sqllogictest":
+            formatted_params = [
+                f"{key}={value}" for key, value in DEFAULT_SYSTEM_PARAMETERS.items()
+            ]
+            env["MZ_SYSTEM_PARAMETER_DEFAULT"] = ";".join(formatted_params)
             db = urlparse(args.postgres).path.removeprefix("/")
             _run_sql(args.postgres, f"CREATE DATABASE IF NOT EXISTS {db}")
             command += [f"--postgres-url={args.postgres}", *args.args]
     elif args.program == "test":
-        build_retcode = _build(args)
+        (build_retcode, _) = _build(args)
         if args.build_only:
             return build_retcode
 
@@ -238,7 +273,7 @@ def main() -> int:
         except OSError:
             pass
         _set_foreground_process(os.getpid())
-        os.execvp(command[0], command)
+        os.execvpe(command[0], command, env)
 
     try:
         os.setpgid(child_pid, child_pid)
@@ -262,13 +297,13 @@ def _set_foreground_process(pid: int) -> None:
         os.tcsetpgrp(tty.fileno(), os.getpgrp())
 
 
-def _build(args: argparse.Namespace, extra_programs: list[str] = []) -> int:
+def _build(
+    args: argparse.Namespace, extra_programs: list[str] = []
+) -> tuple[int, list[str]]:
     env = dict(os.environ)
     command = _cargo_command(args, "build")
     features = []
-    if args.tokio_console:
-        features += ["tokio-console"]
-        env["RUSTFLAGS"] = env.get("RUSTFLAGS", "") + " --cfg=tokio_unstable"
+
     if args.coverage:
         env["RUSTFLAGS"] = (
             env.get("RUSTFLAGS", "") + " " + " ".join(rustc_flags.coverage)
@@ -277,10 +312,13 @@ def _build(args: argparse.Namespace, extra_programs: list[str] = []) -> int:
         features.extend(args.features.split(","))
     if features:
         command += [f"--features={','.join(features)}"]
-    for program in [*REQUIRED_SERVICES, *extra_programs]:
+
+    programs = [*REQUIRED_SERVICES, *extra_programs]
+    for program in programs:
         command += ["--bin", program]
     completed_proc = spawn.runv(command, env=env)
-    return completed_proc.returncode
+
+    return (completed_proc.returncode, programs)
 
 
 def _macos_codesign(path: str) -> None:
@@ -315,7 +353,7 @@ def _cargo_command(args: argparse.Namespace, subcommand: str) -> list[str]:
 
 def _run_sql(url: str, sql: str) -> None:
     try:
-        spawn.runv(["psql", "-At", url, "-c", sql])
+        spawn.runv(["psql", "-AtX", url, "-c", sql])
     except Exception as e:
         raise UIError(
             f"unable to execute postgres statement: {e}",

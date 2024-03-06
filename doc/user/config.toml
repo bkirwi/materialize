@@ -28,65 +28,83 @@ name = "Ingest data"
 weight= 11
 
 [[menu.main]]
-name = "PostgreSQL"
-parent = 'ingest-data'
-identifier = 'postgresql'
-weight = 5
-
-[[menu.main]]
 name = "MySQL"
 parent = 'ingest-data'
 identifier = 'mysql'
+weight = 5
+
+[[menu.main]]
+name = "PostgreSQL"
+parent = 'ingest-data'
+identifier = 'postgresql'
 weight = 10
+
+[[menu.main]]
+name = "SQL Server"
+parent = 'ingest-data'
+identifier = 'sql-server'
+weight = 15
 
 [[menu.main]]
 name = "Kafka"
 parent = 'ingest-data'
 identifier = 'kafka'
-weight = 15
+weight = 20
 
 [[menu.main]]
 name = "Redpanda"
 parent = 'ingest-data'
 identifier = 'redpanda'
-weight = 20
+weight = 25
+
+[[menu.main]]
+identifier = "webhooks"
+name = "Webhooks"
+parent = 'ingest-data'
+weight = 30
 
 [[menu.main]]
 identifier = "network-security"
 name = "Network security"
 parent = 'ingest-data'
-weight= 30
+weight= 35
 
 #
 # Transform data
 #
 
 [[menu.main]]
-identifier = "transform"
+identifier = "transform-data"
 name = "Transform data"
 weight= 12
 
 [[menu.main]]
+name = "Overview"
+parent = 'transform-data'
+identifier = 'transform-overview'
+weight = 5
+
+[[menu.main]]
 name = "Views"
-parent = "transform"
+parent = "transform-overview"
 url = "/sql/create-view/"
 weight= 5
 
 [[menu.main]]
 name = "Indexes"
-parent = "transform"
+parent = "transform-overview"
 url = "/sql/create-index"
 weight= 10
 
 [[menu.main]]
 name = "Materialized views"
-parent = "transform"
+parent = "transform-overview"
 url = "/sql/create-materialized-view/"
 weight= 15
 
 [[menu.main]]
 name = "Common patterns"
-parent = 'transform'
+parent = 'transform-data'
 identifier = 'sql-patterns'
 weight = 30
 
@@ -100,22 +118,40 @@ name = "Serve results"
 weight= 13
 
 [[menu.main]]
-name = "Query for results (`SELECT`)"
+name = "Query using `SELECT`"
 parent = "serve"
 url = "/sql/select/"
 weight= 5
 
 [[menu.main]]
-name = "Subscribe to results (`SUBSCRIBE`)"
+name = "Query using external tools"
+identifier = "bi-tools"
 parent = "serve"
-url = "/sql/subscribe/"
 weight= 10
 
 [[menu.main]]
-name = "Sink results to Kafka"
+name = "Subscribe to results (`SUBSCRIBE`)"
 parent = "serve"
-url = "/sql/create-sink"
+url = "/sql/subscribe/"
 weight= 15
+
+[[menu.main]]
+name = "Sink results to external tools"
+identifier = "sink"
+parent = "serve"
+weight= 20
+
+[[menu.main]]
+name = "Kafka"
+parent = "sink"
+url = "/sql/create-sink"
+weight= 20
+
+[[menu.main]]
+name = "Redpanda"
+parent = "sink"
+url = "/sql/create-sink"
+weight= 25
 
 #
 # Manage Materialize
@@ -125,6 +161,12 @@ weight= 15
 identifier = "manage"
 name = "Manage Materialize"
 weight= 14
+
+[[menu.main]]
+name = "Monitoring"
+identifier = "monitor"
+parent = "manage"
+weight= 10
 
 
 #
@@ -195,6 +237,11 @@ name = "Overview"
 parent = "integrations"
 url = "/integrations"
 weight = 5
+
+[[menu.main]]
+identifier = "cli-reference"
+name = "Command reference"
+parent = "cli"
 
 [[menu.main]]
 identifier = "client-libraries"

@@ -28,7 +28,7 @@ use itertools::{zip_eq, Either, Itertools};
 use mz_expr::{Id, JoinInputMapper, MirRelationExpr, MirScalarExpr, RECURSION_LIMIT};
 use mz_ore::stack::{CheckedRecursion, RecursionGuard};
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Push non-null requirements toward sources.
 #[derive(Debug)]
@@ -51,16 +51,15 @@ impl CheckedRecursion for NonNullRequirements {
 }
 
 impl crate::Transform for NonNullRequirements {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "non_null_requirements")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         let result = self.action(relation, BTreeSet::new(), &mut BTreeMap::new());
         mz_repr::explain::trace_plan(&*relation);
@@ -119,7 +118,7 @@ impl NonNullRequirements {
                     limits: _,
                 } => {
                     // Determine the recursive IDs in this LetRec binding.
-                    let rec_ids = MirRelationExpr::recursive_ids(ids, values)?;
+                    let rec_ids = MirRelationExpr::recursive_ids(ids, values);
 
                     // Seed the gets map with an empty vector for each ID.
                     for id in ids.iter() {

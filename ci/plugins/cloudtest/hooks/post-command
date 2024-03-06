@@ -12,9 +12,10 @@
 set -euo pipefail
 
 . misc/shlib/shlib.bash
+. test/cloudtest/config.bash
 
 kubectl() {
-    bin/ci-builder run stable kubectl --context=kind-cloudtest "$@"
+    bin/ci-builder run stable kubectl --context="$K8S_CONTEXT" "$@"
 }
 
 export_cov() {
@@ -55,8 +56,8 @@ if [ -n "${CI_COVERAGE_ENABLED:-}" ]; then
         if [ "${#ARGS[@]}" != 0 ]; then
           bin/ci-builder run stable lcov "${ARGS[@]}" -o coverage/"$BUILDKITE_JOB_ID".lcov
           rm coverage/"$BUILDKITE_JOB_ID"-*.lcov
-          bin/ci-builder run stable xz -0 coverage/"$BUILDKITE_JOB_ID".lcov
-          buildkite-agent artifact upload coverage/"$BUILDKITE_JOB_ID".lcov.xz
+          bin/ci-builder run stable zstd coverage/"$BUILDKITE_JOB_ID".lcov
+          buildkite-agent artifact upload coverage/"$BUILDKITE_JOB_ID".lcov.zst
         fi
     fi
 fi
@@ -73,11 +74,16 @@ done
 kubectl get events > kubectl-get-events.log || true
 kubectl get all > kubectl-get-all.log || true
 kubectl describe all > kubectl-describe-all.log || true
+kubectl get pods -o wide > kubectl-pods-with-nodes.log || true
+
+kubectl -n kube-system get events > kubectl-get-events-kube-system.log || true
+kubectl -n kube-system get all > kubectl-get-all-kube-system.log || true
+kubectl -n kube-system describe all > kubectl-describe-all-kube-system.log || true
 
 # shellcheck disable=SC2024
 sudo journalctl --merge --since "$(cat step_start_timestamp)" > journalctl-merge.log
 
-artifacts=(run.log kubectl-*.log journalctl-merge.log kail-output.log)
+mapfile -t artifacts < <(printf "run.log\nkubectl-get-logs.log\nkubectl-get-logs-previous.log\nkubectl-get-events.log\nkubectl-get-all.log\nkubectl-describe-all.log\nkubectl-pods-with-nodes.log\nkubectl-get-events-kube-system.log\nkubectl-get-all-kube-system.log\nkubectl-describe-all-kube-system.log\njournalctl-merge.log\nkail-output.log\n"; find . -name 'junit_*.xml')
 artifacts_str=$(IFS=";"; echo "${artifacts[*]}")
 buildkite-agent artifact upload "$artifacts_str"
-bin/ci-builder run stable bin/ci-logged-errors-detect "${artifacts[@]}"
+bin/ci-builder run stable bin/ci-annotate-errors "${artifacts[@]}"

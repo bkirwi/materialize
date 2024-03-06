@@ -10,7 +10,7 @@
 # Build a cross-compiling toolchain that targets the oldest version of Linux
 # that we support.
 
-FROM ubuntu:jammy-20221130 AS crosstool
+FROM ubuntu:lunar-20230731 as crosstool
 ARG ARCH_GCC
 ARG ARCH_GO
 
@@ -19,7 +19,7 @@ WORKDIR /scratch
 # The environment variables are necessary to convince `tzdata`'s install scripts
 # not to hang.
 # See: https://serverfault.com/questions/949991/how-to-install-tzdata-on-a-ubuntu-docker-image
-RUN apt-get update && TZ=UTC DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+RUN apt-get update --fix-missing && TZ=UTC DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     autoconf \
     automake \
     bison \
@@ -62,13 +62,13 @@ COPY crosstool-$ARCH_GCC.defconfig ./
 RUN DEFCONFIG=crosstool-$ARCH_GCC.defconfig ct-ng defconfig \
     && rm crosstool-$ARCH_GCC.defconfig \
     # https://github.com/crosstool-ng/crosstool-ng/issues/1832 \
-    && sed -i 's/CT_ZLIB_VERSION="1.2.12"/CT_ZLIB_VERSION="1.2.13"/g' .config \
+    && sed -i 's/CT_ZLIB_VERSION="1.2.12"/CT_ZLIB_VERSION="1.3.1"/g' .config \
     && ct-ng build
 
 # Import the cross-compiling toolchain into a fresh image, omitting the
 # dependencies that we needed to actually build the toolchain.
 
-FROM ubuntu:jammy-20221130
+FROM ubuntu:lunar-20230731
 ARG ARCH_GCC
 ARG ARCH_GO
 
@@ -80,7 +80,8 @@ COPY --from=crosstool /opt/x-tools /opt/x-tools
 
 # Install dependencies needed by any CI job. Not all of these are available in
 # the Ubuntu repositories.
-RUN apt-get update && TZ=UTC DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+RUN apt-get update --fix-missing && TZ=UTC DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    binfmt-support \
     bsdmainutils \
     ca-certificates \
     cmake \
@@ -88,10 +89,12 @@ RUN apt-get update && TZ=UTC DEBIAN_FRONTEND=noninteractive apt-get install -y -
     docker.io \
     gcc \
     g++ \
+    gdb \
     git \
     gnupg2 \
     jq \
     lcov \
+    libc-dbg \
     libclang-dev \
     libpq-dev \
     lld \
@@ -99,16 +102,31 @@ RUN apt-get update && TZ=UTC DEBIAN_FRONTEND=noninteractive apt-get install -y -
     make \
     openssh-client \
     pkg-config \
-    postgresql-client-14 \
+    postgresql-client \
     python3 \
     python3-dev \
     python3-pip \
     python3-setuptools \
+    qemu-system \
+    qemu-user-static \
     rsync \
     ruby \
     unzip \
     xz-utils \
+    yamllint \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js LTS, for our Python typechecker. This is up here because we don't
+# expect it to change often.
+
+COPY nodesource.asc .
+
+RUN gpg --dearmor < nodesource.asc > /etc/apt/keyrings/nodesource.gpg \
+    && rm nodesource.asc \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs
 
 RUN curl -fsSL https://github.com/benesch/autouseradd/releases/download/1.3.0/autouseradd-1.3.0-$ARCH_GO.tar.gz \
     | tar xz -C / --strip-components 1 \
@@ -124,10 +142,13 @@ RUN curl -fsSL https://github.com/benesch/autouseradd/releases/download/1.3.0/au
     && rm kail.tar.gz \
     && chmod +x /usr/local/bin/kail \
     && mkdir -p /usr/local/lib/docker/cli-plugins \
+    # If you upgrade Docker (Compose) version here, also update it in misc/python/cli/mzcompose.py \
     && curl -fsSL https://github.com/docker/compose/releases/download/v2.15.1/docker-compose-linux-$ARCH_GCC > /usr/local/lib/docker/cli-plugins/docker-compose \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose \
     && curl -fsSL https://github.com/christian-korneck/docker-pushrm/releases/download/v1.9.0/docker-pushrm_linux_$ARCH_GO > /usr/local/lib/docker/cli-plugins/docker-pushrm \
-    && chmod +x /usr/local/lib/docker/cli-plugins/docker-pushrm
+    && chmod +x /usr/local/lib/docker/cli-plugins/docker-pushrm \
+    && curl -fsSL https://github.com/parca-dev/parca-debuginfo/releases/download/v0.9.0/parca-debuginfo_0.9.0_Linux_$(echo "$ARCH_GCC" | sed "s/aarch64/arm64/").tar.gz \
+    | tar xz -C /usr/local/bin parca-debuginfo
 
 ENTRYPOINT ["autouseradd", "--user", "materialize"]
 
@@ -144,6 +165,8 @@ RUN gpg --import rust.asc \
 ARG RUST_DATE
 ARG RUST_VERSION
 ARG RUST_COMPONENTS
+ARG RUST_CPU_TARGET
+ARG RUST_TARGET_FEATURES
 
 RUN mkdir rust \
     && curl -fsSL https://static.rust-lang.org/dist$RUST_DATE/rust-$RUST_VERSION-$ARCH_GCC-unknown-linux-gnu.tar.gz > rust.tar.gz \
@@ -162,33 +185,41 @@ RUN mkdir rust \
         PATH=$PATH:/root/.cargo/bin cargo miri setup \
         ;; \
     esac \
-    && rm -rf rust \
-    && cargo install --root /usr/local --version "=0.5.2" --locked cargo-about \
-    && cargo install --root /usr/local --version "=1.40.5" --locked cargo-deb \
+    && curl -fsSL https://static.rust-lang.org/dist$RUST_DATE/rust-std-$RUST_VERSION-wasm32-unknown-unknown.tar.gz > rust.tar.gz \
+    && curl -fsSL https://static.rust-lang.org/dist$RUST_DATE/rust-std-$RUST_VERSION-wasm32-unknown-unknown.tar.gz.asc > rust.asc \
+    && gpg --verify rust.asc rust.tar.gz \
+    && tar -xzf rust.tar.gz -C /usr/local/lib/rustlib/ --strip-components=4 \
+    && rm -rf rust.asc rust.tar.gz rust \
+    && cargo install --root /usr/local --version "=0.8.0" --locked cargo-vet \
+    && cargo install --root /usr/local --version "=0.6.0" --locked cargo-about \
+    && cargo install --root /usr/local --version "=2.0.2" --locked cargo-deb \
     && cargo install --root /usr/local --version "=0.12.2" --locked cargo-deny \
-    && cargo install --root /usr/local --version ="0.9.18" --locked cargo-hakari \
-    && cargo install --root /usr/local --version "=0.9.44" --locked cargo-nextest \
-    && cargo install --root /usr/local --version "=0.5.18" --locked cargo-llvm-cov \
-    && `: Until https://github.com/est31/cargo-udeps/pull/147 is released in cargo-udeps` \
-    && cargo install --root /usr/local --git https://github.com/est31/cargo-udeps --rev=b84d478ef3efd7264dba8c15c31a50c6399dc5bb --locked cargo-udeps --features=vendored-openssl \
+    && cargo install --root /usr/local --version "=0.1.0" --locked cargo-deplint \
+    && cargo install --root /usr/local --version ="0.9.28" --locked cargo-hakari \
+    && cargo install --root /usr/local --version "=0.9.63" --locked cargo-nextest \
+    && cargo install --root /usr/local --version "=0.5.37" --locked cargo-llvm-cov \
+    && cargo install --root /usr/local --version "=0.1.43" --features=vendored-openssl cargo-udeps \
     && cargo install --root /usr/local --version "=0.2.15" --no-default-features --features=s3,openssl/vendored sccache \
-    && cargo install --root /usr/local --version "=0.3.6" cargo-binutils
+    && cargo install --root /usr/local --version "=0.3.6" cargo-binutils \
+    && cargo install --root /usr/local --version "=0.12.1" wasm-pack
 
 # Link the system lld into the cross-compiling sysroot.
 
 RUN ln -s /usr/bin/lld /opt/x-tools/$ARCH_GCC-unknown-linux-gnu/bin/$ARCH_GCC-unknown-linux-gnu-ld.lld \
     && ln -s /usr/bin/lld /opt/x-tools/$ARCH_GCC-unknown-linux-gnu/bin/$ARCH_GCC-unknown-linux-gnu-lld
 
-# Install the Antithesis stub instrumentation library.
-
-COPY libvoidstar.so /usr/local/lib/
+# Install the locked version of our typechecker -- it'll be invoked via `npx`,
+# so using the same command here should ensure it's installed and cached in the
+# right place
+COPY pyright-version.sh /workdir/
+RUN npx pyright@$(sh /workdir/pyright-version.sh) --help
 
 # Install Python dependencies. These are so quick to install and change
 # frequently enough that it makes sense to install them last.
 
 COPY requirements.txt /workdir/
 
-RUN pip3 install -r /workdir/requirements.txt && rm /workdir/requirements*.txt
+RUN pip3 install --break-system-packages -r /workdir/requirements.txt && rm /workdir/requirements*.txt
 
 # Install APT repo generator.
 
@@ -248,7 +279,7 @@ ENV CC=$ARCH_GCC-unknown-linux-gnu-cc
 ENV CXX=$ARCH_GCC-unknown-linux-gnu-c++
 ENV CXXSTDLIB=static=stdc++
 ENV LDFLAGS="-fuse-ld=lld -static-libstdc++"
-ENV RUSTFLAGS="-Clink-arg=-Wl,--compress-debug-sections=zlib -Clink-arg=-fuse-ld=lld -L/opt/x-tools/$ARCH_GCC-unknown-linux-gnu/$ARCH_GCC-unknown-linux-gnu/sysroot/lib/ -Csymbol-mangling-version=v0"
+ENV RUSTFLAGS="-Clink-arg=-Wl,--compress-debug-sections=zlib -Clink-arg=-fuse-ld=lld -L/opt/x-tools/$ARCH_GCC-unknown-linux-gnu/$ARCH_GCC-unknown-linux-gnu/sysroot/lib/ -Csymbol-mangling-version=v0 -Ctarget-cpu=$RUST_CPU_TARGET -Ctarget-feature=$RUST_TARGET_FEATURES --cfg=tokio_unstable"
 ENV TARGET_AR=$AR
 ENV TARGET_CC=$CC
 ENV TARGET_CXX=$CXX
@@ -277,6 +308,10 @@ ENV RUST_BACKTRACE=1
 
 # Make the image as small as possible.
 RUN find /workdir /root -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+# remove Ubuntu user causing UID collisions
+# https://bugs.launchpad.net/cloud-images/+bug/2005129
+RUN userdel -r ubuntu
 
 # Ensure that all python output is unbuffered, otherwise it is not
 # logged properly in Buildkite

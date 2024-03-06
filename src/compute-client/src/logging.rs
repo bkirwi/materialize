@@ -101,11 +101,35 @@ impl ProtoMapEntry<LogVariant, GlobalId> for ProtoIndexLog {
     }
 }
 
-#[derive(Arbitrary, Hash, Eq, PartialEq, Ord, PartialOrd, Debug, Clone, Serialize, Deserialize)]
+/// TODO(#25239): Add documentation.
+#[derive(
+    Arbitrary, Hash, Eq, PartialEq, Ord, PartialOrd, Debug, Clone, Copy, Serialize, Deserialize,
+)]
 pub enum LogVariant {
+    /// TODO(#25239): Add documentation.
     Timely(TimelyLog),
+    /// TODO(#25239): Add documentation.
     Differential(DifferentialLog),
+    /// TODO(#25239): Add documentation.
     Compute(ComputeLog),
+}
+
+impl From<TimelyLog> for LogVariant {
+    fn from(value: TimelyLog) -> Self {
+        Self::Timely(value)
+    }
+}
+
+impl From<DifferentialLog> for LogVariant {
+    fn from(value: DifferentialLog) -> Self {
+        Self::Differential(value)
+    }
+}
+
+impl From<ComputeLog> for LogVariant {
+    fn from(value: ComputeLog) -> Self {
+        Self::Compute(value)
+    }
 }
 
 impl RustType<ProtoLogVariant> for LogVariant {
@@ -131,17 +155,33 @@ impl RustType<ProtoLogVariant> for LogVariant {
     }
 }
 
-#[derive(Arbitrary, Hash, Eq, Ord, PartialEq, PartialOrd, Debug, Clone, Serialize, Deserialize)]
+/// TODO(#25239): Add documentation.
+#[derive(
+    Arbitrary, Hash, Eq, Ord, PartialEq, PartialOrd, Debug, Clone, Copy, Serialize, Deserialize,
+)]
 pub enum TimelyLog {
+    /// TODO(#25239): Add documentation.
     Operates,
+    /// TODO(#25239): Add documentation.
     Channels,
+    /// TODO(#25239): Add documentation.
     Elapsed,
+    /// TODO(#25239): Add documentation.
     Histogram,
+    /// TODO(#25239): Add documentation.
     Addresses,
+    /// TODO(#25239): Add documentation.
     Parks,
+    /// TODO(#25239): Add documentation.
     MessagesSent,
+    /// TODO(#25239): Add documentation.
     MessagesReceived,
+    /// TODO(#25239): Add documentation.
     Reachability,
+    /// TODO(#25239): Add documentation.
+    BatchesSent,
+    /// TODO(#25239): Add documentation.
+    BatchesReceived,
 }
 
 impl RustType<ProtoTimelyLog> for TimelyLog {
@@ -158,6 +198,8 @@ impl RustType<ProtoTimelyLog> for TimelyLog {
                 TimelyLog::MessagesSent => MessagesSent(()),
                 TimelyLog::MessagesReceived => MessagesReceived(()),
                 TimelyLog::Reachability => Reachability(()),
+                TimelyLog::BatchesSent => BatchesSent(()),
+                TimelyLog::BatchesReceived => BatchesReceived(()),
             }),
         }
     }
@@ -174,16 +216,32 @@ impl RustType<ProtoTimelyLog> for TimelyLog {
             Some(MessagesSent(())) => Ok(TimelyLog::MessagesSent),
             Some(MessagesReceived(())) => Ok(TimelyLog::MessagesReceived),
             Some(Reachability(())) => Ok(TimelyLog::Reachability),
+            Some(BatchesSent(())) => Ok(TimelyLog::BatchesSent),
+            Some(BatchesReceived(())) => Ok(TimelyLog::BatchesReceived),
             None => Err(TryFromProtoError::missing_field("ProtoTimelyLog::kind")),
         }
     }
 }
 
-#[derive(Arbitrary, Hash, Eq, Ord, PartialEq, PartialOrd, Debug, Clone, Serialize, Deserialize)]
+/// TODO(#25239): Add documentation.
+#[derive(
+    Arbitrary, Hash, Eq, Ord, PartialEq, PartialOrd, Debug, Clone, Copy, Serialize, Deserialize,
+)]
 pub enum DifferentialLog {
+    /// TODO(#25239): Add documentation.
     ArrangementBatches,
+    /// TODO(#25239): Add documentation.
     ArrangementRecords,
+    /// TODO(#25239): Add documentation.
     Sharing,
+    /// TODO(#25239): Add documentation.
+    BatcherRecords,
+    /// TODO(#25239): Add documentation.
+    BatcherSize,
+    /// TODO(#25239): Add documentation.
+    BatcherCapacity,
+    /// TODO(#25239): Add documentation.
+    BatcherAllocations,
 }
 
 impl RustType<ProtoDifferentialLog> for DifferentialLog {
@@ -194,6 +252,10 @@ impl RustType<ProtoDifferentialLog> for DifferentialLog {
                 DifferentialLog::ArrangementBatches => ArrangementBatches(()),
                 DifferentialLog::ArrangementRecords => ArrangementRecords(()),
                 DifferentialLog::Sharing => Sharing(()),
+                DifferentialLog::BatcherRecords => BatcherRecords(()),
+                DifferentialLog::BatcherSize => BatcherSize(()),
+                DifferentialLog::BatcherCapacity => BatcherCapacity(()),
+                DifferentialLog::BatcherAllocations => BatcherAllocations(()),
             }),
         }
     }
@@ -204,6 +266,10 @@ impl RustType<ProtoDifferentialLog> for DifferentialLog {
             Some(ArrangementBatches(())) => Ok(DifferentialLog::ArrangementBatches),
             Some(ArrangementRecords(())) => Ok(DifferentialLog::ArrangementRecords),
             Some(Sharing(())) => Ok(DifferentialLog::Sharing),
+            Some(BatcherRecords(())) => Ok(DifferentialLog::BatcherRecords),
+            Some(BatcherSize(())) => Ok(DifferentialLog::BatcherSize),
+            Some(BatcherCapacity(())) => Ok(DifferentialLog::BatcherCapacity),
+            Some(BatcherAllocations(())) => Ok(DifferentialLog::BatcherAllocations),
             None => Err(TryFromProtoError::missing_field(
                 "ProtoDifferentialLog::kind",
             )),
@@ -211,19 +277,33 @@ impl RustType<ProtoDifferentialLog> for DifferentialLog {
     }
 }
 
-#[derive(Arbitrary, Hash, Eq, PartialEq, Ord, PartialOrd, Debug, Clone, Serialize, Deserialize)]
+/// TODO(#25239): Add documentation.
+#[derive(
+    Arbitrary, Hash, Eq, PartialEq, Ord, PartialOrd, Debug, Clone, Copy, Serialize, Deserialize,
+)]
 pub enum ComputeLog {
+    /// TODO(#25239): Add documentation.
     DataflowCurrent,
-    DataflowDependency,
+    /// TODO(#25239): Add documentation.
     FrontierCurrent,
+    /// TODO(#25239): Add documentation.
     PeekCurrent,
+    /// TODO(#25239): Add documentation.
     PeekDuration,
+    /// TODO(#25239): Add documentation.
     FrontierDelay,
+    /// TODO(#25239): Add documentation.
     ImportFrontierCurrent,
+    /// TODO(#25239): Add documentation.
     ArrangementHeapSize,
+    /// TODO(#25239): Add documentation.
     ArrangementHeapCapacity,
+    /// TODO(#25239): Add documentation.
     ArrangementHeapAllocations,
+    /// TODO(#25239): Add documentation.
     ShutdownDuration,
+    /// TODO(#25239): Add documentation.
+    ErrorCount,
 }
 
 impl RustType<ProtoComputeLog> for ComputeLog {
@@ -232,7 +312,6 @@ impl RustType<ProtoComputeLog> for ComputeLog {
         ProtoComputeLog {
             kind: Some(match self {
                 ComputeLog::DataflowCurrent => DataflowCurrent(()),
-                ComputeLog::DataflowDependency => DataflowDependency(()),
                 ComputeLog::FrontierCurrent => FrontierCurrent(()),
                 ComputeLog::PeekCurrent => PeekCurrent(()),
                 ComputeLog::PeekDuration => PeekDuration(()),
@@ -242,6 +321,7 @@ impl RustType<ProtoComputeLog> for ComputeLog {
                 ComputeLog::ArrangementHeapCapacity => ArrangementHeapCapacity(()),
                 ComputeLog::ArrangementHeapAllocations => ArrangementHeapAllocations(()),
                 ComputeLog::ShutdownDuration => ShutdownDuration(()),
+                ComputeLog::ErrorCount => ErrorCount(()),
             }),
         }
     }
@@ -250,7 +330,6 @@ impl RustType<ProtoComputeLog> for ComputeLog {
         use proto_compute_log::Kind::*;
         match proto.kind {
             Some(DataflowCurrent(())) => Ok(ComputeLog::DataflowCurrent),
-            Some(DataflowDependency(())) => Ok(ComputeLog::DataflowDependency),
             Some(FrontierCurrent(())) => Ok(ComputeLog::FrontierCurrent),
             Some(PeekCurrent(())) => Ok(ComputeLog::PeekCurrent),
             Some(PeekDuration(())) => Ok(ComputeLog::PeekDuration),
@@ -260,11 +339,13 @@ impl RustType<ProtoComputeLog> for ComputeLog {
             Some(ArrangementHeapCapacity(())) => Ok(ComputeLog::ArrangementHeapCapacity),
             Some(ArrangementHeapAllocations(())) => Ok(ComputeLog::ArrangementHeapAllocations),
             Some(ShutdownDuration(())) => Ok(ComputeLog::ShutdownDuration),
+            Some(ErrorCount(())) => Ok(ComputeLog::ErrorCount),
             None => Err(TryFromProtoError::missing_field("ProtoComputeLog::kind")),
         }
     }
 }
 
+/// TODO(#25239): Add documentation.
 pub static DEFAULT_LOG_VARIANTS: Lazy<Vec<LogVariant>> = Lazy::new(|| {
     let default_logs = vec![
         LogVariant::Timely(TimelyLog::Operates),
@@ -280,7 +361,6 @@ pub static DEFAULT_LOG_VARIANTS: Lazy<Vec<LogVariant>> = Lazy::new(|| {
         LogVariant::Differential(DifferentialLog::ArrangementRecords),
         LogVariant::Differential(DifferentialLog::Sharing),
         LogVariant::Compute(ComputeLog::DataflowCurrent),
-        LogVariant::Compute(ComputeLog::DataflowDependency),
         LogVariant::Compute(ComputeLog::FrontierCurrent),
         LogVariant::Compute(ComputeLog::ImportFrontierCurrent),
         LogVariant::Compute(ComputeLog::FrontierDelay),
@@ -307,6 +387,7 @@ impl LogVariant {
             .unwrap_or_else(|| (0..arity).collect())
     }
 
+    /// TODO(#25239): Add documentation.
     pub fn desc(&self) -> RelationDesc {
         match self {
             LogVariant::Timely(TimelyLog::Operates) => RelationDesc::empty()
@@ -351,6 +432,16 @@ impl LogVariant {
                 .with_column("slept_for_ns", ScalarType::UInt64.nullable(false))
                 .with_column("requested_ns", ScalarType::UInt64.nullable(false)),
 
+            LogVariant::Timely(TimelyLog::BatchesReceived) => RelationDesc::empty()
+                .with_column("channel_id", ScalarType::UInt64.nullable(false))
+                .with_column("from_worker_id", ScalarType::UInt64.nullable(false))
+                .with_column("to_worker_id", ScalarType::UInt64.nullable(false)),
+
+            LogVariant::Timely(TimelyLog::BatchesSent) => RelationDesc::empty()
+                .with_column("channel_id", ScalarType::UInt64.nullable(false))
+                .with_column("from_worker_id", ScalarType::UInt64.nullable(false))
+                .with_column("to_worker_id", ScalarType::UInt64.nullable(false)),
+
             LogVariant::Timely(TimelyLog::MessagesReceived) => RelationDesc::empty()
                 .with_column("channel_id", ScalarType::UInt64.nullable(false))
                 .with_column("from_worker_id", ScalarType::UInt64.nullable(false))
@@ -378,6 +469,10 @@ impl LogVariant {
             LogVariant::Differential(DifferentialLog::ArrangementBatches)
             | LogVariant::Differential(DifferentialLog::ArrangementRecords)
             | LogVariant::Differential(DifferentialLog::Sharing)
+            | LogVariant::Differential(DifferentialLog::BatcherRecords)
+            | LogVariant::Differential(DifferentialLog::BatcherSize)
+            | LogVariant::Differential(DifferentialLog::BatcherCapacity)
+            | LogVariant::Differential(DifferentialLog::BatcherAllocations)
             | LogVariant::Compute(ComputeLog::ArrangementHeapSize)
             | LogVariant::Compute(ComputeLog::ArrangementHeapCapacity)
             | LogVariant::Compute(ComputeLog::ArrangementHeapAllocations) => RelationDesc::empty()
@@ -390,21 +485,18 @@ impl LogVariant {
                 .with_column("dataflow_id", ScalarType::UInt64.nullable(false))
                 .with_key(vec![0, 1]),
 
-            LogVariant::Compute(ComputeLog::DataflowDependency) => RelationDesc::empty()
-                .with_column("export_id", ScalarType::String.nullable(false))
-                .with_column("import_id", ScalarType::String.nullable(false))
-                .with_column("worker_id", ScalarType::UInt64.nullable(false)),
-
             LogVariant::Compute(ComputeLog::FrontierCurrent) => RelationDesc::empty()
                 .with_column("export_id", ScalarType::String.nullable(false))
                 .with_column("worker_id", ScalarType::UInt64.nullable(false))
-                .with_column("time", ScalarType::MzTimestamp.nullable(false)),
+                .with_column("time", ScalarType::MzTimestamp.nullable(false))
+                .with_key(vec![0, 1]),
 
             LogVariant::Compute(ComputeLog::ImportFrontierCurrent) => RelationDesc::empty()
                 .with_column("export_id", ScalarType::String.nullable(false))
                 .with_column("import_id", ScalarType::String.nullable(false))
                 .with_column("worker_id", ScalarType::UInt64.nullable(false))
-                .with_column("time", ScalarType::MzTimestamp.nullable(false)),
+                .with_column("time", ScalarType::MzTimestamp.nullable(false))
+                .with_key(vec![0, 1, 2]),
 
             LogVariant::Compute(ComputeLog::FrontierDelay) => RelationDesc::empty()
                 .with_column("export_id", ScalarType::String.nullable(false))
@@ -415,70 +507,25 @@ impl LogVariant {
             LogVariant::Compute(ComputeLog::PeekCurrent) => RelationDesc::empty()
                 .with_column("id", ScalarType::Uuid.nullable(false))
                 .with_column("worker_id", ScalarType::UInt64.nullable(false))
-                .with_column("index_id", ScalarType::String.nullable(false))
+                .with_column("object_id", ScalarType::String.nullable(false))
+                .with_column("type", ScalarType::String.nullable(false))
                 .with_column("time", ScalarType::MzTimestamp.nullable(false))
                 .with_key(vec![0, 1]),
 
             LogVariant::Compute(ComputeLog::PeekDuration) => RelationDesc::empty()
                 .with_column("worker_id", ScalarType::UInt64.nullable(false))
+                .with_column("type", ScalarType::String.nullable(false))
                 .with_column("duration_ns", ScalarType::UInt64.nullable(false)),
 
             LogVariant::Compute(ComputeLog::ShutdownDuration) => RelationDesc::empty()
                 .with_column("worker_id", ScalarType::UInt64.nullable(false))
                 .with_column("duration_ns", ScalarType::UInt64.nullable(false)),
-        }
-    }
 
-    /// Foreign key relations from the log variant to other log collections.
-    ///
-    /// The result is a list of other variants, and for each a list of local
-    /// and other column identifiers that can be equated.
-    pub fn foreign_keys(&self) -> Vec<(LogVariant, Vec<(usize, usize)>)> {
-        match self {
-            LogVariant::Timely(TimelyLog::Operates) => vec![],
-            LogVariant::Timely(TimelyLog::Channels) => vec![],
-            LogVariant::Timely(TimelyLog::Elapsed) => vec![(
-                LogVariant::Timely(TimelyLog::Operates),
-                vec![(0, 0), (1, 1)],
-            )],
-            LogVariant::Timely(TimelyLog::Histogram) => vec![(
-                LogVariant::Timely(TimelyLog::Operates),
-                vec![(0, 0), (1, 1)],
-            )],
-            LogVariant::Timely(TimelyLog::Addresses) => vec![(
-                LogVariant::Timely(TimelyLog::Operates),
-                vec![(0, 0), (1, 1)],
-            )],
-            LogVariant::Timely(TimelyLog::Parks) => vec![],
-            LogVariant::Timely(TimelyLog::MessagesReceived)
-            | LogVariant::Timely(TimelyLog::MessagesSent) => vec![
-                (
-                    LogVariant::Timely(TimelyLog::Channels),
-                    vec![(0, 0), (1, 1)],
-                ),
-                (
-                    LogVariant::Timely(TimelyLog::Channels),
-                    vec![(0, 0), (2, 2)],
-                ),
-            ],
-            LogVariant::Timely(TimelyLog::Reachability) => vec![],
-            LogVariant::Differential(DifferentialLog::ArrangementBatches)
-            | LogVariant::Differential(DifferentialLog::ArrangementRecords)
-            | LogVariant::Differential(DifferentialLog::Sharing)
-            | LogVariant::Compute(ComputeLog::ArrangementHeapSize)
-            | LogVariant::Compute(ComputeLog::ArrangementHeapCapacity)
-            | LogVariant::Compute(ComputeLog::ArrangementHeapAllocations) => vec![(
-                LogVariant::Timely(TimelyLog::Operates),
-                vec![(0, 0), (1, 1)],
-            )],
-            LogVariant::Compute(ComputeLog::DataflowCurrent) => vec![],
-            LogVariant::Compute(ComputeLog::DataflowDependency) => vec![],
-            LogVariant::Compute(ComputeLog::FrontierCurrent) => vec![],
-            LogVariant::Compute(ComputeLog::ImportFrontierCurrent) => vec![],
-            LogVariant::Compute(ComputeLog::FrontierDelay) => vec![],
-            LogVariant::Compute(ComputeLog::PeekCurrent) => vec![],
-            LogVariant::Compute(ComputeLog::PeekDuration) => vec![],
-            LogVariant::Compute(ComputeLog::ShutdownDuration) => vec![],
+            LogVariant::Compute(ComputeLog::ErrorCount) => RelationDesc::empty()
+                .with_column("export_id", ScalarType::String.nullable(false))
+                .with_column("worker_id", ScalarType::UInt64.nullable(false))
+                .with_column("count", ScalarType::Int64.nullable(false))
+                .with_key(vec![0, 1]),
         }
     }
 }

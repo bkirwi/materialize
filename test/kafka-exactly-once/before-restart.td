@@ -85,7 +85,7 @@ $ set schema=[
 
 $ kafka-create-topic topic=input
 
-> CREATE CONNECTION IF NOT EXISTS kafka_conn TO KAFKA (BROKER '${testdrive.kafka-addr}');
+> CREATE CONNECTION IF NOT EXISTS kafka_conn TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
     URL '${testdrive.schema-registry-url}'
@@ -129,7 +129,7 @@ $ kafka-verify-data headers=materialize-timestamp format=avro sink=materialize.p
 # get correct results even with compaction, which re-timestamps earlier data
 # at later timestamps upon restarting.
 
-> SELECT mz_internal.mz_sleep(5);
+> SELECT mz_unsafe.mz_sleep(5);
 <null>
 
 # TODO: enable when possible

@@ -12,23 +12,22 @@
 use mz_expr::visit::Visit;
 use mz_expr::MirRelationExpr;
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Normalize the structure of various operators.
 #[derive(Debug)]
 pub struct NormalizeOps;
 
 impl crate::Transform for NormalizeOps {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "normalize_ops")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _args: TransformArgs,
+        _ctx: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         // Canonicalize and fuse various operators as a bottom-up transforms.
         relation.try_visit_mut_post::<_, crate::TransformError>(

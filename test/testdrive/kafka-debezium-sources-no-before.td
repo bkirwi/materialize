@@ -81,7 +81,7 @@ $ set schema={
   }
 
 > CREATE CONNECTION kafka_conn
-  TO KAFKA (BROKER '${testdrive.kafka-addr}');
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
     URL '${testdrive.schema-registry-url}'
@@ -96,7 +96,9 @@ $ kafka-ingest format=avro topic=dbz-no-before key-format=avro key-schema=${keys
 {"id": 1} {"after": {"row": {"id": 1, "creature": "salamander"}}, "op": "c", "source": {"file": "binlog2", "pos": 1, "row": 1, "snapshot": {"boolean": false}}}
 {"id": 1} {"after": {"row": {"id": 1, "creature": "lizard"}}, "op": "c", "source": {"file": "binlog3", "pos": 1, "row": 1, "snapshot": {"boolean": false}}}
 
+> CREATE CLUSTER dbz_no_before_cluster SIZE '${arg.default-storage-size}';
 > CREATE SOURCE dbz_no_before
+  IN CLUSTER dbz_no_before_cluster
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-dbz-no-before-${testdrive.seed}')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
   ENVELOPE DEBEZIUM

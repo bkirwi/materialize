@@ -152,7 +152,7 @@ function Dataflows(props) {
                     mz_internal.mz_dataflow_operators;
 
                 SELECT
-                    id, from_index, to_index, from_port, to_port, sent
+                    id, from_index, to_index, from_port, to_port, sent, batch_sent
                 FROM
                     mz_internal.mz_dataflow_channels AS channels
                     LEFT JOIN mz_internal.mz_message_counts AS counts
@@ -179,7 +179,7 @@ function Dataflows(props) {
 
       // {id: [source, target]}.
       const chans = Object.fromEntries(
-        chan_table.rows.map(([id, source, target, source_port, target_port, sent]) => [id, [source, target, source_port, target_port, sent]])
+        chan_table.rows.map(([id, source, target, source_port, target_port, sent, batch_sent]) => [id, [source, target, source_port, target_port, sent, batch_sent]])
       );
       setChans(chans);
 
@@ -249,7 +249,7 @@ function Dataflows(props) {
           let addr = addrStr(id_to_addr[id]);
           if (!scope_children.has(addr)) { scope_channels.set(addr, []); }
           if (!scope_channels.has(addr)) { scope_channels.set(addr, []); }
-          scope_channels.get(addr).push([st[0], st[1], st[2], st[3], st[4]]);
+          scope_channels.get(addr).push([st[0], st[1], st[2], st[3], st[4], st[5]]);
         }
       });
 
@@ -259,14 +259,14 @@ function Dataflows(props) {
         if (scope_channels.get(addr) != null && scope_children.get(addr) != undefined) {
 
           let ids_seen = [];
-          const edges = scope_channels.get(addr).map(([source, target, source_port, target_port, sent]) => {
+          const edges = scope_channels.get(addr).map(([source, target, source_port, target_port, sent, batch_sent]) => {
             // if either `source` or `target` are zero, they signify a scope input or output, respectively.
-            let source1 = source != 0 ? addr_to_id[addr.concat(", ").concat(source)] : `input_${source_port}`;
-            let target1 = target != 0 ? addr_to_id[addr.concat(", ").concat(target)] : `output_${target_port}`;
+            let source1 = source != "0" ? addr_to_id[addr.concat(", ").concat(source)] : `input_${source_port}`;
+            let target1 = target != "0" ? addr_to_id[addr.concat(", ").concat(target)] : `output_${target_port}`;
             ids_seen.push(source1);
             ids_seen.push(target1);
             return sent == null ? `${source1} -> ${target1} [style="dashed"]` :
-              `${source1} -> ${target1} [label="sent ${sent}"]`;
+              `${source1} -> ${target1} [label="sent ${sent} (${batch_sent})"]`;
           })
 
           const children = [];
@@ -412,36 +412,8 @@ async function getCreateView(dataflow_name) {
   return { name: create_table.rows[0][0], create: create_table.rows[0][1] };
 }
 
-function makeAddrStr(addrs, id, other) {
-  let addr = addrs[id].slice();
-  // The 0 source or target should not append itself to the address.
-  if (other !== 0) {
-    addr.push(other);
-  }
-  return addrStr(addr);
-}
-
 function addrStr(addr) {
   return addr.join(', ');
-}
-
-// dispNs displays ns nanoseconds in a human-readable string.
-function dispNs(ns) {
-  const timeTable = [
-    [60, 's'],
-    [60, 'm'],
-    [60, 'h'],
-  ];
-  const parts = [];
-  let v = ns / 1e9;
-  timeTable.forEach(([div, disp], idx) => {
-    const part = Math.floor(v % div);
-    if (part >= 1 || idx === 0) {
-      parts.unshift(`${part}${disp}`);
-    }
-    v = Math.floor(v / div);
-  });
-  return parts.join('');
 }
 
 function toggle_active(e) {

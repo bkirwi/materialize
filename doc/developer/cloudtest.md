@@ -29,7 +29,7 @@ official [`kubernetes`] Python library to control the Kubernetes cluster.
     On Linux, use:
 
     ```
-    curl -fL https://dl.k8s.io/release/v1.24.3/bin/linux/amd64/kubectl > kubectl
+    curl -fL https://dl.k8s.io/release/v1.26.6/bin/linux/amd64/kubectl > kubectl
     chmod +x kubectl
     sudo mv kubectl /usr/local/bin
     ```
@@ -63,6 +63,9 @@ official [`kubernetes`] Python library to control the Kubernetes cluster.
     ./setup
     ```
 
+4. On macOS, configure Docker to use "gRPC FUSE" as file sharing implementation for the containers
+   (Docker settings, tab "General"). This will speed up the execution of cloudtests.
+
 # Running tests
 
 To run all short tests:
@@ -84,16 +87,23 @@ build in debug mode by passing the `--dev` flag:
 ./pytest --dev [-k TEST]
 ```
 
+⚠️ By default, cloudtest only runs short tests. To include long tests you can include the `-m=long`
+flag:
+
+```
+./pytest -m=long
+```
+
 To check the cluster status:
 
 ```
-kubectl --context=kind-cloudtest get all
+kubectl --context=kind-mzcloud get all
 ```
 
 Consider also using the [k9s] terminal user interface:
 
 ```
-k9s --context=kind-cloudtest
+k9s --context=kind-mzcloud
 ```
 
 To remove all resources from the Kubernetes cluster, so that a test can be rerun
@@ -126,7 +136,7 @@ cluster to become ready:
 
 See the examples in `test/clustertest/test_smoke.py`.
 
-The tests folow pytest conventions:
+The tests follow pytest conventions:
 
 ```python
 from materialize.cloudtest.app.materialize_application import MaterializeApplication
@@ -141,9 +151,9 @@ is instantiated once per `pytest` invocation
 ## Waiting for a resource to reach a particular state
 
 ```
-from materialize.cloudtest.wait import wait
+from materialize.cloudtest.util.wait import wait
 
-wait(condition="condition=Ready", resource="pod/compute-cluster-1-replica-1-0")
+wait(condition="condition=Ready", resource="pod/compute-cluster-u1-replica-u1-0")
 ```
 
 `wait` uses `kubectl wait` behind the scenes. Here is what the `kubectl wait`
@@ -175,7 +185,7 @@ wait(condition="delete", resource="secret/some_secret")
 
 ```python
 mz.testdrive.run(
-    dedent(
+    input=dedent(
         """
         > SELECT 1;
         1
@@ -254,3 +264,13 @@ can be very relevant for your linux distribution, if it is running
 In at least one case, a VPN (mullvad) was interfering with DNS resolution. Try
 de-activating your VPN and then tear down and restart your testing cluster to
 see if that helps.
+
+## botocore.exceptions.ClientError: An error occurred (AccessDenied) when calling the CreateMultipartUpload operation: Access Denied
+
+If tests are failing almost immediately while trying to upload a file to S3, it may be a bug in our debuginfo upload logic. You can _**unset**_ all your AWS credentials to work around this.
+
+## Failure joining worker nodes
+
+If `./setup` fails during the `Joining worker nodes` step and spams 404 error messages, the kubelet has likely died on at least one node. You can troubleshoot this by adding `--retain` to the `kind create cluster` command in `setup`, and then `docker exec -it "$node" bash` to access the node. From there you can access the kubelet logs with `journalctl -xeu kubelet`.
+
+Some common issues are listed at https://kind.sigs.k8s.io/docs/user/known-issues . We launch many nodes, so it is likely to be the inotify limits.

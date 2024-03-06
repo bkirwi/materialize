@@ -17,15 +17,17 @@ use std::collections::BTreeSet;
 use itertools::Itertools;
 use mz_sql_parser::ast::display::AstDisplay;
 
-use crate::ast::{Ident, QualifiedReplica, UnresolvedDatabaseName};
+use crate::ast::{Ident, UnresolvedDatabaseName};
 use crate::catalog::{
-    CatalogItemType, DefaultPrivilegeAclItem, DefaultPrivilegeObject, ObjectType,
+    CatalogItemType, DefaultPrivilegeAclItem, DefaultPrivilegeObject,
+    ErrorMessageObjectDescription, ObjectType, SystemObjectType,
 };
-use crate::names::{Aug, ObjectId, ResolvedDatabaseSpecifier, ResolvedRoleName, SchemaSpecifier};
+use crate::names::{
+    Aug, ObjectId, ResolvedDatabaseSpecifier, ResolvedRoleName, SchemaSpecifier, SystemObjectId,
+};
 use crate::plan::error::PlanError;
 use crate::plan::statement::ddl::{
-    ensure_cluster_is_not_managed, resolve_cluster, resolve_cluster_replica, resolve_database,
-    resolve_item, resolve_schema,
+    resolve_cluster, resolve_database, resolve_item_or_type, resolve_schema,
 };
 use crate::plan::statement::{StatementContext, StatementDesc};
 use crate::plan::{
@@ -65,8 +67,8 @@ pub fn plan_alter_owner(
         (ObjectType::Cluster, UnresolvedObjectName::Cluster(name)) => {
             plan_alter_cluster_owner(scx, if_exists, name, new_owner.id)
         }
-        (ObjectType::ClusterReplica, UnresolvedObjectName::ClusterReplica(name)) => {
-            plan_alter_cluster_replica_owner(scx, if_exists, name, new_owner.id)
+        (ObjectType::ClusterReplica, UnresolvedObjectName::ClusterReplica(_)) => {
+            bail_never_supported!("altering the owner of a cluster replica");
         }
         (ObjectType::Database, UnresolvedObjectName::Database(name)) => {
             plan_alter_database_owner(scx, if_exists, name, new_owner.id)
@@ -118,34 +120,6 @@ fn plan_alter_cluster_owner(
             });
             Ok(Plan::AlterNoop(AlterNoopPlan {
                 object_type: ObjectType::Cluster,
-            }))
-        }
-    }
-}
-
-fn plan_alter_cluster_replica_owner(
-    scx: &StatementContext,
-    if_exists: bool,
-    name: QualifiedReplica,
-    new_owner: RoleId,
-) -> Result<Plan, PlanError> {
-    match resolve_cluster_replica(scx, &name, if_exists)? {
-        Some((cluster, replica_id)) => {
-            ensure_cluster_is_not_managed(scx, cluster.id())?;
-            Ok(Plan::AlterOwner(AlterOwnerPlan {
-                id: ObjectId::ClusterReplica((cluster.id(), replica_id)),
-                object_type: ObjectType::ClusterReplica,
-                new_owner,
-            }))
-        }
-        None => {
-            scx.catalog.add_notice(PlanNotice::ObjectDoesNotExist {
-                name: name.to_ast_string(),
-                object_type: ObjectType::ClusterReplica,
-            });
-
-            Ok(Plan::AlterNoop(AlterNoopPlan {
-                object_type: ObjectType::ClusterReplica,
             }))
         }
     }
@@ -218,7 +192,7 @@ fn plan_alter_item_owner(
     name: UnresolvedItemName,
     new_owner: RoleId,
 ) -> Result<Plan, PlanError> {
-    match resolve_item(scx, name.clone(), if_exists)? {
+    match resolve_item_or_type(scx, object_type, name.clone(), if_exists)? {
         Some(item) => {
             if item.id().is_system() {
                 sql_bail!(
@@ -243,6 +217,12 @@ fn plan_alter_item_owner(
                     format!("{object_type}").to_lowercase(),
                 );
             }
+
+            // Sub-sources cannot be altered directly.
+            if item.is_subsource() {
+                sql_bail!("cannot ALTER this type of source");
+            }
+
             Ok(Plan::AlterOwner(AlterOwnerPlan {
                 id: ObjectId::Item(item.id()),
                 object_type,
@@ -413,108 +393,123 @@ fn plan_update_privilege(
     target: GrantTargetSpecification<Aug>,
     roles: Vec<ResolvedRoleName>,
 ) -> Result<UpdatePrivilegesPlan, PlanError> {
-    let object_type = target.object_type.into();
-    fn object_type_filter(
-        object_id: &ObjectId,
-        object_type: &ObjectType,
-        scx: &StatementContext,
-    ) -> bool {
-        if object_type == &ObjectType::Table {
-            scx.get_object_type(object_id).is_relation()
-        } else {
-            object_type == &scx.get_object_type(object_id)
-        }
-    }
-    let object_ids: Vec<ObjectId> = match target.object_spec_inner {
-        GrantTargetSpecificationInner::All(GrantTargetAllSpecification::All) => {
-            let cluster_ids = scx
-                .catalog
-                .get_clusters()
-                .into_iter()
-                .map(|cluster| cluster.id().into());
-            let database_ids = scx
-                .catalog
-                .get_databases()
-                .into_iter()
-                .map(|database| database.id().into());
-            let schema_ids = scx
-                .catalog
-                .get_schemas()
-                .into_iter()
-                .filter(|schema| !schema.id().is_temporary())
-                .map(|schema| (schema.database().clone(), schema.id().clone()).into());
-            let item_ids = scx
-                .catalog
-                .get_items()
-                .into_iter()
-                .map(|item| item.id().into());
-            cluster_ids
-                .chain(database_ids)
-                .chain(schema_ids)
-                .chain(item_ids)
-                .filter(|object_id| object_type_filter(object_id, &object_type, scx))
-                .filter(|object_id| object_id.is_user())
-                .collect()
-        }
-        GrantTargetSpecificationInner::All(GrantTargetAllSpecification::AllDatabases {
-            databases,
-        }) => {
-            let schema_ids = databases
-                .iter()
-                .map(|database| scx.get_database(database.database_id()))
-                .flat_map(|database| database.schemas().into_iter())
-                .filter(|schema| !schema.id().is_temporary())
-                .map(|schema| (schema.database().clone(), schema.id().clone()).into());
+    let (object_type, target_ids) = match target {
+        GrantTargetSpecification::Object {
+            object_type,
+            object_spec_inner,
+        } => {
+            fn object_type_filter(
+                object_id: &ObjectId,
+                object_type: &ObjectType,
+                scx: &StatementContext,
+            ) -> bool {
+                if object_type == &ObjectType::Table {
+                    scx.get_object_type(object_id).is_relation()
+                } else {
+                    object_type == &scx.get_object_type(object_id)
+                }
+            }
+            let object_type = object_type.into();
+            let object_ids: Vec<ObjectId> = match object_spec_inner {
+                GrantTargetSpecificationInner::All(GrantTargetAllSpecification::All) => {
+                    let cluster_ids = scx
+                        .catalog
+                        .get_clusters()
+                        .into_iter()
+                        .map(|cluster| cluster.id().into());
+                    let database_ids = scx
+                        .catalog
+                        .get_databases()
+                        .into_iter()
+                        .map(|database| database.id().into());
+                    let schema_ids = scx
+                        .catalog
+                        .get_schemas()
+                        .into_iter()
+                        .filter(|schema| !schema.id().is_temporary())
+                        .map(|schema| (schema.database().clone(), schema.id().clone()).into());
+                    let item_ids = scx
+                        .catalog
+                        .get_items()
+                        .into_iter()
+                        .map(|item| item.id().into());
+                    cluster_ids
+                        .chain(database_ids)
+                        .chain(schema_ids)
+                        .chain(item_ids)
+                        .filter(|object_id| object_type_filter(object_id, &object_type, scx))
+                        .filter(|object_id| object_id.is_user())
+                        .collect()
+                }
+                GrantTargetSpecificationInner::All(GrantTargetAllSpecification::AllDatabases {
+                    databases,
+                }) => {
+                    let schema_ids = databases
+                        .iter()
+                        .map(|database| scx.get_database(database.database_id()))
+                        .flat_map(|database| database.schemas().into_iter())
+                        .filter(|schema| !schema.id().is_temporary())
+                        .map(|schema| (schema.database().clone(), schema.id().clone()).into());
 
-            let item_ids = databases
-                .iter()
-                .map(|database| scx.get_database(database.database_id()))
-                .flat_map(|database| database.schemas().into_iter())
-                .flat_map(|schema| schema.item_ids().values())
-                .map(|item_id| (*item_id).into());
+                    let item_ids = databases
+                        .iter()
+                        .map(|database| scx.get_database(database.database_id()))
+                        .flat_map(|database| database.schemas().into_iter())
+                        .flat_map(|schema| schema.item_ids())
+                        .map(|item_id| item_id.into());
 
-            item_ids
-                .chain(schema_ids)
-                .filter(|object_id| object_type_filter(object_id, &object_type, scx))
-                .collect()
+                    item_ids
+                        .chain(schema_ids)
+                        .filter(|object_id| object_type_filter(object_id, &object_type, scx))
+                        .collect()
+                }
+                GrantTargetSpecificationInner::All(GrantTargetAllSpecification::AllSchemas {
+                    schemas,
+                }) => schemas
+                    .into_iter()
+                    .map(|schema| scx.get_schema(schema.database_spec(), schema.schema_spec()))
+                    .flat_map(|schema| schema.item_ids())
+                    .map(|item_id| item_id.into())
+                    .filter(|object_id| object_type_filter(object_id, &object_type, scx))
+                    .collect(),
+                GrantTargetSpecificationInner::Objects { names } => names
+                    .into_iter()
+                    .map(|name| {
+                        name.try_into()
+                            .expect("name resolution should handle invalid objects")
+                    })
+                    .collect(),
+            };
+            let target_ids = object_ids.into_iter().map(|id| id.into()).collect();
+            (SystemObjectType::Object(object_type), target_ids)
         }
-        GrantTargetSpecificationInner::All(GrantTargetAllSpecification::AllSchemas { schemas }) => {
-            schemas
-                .into_iter()
-                .map(|schema| scx.get_schema(schema.database_spec(), schema.schema_spec()))
-                .flat_map(|schema| schema.item_ids().values())
-                .map(|item_id| (*item_id).into())
-                .filter(|object_id| object_type_filter(object_id, &object_type, scx))
-                .collect()
+        GrantTargetSpecification::System => {
+            (SystemObjectType::System, vec![SystemObjectId::System])
         }
-        GrantTargetSpecificationInner::Objects { names } => names
-            .into_iter()
-            .map(|name| {
-                name.try_into()
-                    .expect("name resolution should handle invalid objects")
-            })
-            .collect(),
     };
 
-    let mut update_privileges = Vec::with_capacity(object_ids.len());
+    let mut update_privileges = Vec::with_capacity(target_ids.len());
 
-    for object_id in object_ids {
-        let actual_object_type = scx.get_object_type(&object_id);
+    for target_id in target_ids {
+        // The actual type of the object.
+        let actual_object_type = scx.get_system_object_type(&target_id);
+        // The type used for privileges, for example if the actual type is a view, the reference
+        // type is table.
         let mut reference_object_type = actual_object_type.clone();
 
         let acl_mode = privilege_spec_to_acl_mode(scx, &privileges, actual_object_type);
 
-        if let ObjectId::Item(id) = &object_id {
+        if let SystemObjectId::Object(ObjectId::Item(id)) = &target_id {
             let item = scx.get_item(id);
             let item_type: ObjectType = item.item_type().into();
             if (item_type == ObjectType::View
                 || item_type == ObjectType::MaterializedView
                 || item_type == ObjectType::Source)
-                && object_type == ObjectType::Table
+                && object_type == SystemObjectType::Object(ObjectType::Table)
             {
                 // This is an expected mis-match to match PostgreSQL semantics.
-                reference_object_type = ObjectType::Table;
-            } else if item_type != object_type {
+                reference_object_type = SystemObjectType::Object(ObjectType::Table);
+            } else if SystemObjectType::Object(item_type) != object_type {
                 let object_name = scx.catalog.resolve_full_name(item.name()).to_string();
                 return Err(PlanError::InvalidObjectType {
                     expected_type: object_type,
@@ -527,11 +522,11 @@ fn plan_update_privilege(
         let all_object_privileges = scx.catalog.all_object_privileges(reference_object_type);
         let invalid_privileges = acl_mode.difference(all_object_privileges);
         if !invalid_privileges.is_empty() {
-            let object_name = scx.catalog.get_object_name(&object_id);
+            let object_description =
+                ErrorMessageObjectDescription::from_sys_id(&target_id, scx.catalog);
             return Err(PlanError::InvalidPrivilegeTypes {
                 invalid_privileges,
-                object_type: actual_object_type,
-                object_name: Some(object_name),
+                object_description,
             });
         }
 
@@ -541,14 +536,17 @@ fn plan_update_privilege(
         //
         // For more details see:
         // https://github.com/postgres/postgres/blob/78d5952dd0e66afc4447eec07f770991fa406cce/src/backend/utils/adt/acl.c#L5154-L5246
-        let grantor = scx
-            .catalog
-            .get_owner_id(&object_id)
-            .expect("cannot revoke privileges on objects without owners");
+        let grantor = match &target_id {
+            SystemObjectId::Object(object_id) => scx
+                .catalog
+                .get_owner_id(object_id)
+                .expect("cannot revoke privileges on objects without owners"),
+            SystemObjectId::System => scx.catalog.mz_system_role_id(),
+        };
 
         update_privileges.push(UpdatePrivilege {
             acl_mode,
-            object_id,
+            target_id,
             grantor,
         });
     }
@@ -564,7 +562,7 @@ fn plan_update_privilege(
 fn privilege_spec_to_acl_mode(
     scx: &StatementContext,
     privilege_spec: &PrivilegeSpecification,
-    object_type: ObjectType,
+    object_type: SystemObjectType,
 ) -> AclMode {
     match privilege_spec {
         PrivilegeSpecification::All => scx.catalog.all_object_privileges(object_type),
@@ -584,6 +582,9 @@ fn privilege_to_acl_mode(privilege: Privilege) -> AclMode {
         Privilege::DELETE => AclMode::DELETE,
         Privilege::USAGE => AclMode::USAGE,
         Privilege::CREATE => AclMode::CREATE,
+        Privilege::CREATEROLE => AclMode::CREATE_ROLE,
+        Privilege::CREATEDB => AclMode::CREATE_DB,
+        Privilege::CREATECLUSTER => AclMode::CREATE_CLUSTER,
     }
 }
 
@@ -602,7 +603,7 @@ pub fn plan_alter_default_privileges(
         grant_or_revoke,
     }: AlterDefaultPrivilegesStatement<Aug>,
 ) -> Result<Plan, PlanError> {
-    let object_type = (*grant_or_revoke.object_type()).into();
+    let object_type: ObjectType = (*grant_or_revoke.object_type()).into();
     match object_type {
         ObjectType::View | ObjectType::MaterializedView | ObjectType::Source => sql_bail!(
             "{object_type}S is not valid for ALTER DEFAULT PRIVILEGES, use TABLES instead"
@@ -637,20 +638,26 @@ pub fn plan_alter_default_privileges(
         | ObjectType::Schema => {}
     }
 
-    let acl_mode = privilege_spec_to_acl_mode(scx, grant_or_revoke.privileges(), object_type);
-    let all_object_privileges = scx.catalog.all_object_privileges(object_type);
+    let acl_mode = privilege_spec_to_acl_mode(
+        scx,
+        grant_or_revoke.privileges(),
+        SystemObjectType::Object(object_type),
+    );
+    let all_object_privileges = scx
+        .catalog
+        .all_object_privileges(SystemObjectType::Object(object_type));
     let invalid_privileges = acl_mode.difference(all_object_privileges);
     if !invalid_privileges.is_empty() {
+        let object_description =
+            ErrorMessageObjectDescription::from_object_type(SystemObjectType::Object(object_type));
         return Err(PlanError::InvalidPrivilegeTypes {
             invalid_privileges,
-            object_type,
-            object_name: None,
+            object_description,
         });
     }
 
     let target_roles = match target_roles {
         TargetRoleSpecification::Roles(roles) => roles.into_iter().map(|role| role.id).collect(),
-        TargetRoleSpecification::CurrentRole => vec![*scx.catalog.active_role_id()],
         TargetRoleSpecification::AllRoles => vec![RoleId::Public],
     };
     let mut privilege_objects = Vec::with_capacity(target_roles.len() * target_objects.len());

@@ -7,7 +7,6 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-from typing import List, Set
 
 from materialize.output_consistency.execution.evaluation_strategy import (
     EvaluationStrategy,
@@ -23,6 +22,7 @@ from materialize.output_consistency.query.query_format import QueryOutputFormat
 from materialize.output_consistency.query.query_template import QueryTemplate
 from materialize.output_consistency.selection.selection import (
     ALL_QUERY_COLUMNS_BY_INDEX_SELECTION,
+    ALL_ROWS_SELECTION,
     QueryColumnByIndexSelection,
     TableColumnByNameSelection,
 )
@@ -33,7 +33,7 @@ class ReproductionCodePrinter(BaseOutputPrinter):
     def __init__(self, input_data: ConsistencyTestInputData):
         self.input_data = input_data
 
-    def print_reproduction_code(self, errors: List[ValidationError]) -> None:
+    def print_reproduction_code(self, errors: list[ValidationError]) -> None:
         for error in errors:
             self.__print_reproduction_code_of_error(error)
 
@@ -45,6 +45,11 @@ class ReproductionCodePrinter(BaseOutputPrinter):
         else:
             query_column_selection = QueryColumnByIndexSelection({error.col_index})
 
+        # do not restrict the input to selected rows when a where clause is present;
+        # there is no guarantee that the database filters the rows by the specified row indices before evaluating the
+        # rest of the where condition such that the where condition evaluation may fail on rows outside the selection
+        apply_row_filter = error.query_execution.query_template.where_expression is None
+
         table_column_selection = TableColumnByNameSelection(
             self.__get_involved_column_names(query_template, query_column_selection)
         )
@@ -52,11 +57,11 @@ class ReproductionCodePrinter(BaseOutputPrinter):
         self.start_section("Minimal code for reproduction", collapsed=True)
         self.print_separator_line()
         self.__print_setup_code_for_error(
-            query_template, error.strategy1, table_column_selection
+            query_template, error.strategy1, table_column_selection, apply_row_filter
         )
         self.print_separator_line()
         self.__print_setup_code_for_error(
-            query_template, error.strategy2, table_column_selection
+            query_template, error.strategy2, table_column_selection, apply_row_filter
         )
         self.print_separator_line()
         self.__print_query_of_error(
@@ -71,7 +76,7 @@ class ReproductionCodePrinter(BaseOutputPrinter):
             query_template, query_column_selection
         )
         self._print_text(
-            f"All directly or indirectly involved characteristics: {characteristics}"
+            f"All assumed directly or indirectly involved characteristics: {characteristics}"
         )
 
     def __print_setup_code_for_error(
@@ -79,12 +84,16 @@ class ReproductionCodePrinter(BaseOutputPrinter):
         query_template: QueryTemplate,
         evaluation_strategy: EvaluationStrategy,
         table_column_selection: TableColumnByNameSelection,
+        apply_row_filter: bool,
     ) -> None:
         self._print_text(f"Setup for evaluation strategy '{evaluation_strategy.name}':")
+        row_selection = (
+            query_template.row_selection if apply_row_filter else ALL_ROWS_SELECTION
+        )
         setup_code_lines = evaluation_strategy.generate_source_for_storage_layout(
             self.input_data,
             query_template.storage_layout,
-            query_template.row_selection,
+            row_selection,
             table_column_selection,
             override_db_object_name=evaluation_strategy.simple_db_object_name,
         )
@@ -114,7 +123,7 @@ class ReproductionCodePrinter(BaseOutputPrinter):
         self,
         query_template: QueryTemplate,
         query_column_selection: QueryColumnByIndexSelection,
-    ) -> Set[str]:
+    ) -> set[str]:
         column_names = set()
 
         for index, expression in enumerate(query_template.select_expressions):
@@ -125,14 +134,19 @@ class ReproductionCodePrinter(BaseOutputPrinter):
             for leaf_expression in leave_expressions:
                 column_names.add(leaf_expression.column_name)
 
+        if query_template.where_expression is not None:
+            where_leaf_expressions = query_template.where_expression.collect_leaves()
+            for leaf_expression in where_leaf_expressions:
+                column_names.add(leaf_expression.column_name)
+
         return column_names
 
     def __get_involved_characteristics(
         self,
         query_template: QueryTemplate,
         query_column_selection: QueryColumnByIndexSelection,
-    ) -> Set[ExpressionCharacteristics]:
-        all_involved_characteristics: Set[ExpressionCharacteristics] = set()
+    ) -> set[ExpressionCharacteristics]:
+        all_involved_characteristics: set[ExpressionCharacteristics] = set()
 
         for index, expression in enumerate(query_template.select_expressions):
             if not query_column_selection.is_included(index):

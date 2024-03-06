@@ -20,7 +20,6 @@ use mz_ore::retry::Retry;
 use mz_ore::str::StrExt;
 use mz_pgrepr::{Interval, Jsonb, Numeric, UInt2, UInt4, UInt8};
 use mz_repr::adt::range::Range;
-use mz_sql::ast::ExplainStage;
 use mz_sql_parser::ast::{Raw, Statement};
 use postgres_array::Array;
 use regex::Regex;
@@ -31,7 +30,7 @@ use tokio_postgres::types::{FromSql, Type};
 use crate::action::{ControlFlow, State};
 use crate::parser::{FailSqlCommand, SqlCommand, SqlExpectedError, SqlOutput};
 
-pub async fn run_sql(mut cmd: SqlCommand, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
+pub async fn run_sql(mut cmd: SqlCommand, state: &State) -> Result<ControlFlow, anyhow::Error> {
     use Statement::*;
 
     let stmts = mz_sql_parser::parser::parse_statements(&cmd.query)
@@ -39,7 +38,7 @@ pub async fn run_sql(mut cmd: SqlCommand, state: &mut State) -> Result<ControlFl
     if stmts.len() != 1 {
         bail!("expected one statement, but got {}", stmts.len());
     }
-    let stmt = stmts.into_element();
+    let stmt = stmts.into_element().ast;
     if let SqlOutput::Full { expected_rows, .. } = &mut cmd.expected_output {
         // TODO(benesch): one day we'll support SQL queries where order matters.
         expected_rows.sort();
@@ -49,7 +48,9 @@ pub async fn run_sql(mut cmd: SqlCommand, state: &mut State) -> Result<ControlFl
         // Do not retry FETCH statements as subsequent executions are likely
         // to return an empty result. The original result would thus be lost.
         Fetch(_) => false,
-        Explain(stmt) if stmt.stage != ExplainStage::Timestamp => false,
+        // EXPLAIN ... PLAN statements should always provide the expected result
+        // on the first try
+        ExplainPlan(_) => false,
         // DDL statements should always provide the expected result on the first try
         CreateConnection(_)
         | CreateCluster(_)
@@ -119,38 +120,8 @@ pub async fn run_sql(mut cmd: SqlCommand, state: &mut State) -> Result<ControlFl
         println!();
         return Err(e);
     }
-
-    match stmt {
-        Statement::CreateDatabase { .. }
-        | Statement::CreateIndex { .. }
-        | Statement::CreateSchema { .. }
-        | Statement::CreateSource { .. }
-        | Statement::CreateTable { .. }
-        | Statement::CreateView { .. }
-        | Statement::DropObjects { .. } => {
-            let disk_state = state
-                .with_catalog_copy(|catalog| catalog.state().dump())
-                .await?;
-            if let Some(disk_state) = disk_state {
-                let mem_state = reqwest::get(&format!(
-                    "http://{}/api/catalog",
-                    state.materialize_internal_http_addr,
-                ))
-                .await?
-                .text()
-                .await?;
-                if disk_state != mem_state {
-                    bail!(
-                        "the on-disk state of the catalog does not match its in-memory state\n\
-                     disk:{}\n\
-                     mem:{}",
-                        disk_state,
-                        mem_state
-                    );
-                }
-            }
-        }
-        _ => {}
+    if state.consistency_checks == super::consistency::Level::Statement {
+        super::consistency::run_consistency_checks(state).await?;
     }
 
     Ok(ControlFlow::Continue)
@@ -328,7 +299,7 @@ impl ErrorMatcher {
 
 pub async fn run_fail_sql(
     cmd: FailSqlCommand,
-    state: &mut State,
+    state: &State,
 ) -> Result<ControlFlow, anyhow::Error> {
     use Statement::{Commit, Fetch, Rollback};
 
@@ -342,7 +313,7 @@ pub async fn run_fail_sql(
             if s.len() != 1 {
                 bail!("expected one statement, but got {}", s.len());
             }
-            Some(s.into_element())
+            Some(s.into_element().ast)
         }
         Err(_) => None,
     };
@@ -578,6 +549,7 @@ pub fn decode_row(
     for (i, col) in row.columns().iter().enumerate() {
         let ty = col.type_();
         let mut value: String = match *ty {
+            Type::ACLITEM => row.get::<_, Option<AclItem>>(i).map(|x| x.0),
             Type::BOOL => row.get::<_, Option<bool>>(i).map(|x| x.to_string()),
             Type::BPCHAR | Type::TEXT | Type::VARCHAR => row.get::<_, Option<String>>(i),
             Type::TEXT_ARRAY => row
@@ -741,6 +713,18 @@ impl<'a> FromSql<'a> for MzAclItem {
 
     fn accepts(ty: &Type) -> bool {
         ty.oid() == mz_pgrepr::oid::TYPE_MZ_ACL_ITEM_OID
+    }
+}
+
+struct AclItem(String);
+
+impl<'a> FromSql<'a> for AclItem {
+    fn from_sql(_ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        Ok(AclItem(std::str::from_utf8(raw)?.to_string()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        ty.oid() == 1033
     }
 }
 

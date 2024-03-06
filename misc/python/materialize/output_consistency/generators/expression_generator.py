@@ -7,8 +7,9 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-from typing import Callable, Dict, List, Optional
+from collections.abc import Callable
 
+from materialize.output_consistency.common import probability
 from materialize.output_consistency.common.configuration import (
     ConsistencyTestConfiguration,
 )
@@ -32,7 +33,9 @@ from materialize.output_consistency.expression.expression_with_args import (
 from materialize.output_consistency.input_data.test_input_data import (
     ConsistencyTestInputData,
 )
-from materialize.output_consistency.operation.operation import DbOperationOrFunction
+from materialize.output_consistency.operation.operation import (
+    DbOperationOrFunction,
+)
 from materialize.output_consistency.operation.operation_param import OperationParam
 from materialize.output_consistency.selection.randomized_picker import RandomizedPicker
 
@@ -43,7 +46,7 @@ FIRST_ARG_INDEX = 0
 
 class ArgContext:
     def __init__(self) -> None:
-        self.args: List[Expression] = []
+        self.args: list[Expression] = []
         self.contains_aggregation = False
 
     def append(self, arg: Expression) -> None:
@@ -71,14 +74,14 @@ class ExpressionGenerator:
         self.config = config
         self.randomized_picker = randomized_picker
         self.input_data = input_data
-        self.selectable_operations: List[DbOperationOrFunction] = []
-        self.operation_weights: List[float] = []
-        self.operation_weights_no_aggregates: List[float] = []
-        self.operations_by_return_type_category: Dict[
-            DataTypeCategory, List[DbOperationOrFunction]
+        self.selectable_operations: list[DbOperationOrFunction] = []
+        self.operation_weights: list[float] = []
+        self.operation_weights_no_aggregates: list[float] = []
+        self.operations_by_return_type_category: dict[
+            DataTypeCategory, list[DbOperationOrFunction]
         ] = dict()
-        self.types_with_values_by_category: Dict[
-            DataTypeCategory, List[DataTypeWithValues]
+        self.types_with_values_by_category: dict[
+            DataTypeCategory, list[DataTypeWithValues]
         ] = dict()
         self._initialize_operations()
         self._initialize_types()
@@ -110,23 +113,55 @@ class ExpressionGenerator:
             types_with_values.append(data_type_with_values)
             self.types_with_values_by_category[category] = types_with_values
 
-    def pick_random_operation(self, include_aggregates: bool) -> DbOperationOrFunction:
-        weights = (
+    def pick_random_operation(
+        self,
+        include_aggregates: bool,
+        accept_op_filter: Callable[[DbOperationOrFunction], bool] | None = None,
+    ) -> DbOperationOrFunction:
+        all_weights = (
             self.operation_weights
             if include_aggregates
             else self.operation_weights_no_aggregates
         )
 
-        return self.randomized_picker.random_operation(
-            self.selectable_operations, weights
+        if accept_op_filter:
+            selected_operations = []
+            weights = []
+            for index, operation in enumerate(self.selectable_operations):
+                if accept_op_filter(operation):
+                    selected_operations.append(operation)
+                    weights.append(all_weights[index])
+        else:
+            selected_operations = self.selectable_operations
+            weights = all_weights
+
+        return self.randomized_picker.random_operation(selected_operations, weights)
+
+    def generate_boolean_expression(
+        self,
+        use_aggregation: bool,
+        storage_layout: ValueStorageLayout | None,
+        nesting_level: int = NESTING_LEVEL_ROOT,
+    ) -> ExpressionWithArgs | None:
+        def accept_op(operation: DbOperationOrFunction) -> bool:
+            if operation.is_aggregation != use_aggregation:
+                return False
+
+            # Simplification: This will only include operations defined to return a boolean value but not generic
+            # operations that might return a boolean value depending on the input.
+            return operation.return_type_spec.type_category == DataTypeCategory.BOOLEAN
+
+        boolean_operation = self.pick_random_operation(use_aggregation, accept_op)
+        return self.generate_expression(
+            boolean_operation, storage_layout, nesting_level
         )
 
     def generate_expression(
         self,
         operation: DbOperationOrFunction,
-        storage_layout: Optional[ValueStorageLayout] = None,
+        storage_layout: ValueStorageLayout | None = None,
         nesting_level: int = NESTING_LEVEL_ROOT,
-    ) -> Optional[ExpressionWithArgs]:
+    ) -> ExpressionWithArgs | None:
         if storage_layout is None:
             storage_layout = self._select_storage_layout(operation)
 
@@ -153,20 +188,24 @@ class ExpressionGenerator:
             # results in (an unexpected) error. Furthermore, in case of an error, error messages of non-aggregate
             # expressions can only be compared in HORIZONTAL layout (because the row processing order of an
             # evaluation strategy is not defined).)
-            if self.randomized_picker.random_boolean(0.9):
+            if self.randomized_picker.random_boolean(
+                probability.HORIZONTAL_LAYOUT_WHEN_NOT_AGGREGATED
+            ):
                 return ValueStorageLayout.HORIZONTAL
             else:
                 return ValueStorageLayout.VERTICAL
 
         # strongly prefer vertical storage for aggregations but allow some variance
 
-        if self.randomized_picker.random_boolean(0.1):
-            # Use horizontal layout in 10 % different of the cases
+        if self.randomized_picker.random_boolean(
+            probability.HORIZONTAL_LAYOUT_WHEN_AGGREGATED
+        ):
+            # Use horizontal layout in some cases
             return ValueStorageLayout.HORIZONTAL
 
         return ValueStorageLayout.VERTICAL
 
-    def _contains_aggregate_arg(self, args: List[Expression]) -> bool:
+    def _contains_aggregate_arg(self, args: list[Expression]) -> bool:
         for arg in args:
             if arg.is_aggregate:
                 return True
@@ -179,7 +218,7 @@ class ExpressionGenerator:
         storage_layout: ValueStorageLayout,
         nesting_level: int,
         try_number: int = 1,
-    ) -> List[Expression]:
+    ) -> list[Expression]:
         number_of_args = self.randomized_picker.random_number(
             operation.min_param_count, operation.max_param_count
         )
@@ -229,7 +268,9 @@ class ExpressionGenerator:
 
         create_complex_arg = (
             arg_context.requires_aggregation()
-            or self.randomized_picker.random_boolean(0.2)
+            or self.randomized_picker.random_boolean(
+                probability.CREATE_COMPLEX_EXPRESSION
+            )
         )
 
         if create_complex_arg:
@@ -333,7 +374,7 @@ class ExpressionGenerator:
         )
         is_unsupported = (
             is_unsupported
-            or not param.might_support_as_input_assuming_category_matches(
+            or not param.might_support_type_as_input_assuming_category_matches(
                 nested_expression.operation.return_type_spec
             )
         )
@@ -355,7 +396,7 @@ class ExpressionGenerator:
 
     def _get_data_type_values_of_category(
         self, param: OperationParam, arg_context: ArgContext
-    ) -> List[DataTypeWithValues]:
+    ) -> list[DataTypeWithValues]:
         category = param.resolve_type_category(arg_context.args)
         if category == DataTypeCategory.ANY:
             return self.input_data.all_data_types_with_values
@@ -386,7 +427,7 @@ class ExpressionGenerator:
         arg_context: ArgContext,
         must_use_aggregation: bool,
         allow_aggregation: bool,
-    ) -> List[DbOperationOrFunction]:
+    ) -> list[DbOperationOrFunction]:
         category = param.resolve_type_category(arg_context.args)
         suitable_operations = self._get_all_operations_of_category(param, category)
         if must_use_aggregation:
@@ -398,7 +439,7 @@ class ExpressionGenerator:
 
     def _get_all_operations_of_category(
         self, param: OperationParam, category: DataTypeCategory
-    ) -> List[DbOperationOrFunction]:
+    ) -> list[DbOperationOrFunction]:
         if category == DataTypeCategory.ANY:
             return self.input_data.all_operation_types
 
@@ -407,24 +448,24 @@ class ExpressionGenerator:
         return self.operations_by_return_type_category.get(category, [])
 
     def _get_without_aggregate_operations(
-        self, operations: List[DbOperationOrFunction]
-    ) -> List[DbOperationOrFunction]:
+        self, operations: list[DbOperationOrFunction]
+    ) -> list[DbOperationOrFunction]:
         return self._get_operations_with_filter(
             operations, lambda op: not op.is_aggregation
         )
 
     def _get_only_aggregate_operations(
-        self, operations: List[DbOperationOrFunction]
-    ) -> List[DbOperationOrFunction]:
+        self, operations: list[DbOperationOrFunction]
+    ) -> list[DbOperationOrFunction]:
         return self._get_operations_with_filter(
             operations, lambda op: op.is_aggregation
         )
 
     def _get_operations_with_filter(
         self,
-        operations: List[DbOperationOrFunction],
+        operations: list[DbOperationOrFunction],
         op_filter: Callable[[DbOperationOrFunction], bool],
-    ) -> List[DbOperationOrFunction]:
+    ) -> list[DbOperationOrFunction]:
         matching_operations = []
         for operation in operations:
             if op_filter(operation):
@@ -433,8 +474,8 @@ class ExpressionGenerator:
         return matching_operations
 
     def _get_operation_weights(
-        self, operations: List[DbOperationOrFunction]
-    ) -> List[float]:
+        self, operations: list[DbOperationOrFunction]
+    ) -> list[float]:
         weights = []
 
         for operation in operations:
@@ -444,6 +485,37 @@ class ExpressionGenerator:
             weights.append(weight)
 
         return weights
+
+    def find_operations_by_predicate(
+        self, match_op: Callable[[DbOperationOrFunction], bool]
+    ) -> list[DbOperationOrFunction]:
+        matched_ops = list()
+
+        for op in self.selectable_operations:
+            if match_op(op):
+                matched_ops.append(op)
+
+        return matched_ops
+
+    def find_exactly_one_operation_by_predicate(
+        self, match_op: Callable[[DbOperationOrFunction], bool]
+    ) -> DbOperationOrFunction:
+        operations = self.find_operations_by_predicate(match_op)
+        if len(operations) == 0:
+            raise RuntimeError("No operation matches!")
+        if len(operations) > 1:
+            raise RuntimeError(f"More than one operation matches: {operations}")
+
+        return operations[0]
+
+    def find_data_type_with_values_by_type_identifier(
+        self, type_identifier: str
+    ) -> DataTypeWithValues:
+        for data_type_with_values in self.input_data.all_data_types_with_values:
+            if data_type_with_values.data_type.internal_identifier == type_identifier:
+                return data_type_with_values
+
+        raise RuntimeError(f"No data type found with identifier {type_identifier}")
 
 
 class NoSuitableExpressionFound(Exception):

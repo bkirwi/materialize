@@ -13,17 +13,17 @@
 # Define t0 source
 define
 DefSource name=t0 keys=[[#0]]
-  - bigint
-  - bigint?
+  - c0: bigint
+  - c1: bigint?
 ----
 Source defined as t0
 
 # Define t1 source
 define
 DefSource name=t1 keys=[[#0]]
-  - text
-  - bigint
-  - boolean
+  - c0: text
+  - c1: bigint
+  - c2: boolean
 ----
 Source defined as t1
 
@@ -96,12 +96,12 @@ Reduce group_by=[#2, #1] aggregates=[sum(#2), max((#1 + #2))]
 
 # Case: `TopK`
 apply pipeline=projection_lifting
-TopK group_by=[#2, #1] order_by=[#1 asc nulls_last] monotonic
+TopK group_by=[#2, #1] order_by=[#1 asc nulls_last] limit=(#1 + 7) monotonic
   Project (#0, #2, #1, #2)
     Get t1
 ----
 Project (#0, #2, #1, #2)
-  TopK group_by=[#1, #2] order_by=[#2 asc nulls_last]
+  TopK group_by=[#1, #2] order_by=[#2 asc nulls_last] limit=(#2 + 7)
     Get t1
 
 
@@ -153,7 +153,7 @@ With Mutually Recursive
       Project (#1, #1)
         Get t1
   cte l1 = // { types: "(bigint, bigint?)" }
-    Distinct group_by=[#0, #1]
+    Distinct project=[#0, #1]
       Union
         Get t0
         Get l0
@@ -173,7 +173,7 @@ With Mutually Recursive
     Filter (#1) IS NOT NULL
       Get t1
   cte l1 =
-    Distinct group_by=[#0, #1]
+    Distinct project=[#0, #1]
       Union
         Get t0
         Project (#1, #1)

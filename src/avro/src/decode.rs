@@ -144,7 +144,8 @@ mod tests {
     }
 }
 
-fn build_ts_value(value: i64, unit: TsUnit) -> Result<Value, AvroError> {
+/// A convenience function to build timestamp values from underlying longs.
+pub fn build_ts_value(value: i64, unit: TsUnit) -> Result<Value, AvroError> {
     let result = match unit {
         TsUnit::Millis => NaiveDateTime::from_timestamp_millis(value),
         TsUnit::Micros => NaiveDateTime::from_timestamp_micros(value),
@@ -1155,8 +1156,12 @@ pub mod public_decoders {
                     let mut buf = vec![];
                     buf.resize_with(len, Default::default);
                     r.read_exact(&mut buf)?;
-                    serde_json::from_slice(&buf)
-                        .map_err(|e| AvroError::Decode(DecodeError::BadJson(e.classify())))?
+                    serde_json::from_slice(&buf).map_err(|e| {
+                        AvroError::Decode(DecodeError::BadJson {
+                            category: e.classify(),
+                            bytes: buf.to_owned(),
+                        })
+                    })?
                 }
             };
             Ok(Value::Json(val))

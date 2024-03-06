@@ -33,31 +33,52 @@
 //!       │ updates      │ output
 //!       v              v
 //! ```
+//!
+//! # Progress tracking
+//!
+//! In order to avoid causing excessive resource usage in the upstream server it's important to
+//! track the LSN that we have successfully committed to persist and communicate that back to
+//! PostgreSQL. Under normal operation this gauge of progress is provided by the presence of
+//! transactions themselves. Since at a given LSN offset there can be only a single message, when a
+//! transaction is received and processed we can infer that we have seen all the messages that are
+//! not beyond `commit_lsn + 1`.
+//!
+//! Things are a bit more complicated in the absence of transactions though because even though we
+//! don't receive any the server might very well be generating WAL records. This can happen if
+//! there is a separate logical database performing writes (which is the case for RDS databases),
+//! or, in servers running PostgreSQL version 15 or greater, the logical replication process
+//! includes an optimization that omits empty transactions, which can happen if you're only
+//! replicating a subset of the tables and there writes going to the other ones.
+//!
+//! If we fail to detect this situation and don't send LSN feedback in a timely manner the server
+//! will be forced to keep around WAL data that can eventually lead to disk space exhaustion.
+//!
+//! In the absence of transactions the only available piece of information in the replication
+//! stream are keepalive messages. Keepalive messages are documented[1] to contain the current end
+//! of WAL on the server. That is a useless number when it comes to progress tracking because there
+//! might be pending messages at LSNs between the last received commit_lsn and the current end of
+//! WAL.
+//!
+//! Fortunately for us, the documentation for PrimaryKeepalive messages is wrong and it actually
+//! contains the last *sent* LSN[2]. Here sent doesn't necessarily mean sent over the wire, but
+//! sent to the upstream process that is handling producing the logical stream. Therefore, if we
+//! receive a keepalive with a particular LSN we can be certain that there are no other replication
+//! messages at previous LSNs, because they would have been already generated and received. We
+//! therefore connect the keepalive messages directly to our capability.
+//!
+//! [1]: https://www.postgresql.org/docs/15/protocol-replication.html#PROTOCOL-REPLICATION-START-REPLICATION
+//! [2]: https://www.postgresql.org/message-id/CAFPTHDZS9O9WG02EfayBd6oONzK%2BqfUxS6AbVLJ7W%2BKECza2gg%40mail.gmail.com
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::pin::pin;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use differential_dataflow::{AsCollection, Collection};
 use futures::{future, future::select, FutureExt, Stream as AsyncStream, StreamExt, TryStreamExt};
-use once_cell::sync::Lazy;
-use postgres_protocol::message::backend::{
-    LogicalReplicationMessage, ReplicationMessage, TupleData,
-};
-use serde::{Deserialize, Serialize};
-use timely::dataflow::channels::pact::Exchange;
-use timely::dataflow::operators::Capability;
-use timely::dataflow::{Scope, Stream};
-use timely::progress::Antichain;
-use tokio_postgres::replication::LogicalReplicationStream;
-use tokio_postgres::types::PgLsn;
-use tokio_postgres::Client;
-use tracing::{error, trace};
-
 use mz_expr::MirScalarExpr;
 use mz_ore::cast::CastFrom;
 use mz_ore::collections::HashSet;
@@ -65,13 +86,34 @@ use mz_ore::result::ResultExt;
 use mz_postgres_util::desc::PostgresTableDesc;
 use mz_repr::{Datum, DatumVec, Diff, GlobalId, Row};
 use mz_sql_parser::ast::{display::AstDisplay, Ident};
-use mz_storage_client::types::connections::ConnectionContext;
-use mz_storage_client::types::sources::{MzOffset, PostgresSourceConnection};
-use mz_timely_util::builder_async::{Event as AsyncEvent, OperatorBuilder as AsyncOperatorBuilder};
+use mz_ssh_util::tunnel_manager::SshTunnelManager;
+use mz_storage_types::sources::{MzOffset, PostgresSourceConnection};
+use mz_timely_util::builder_async::{
+    AsyncOutputHandle, Event as AsyncEvent, OperatorBuilder as AsyncOperatorBuilder,
+    PressOnDropButton,
+};
 use mz_timely_util::operator::StreamExt as TimelyStreamExt;
+use once_cell::sync::Lazy;
+use postgres_protocol::message::backend::{
+    LogicalReplicationMessage, ReplicationMessage, TupleData,
+};
+use serde::{Deserialize, Serialize};
+use timely::dataflow::channels::pact::Exchange;
+use timely::dataflow::channels::pushers::TeeCore;
+use timely::dataflow::operators::Capability;
+use timely::dataflow::operators::{Concat, Map};
+use timely::dataflow::{Scope, Stream};
+use timely::progress::Antichain;
+use tokio_postgres::error::SqlState;
+use tokio_postgres::replication::LogicalReplicationStream;
+use tokio_postgres::types::PgLsn;
+use tokio_postgres::Client;
+use tracing::{error, trace};
 
+use crate::metrics::source::postgres::PgSourceMetrics;
 use crate::source::postgres::verify_schema;
-use crate::source::postgres::{metrics::PgSourceMetrics, DefiniteError, TransientError};
+use crate::source::postgres::{DefiniteError, ReplicationError, TransientError};
+use crate::source::types::ProgressStatisticsUpdate;
 use crate::source::types::SourceReaderError;
 use crate::source::RawSourceCreationConfig;
 
@@ -86,10 +128,6 @@ static PG_EPOCH: Lazy<SystemTime> = Lazy::new(|| UNIX_EPOCH + Duration::from_sec
 ///
 /// See: <https://www.postgresql.org/message-id/CAMsr+YE2dSfHVr7iEv1GSPZihitWX-PMkD9QALEGcTYa+sdsgg@mail.gmail.com>
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(30);
-
-/// The maximum amount of waiting for a transaction to appear in the replication stream before
-/// checking for replication lag.
-const TX_TIMEOUT: Duration = Duration::from_secs(30);
 
 // A request to rewind a snapshot taken at `snapshot_lsn` to the initial LSN of the replication
 // slot. This is accomplished by emitting `(data, 0, -diff)` for all updates `(data, lsn, diff)`
@@ -107,163 +145,263 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
     scope: G,
     config: RawSourceCreationConfig,
     connection: PostgresSourceConnection,
-    context: ConnectionContext,
     subsource_resume_uppers: BTreeMap<GlobalId, Antichain<MzOffset>>,
     table_info: BTreeMap<u32, (usize, PostgresTableDesc, Vec<MirScalarExpr>)>,
     rewind_stream: &Stream<G, RewindRequest>,
     committed_uppers: impl futures::Stream<Item = Antichain<MzOffset>> + 'static,
+    metrics: PgSourceMetrics,
 ) -> (
     Collection<G, (usize, Result<Row, SourceReaderError>), Diff>,
     Stream<G, Infallible>,
-    Stream<G, Rc<TransientError>>,
-    Rc<dyn Any>,
+    Stream<G, ProgressStatisticsUpdate>,
+    Stream<G, ReplicationError>,
+    PressOnDropButton,
 ) {
     let op_name = format!("ReplicationReader({})", config.id);
-    let mut builder = AsyncOperatorBuilder::new(op_name, scope);
+    let mut builder = AsyncOperatorBuilder::new(op_name, scope.clone());
 
     let slot_reader = u64::cast_from(config.responsible_worker("slot"));
-    let mut rewind_input = builder.new_input(rewind_stream, Exchange::new(move |_| slot_reader));
     let (mut data_output, data_stream) = builder.new_output();
-    let (_upper_output, upper_stream) = builder.new_output();
+    let (upper_output, upper_stream) = builder.new_output();
+    let (mut definite_error_handle, definite_errors) = builder.new_output();
 
-    let metrics = PgSourceMetrics::new(&config.base_metrics, config.id);
+    let (mut stats_output, stats_stream) = builder.new_output();
+
+    let mut rewind_input = builder.new_input_for_many(
+        rewind_stream,
+        Exchange::new(move |_| slot_reader),
+        [&data_output, &upper_output],
+    );
+
     metrics.tables.set(u64::cast_from(table_info.len()));
 
     let reader_table_info = table_info.clone();
-    let (button, errors) = builder.build_fallible(move |caps| {
+    let (button, transient_errors) = builder.build_fallible(move |caps| {
         let table_info = reader_table_info;
         Box::pin(async move {
             let (id, worker_id) = (config.id, config.worker_id);
-            let [data_cap, upper_cap]: &mut [_; 2] = caps.try_into().unwrap();
-            let (data_cap, upper_cap) = (data_cap.as_mut().unwrap(), upper_cap.as_mut().unwrap());
+            let [data_cap_set, upper_cap_set, definite_error_cap_set, stats_cap]: &mut [_; 4] =
+                caps.try_into().unwrap();
 
             if !config.responsible_for("slot") {
+                // Emit 0, to mark this worker as having started up correctly.
+                stats_output
+                    .give(
+                        &stats_cap[0],
+                        ProgressStatisticsUpdate::SteadyState {
+                            offset_known: 0,
+                            offset_committed: 0,
+                        },
+                    )
+                    .await;
                 return Ok(());
             }
+
+            // Determine the slot lsn.
+            let connection_config = connection
+                .connection
+                .config(
+                    &*config.config.connection_context.secrets_reader,
+                    &config.config,
+                )
+                .await?;
+
+            let slot = &connection.publication_details.slot;
+            let replication_client = connection_config
+                .connect_replication(&config.config.connection_context.ssh_tunnel_manager)
+                .await?;
+
+            tracing::info!(%id, "ensuring replication slot {slot} exists");
+            super::ensure_replication_slot(&replication_client, slot).await?;
+            let slot_lsn = super::fetch_slot_resume_lsn(&replication_client, slot).await?;
 
             let resume_upper = Antichain::from_iter(
                 subsource_resume_uppers
                     .values()
                     .flat_map(|f| f.elements())
-                    .cloned(),
+                    // Advance any upper as far as the slot_lsn.
+                    .map(|t| std::cmp::max(*t, slot_lsn)),
             );
 
             let Some(resume_lsn) = resume_upper.into_option() else {
                 return Ok(());
             };
-            data_cap.downgrade(&resume_lsn);
-            upper_cap.downgrade(&resume_lsn);
-
-            let connection_config = connection
-                .connection
-                .config(&*context.secrets_reader)
-                .await?
-                .replication_timeouts(config.params.pg_replication_timeouts.clone());
+            data_cap_set.downgrade([&resume_lsn]);
+            upper_cap_set.downgrade([&resume_lsn]);
+            trace!(%id, "timely-{worker_id} replication \
+                   reader started lsn={}", resume_lsn);
 
             let mut rewinds = BTreeMap::new();
-            while let Some(event) = rewind_input.next_mut().await {
-                if let AsyncEvent::Data(cap, data) = event {
-                    let cap = cap.retain_for_output(0);
-                    for req in data.drain(..) {
-                        assert!(
-                            resume_lsn <= req.snapshot_lsn,
-                            "slot compacted past snapshot point. snapshot_lsn={} resume_lsn={resume_lsn}", req.snapshot_lsn
-                        );
-                        rewinds.insert(req.oid, (cap.clone(), req));
+            while let Some(event) = rewind_input.next().await {
+                if let AsyncEvent::Data(caps, data) = event {
+                    for req in data {
+                        if resume_lsn > req.snapshot_lsn + 1 {
+                            let err = DefiniteError::SlotCompactedPastResumePoint(
+                                req.snapshot_lsn + 1,
+                                resume_lsn,
+                            );
+                            // If the replication stream cannot be obtained from the resume point there is nothing
+                            // else to do. These errors are not retractable.
+                            for &oid in table_info.keys() {
+                                // We pick `u64::MAX` as the LSN which will (in practice) never conflict
+                                // any previously revealed portions of the TVC.
+                                let update = ((oid, Err(err.clone())), MzOffset::from(u64::MAX), 1);
+                                data_output.give(&data_cap_set[0], update).await;
+                            }
+                            definite_error_handle
+                                .give(
+                                    &definite_error_cap_set[0],
+                                    ReplicationError::Definite(Rc::new(err)),
+                                )
+                                .await;
+                            return Ok(());
+                        }
+                        rewinds.insert(req.oid, (caps.clone(), req));
                     }
                 }
             }
+            trace!(%id, "timely-{worker_id} pending rewinds {rewinds:?}");
 
             let mut committed_uppers = pin!(committed_uppers);
 
-            // This loop alternates  between streaming the replication slot and using normal SQL
-            // queries with pg admin functions to fast-foward our cursor in the event of WAL lag.
-            let client = connection_config.connect("replication metadata").await?;
-            loop {
-                if let Err(err) = ensure_publication_exists(&client, &connection.publication).await? {
-                    // If the publication gets deleted there is nothing else to do. These errors
-                    // are not retractable.
+            let client = connection_config
+                .connect(
+                    "replication metadata",
+                    &config.config.connection_context.ssh_tunnel_manager,
+                )
+                .await?;
+
+            let stream_result = raw_stream(
+                &config,
+                replication_client,
+                client,
+                &connection.publication_details.slot,
+                &connection.publication_details.timeline_id,
+                &connection.publication,
+                *data_cap_set[0].time(),
+                committed_uppers.as_mut(),
+                &mut stats_output,
+                &stats_cap[0],
+            )
+            .await?;
+
+            let stream = match stream_result {
+                Ok(stream) => stream,
+                Err(err) => {
+                    // If the replication stream cannot be obtained in a definite way there is
+                    // nothing else to do. These errors are not retractable.
                     for &oid in table_info.keys() {
-                        let update = ((oid, Err(err.clone())), *data_cap.time(), 1);
-                        data_output.give(data_cap, update).await;
+                        // We pick `u64::MAX` as the LSN which will (in practice) never conflict
+                        // any previously revealed portions of the TVC.
+                        let update = ((oid, Err(err.clone())), MzOffset::from(u64::MAX), 1);
+                        data_output.give(&data_cap_set[0], update).await;
                     }
+
+                    definite_error_handle
+                        .give(
+                            &definite_error_cap_set[0],
+                            ReplicationError::Definite(Rc::new(err)),
+                        )
+                        .await;
                     return Ok(());
                 }
+            };
+            let mut stream = pin!(stream.peekable());
 
-                // We will peek the slot first to eagerly advance the frontier in case the stream
-                // is currently empty. This avoids needlesly holding back the capability and allows
-                // the rest of the ingestion pipeline to proceed immediately.
-                let slot = &connection.publication_details.slot;
-                advance_upper(&client, slot, &connection.publication, data_cap).await?;
-                upper_cap.downgrade(data_cap.time());
-                rewinds.retain(|_, (_, req)| data_cap.time() <= &req.snapshot_lsn);
-                trace!(%id, "timely-{worker_id} downgraded capability to {}", data_cap.time());
-                trace!(%id, "timely-{worker_id} pending rewinds {rewinds:?}");
+            let mut errored = HashSet::new();
+            let mut container = Vec::new();
+            let max_capacity = timely::container::buffer::default_capacity::<(
+                (u32, Result<Vec<Option<Bytes>>, DefiniteError>),
+                MzOffset,
+                Diff,
+            )>();
 
-                let mut stream = pin!(raw_stream(
-                    &config,
-                    &connection_config,
-                    &client,
-                    slot,
-                    &connection.publication,
-                    *data_cap.time(),
-                    committed_uppers.as_mut()
-                )
-                .peekable());
+            while let Some(event) = stream.as_mut().next().await {
+                use LogicalReplicationMessage::*;
+                use ReplicationMessage::*;
+                let mut new_upper = *data_cap_set[0].time();
+                match event {
+                    Ok(XLogData(data)) => match data.data() {
+                        Begin(begin) => {
+                            let commit_lsn = MzOffset::from(begin.final_lsn());
 
-                let mut errored = HashSet::new();
-                let mut container = Vec::new();
-                let max_capacity = timely::container::buffer::default_capacity::<((u32, Result<Vec<Option<Bytes>>, DefiniteError>), MzOffset, Diff)>();
+                            let mut tx = pin!(extract_transaction(
+                                stream.by_ref(),
+                                commit_lsn,
+                                &table_info,
+                                &connection_config,
+                                &config.config.connection_context.ssh_tunnel_manager,
+                                &metrics,
+                                &connection.publication,
+                                &mut errored
+                            ));
 
-                while let Ok(_) = tokio::time::timeout(TX_TIMEOUT, stream.as_mut().peek()).await {
-                    let mut new_upper = *data_cap.time();
-                    while let Some(event) = stream.as_mut().peek().now_or_never() {
-                        match event {
-                            Some(Ok(LogicalReplicationMessage::Begin(begin))) => {
-                                let tx_lsn = MzOffset::from(begin.final_lsn());
-                                let mut tx = pin!(extract_transaction(
-                                    stream.by_ref(),
-                                    &table_info,
-                                    &connection_config,
-                                    &metrics,
-                                    &connection.publication,
-                                    &mut errored
-                                ));
-
-                                trace!(%id, "timely-{worker_id} extracting transaction at {tx_lsn}");
-                                while let Some((oid, event, diff)) = tx.try_next().await? {
-                                    if !table_info.contains_key(&oid) {
-                                        continue;
-                                    }
-                                    let data = (oid, event);
-                                    if let Some((rewind_cap, req)) = rewinds.get(&oid) {
-                                        if tx_lsn <= req.snapshot_lsn {
-                                            let update = (data.clone(), MzOffset::from(0), -diff);
-                                            data_output.give(rewind_cap, update).await;
-                                        }
-                                    }
-                                    container.push((data, tx_lsn, diff));
+                            trace!(
+                                %id,
+                                "timely-{worker_id} extracting transaction \
+                                    at {commit_lsn}"
+                            );
+                            while let Some((oid, event, diff)) = tx.try_next().await? {
+                                if !table_info.contains_key(&oid) {
+                                    continue;
                                 }
-                                new_upper = tx_lsn + 1;
-                                if container.len() > max_capacity {
-                                    data_output.give_container(data_cap, &mut container).await;
-                                    upper_cap.downgrade(&new_upper);
-                                    data_cap.downgrade(&new_upper);
+
+                                let event_is_ok = event.is_ok();
+                                let data = (oid, event);
+                                if let Some((rewind_caps, req)) = rewinds.get(&oid) {
+                                    let [data_cap, _upper_cap] = rewind_caps;
+                                    // Do not "rewind" definite errors because
+                                    // we cannot guarantee that the snapshot
+                                    // dataflow produced a definite error.
+                                    if commit_lsn <= req.snapshot_lsn && event_is_ok {
+                                        let update = (data.clone(), MzOffset::from(0), -diff);
+                                        data_output.give(data_cap, update).await;
+                                    }
                                 }
+                                assert!(
+                                    new_upper <= commit_lsn,
+                                    "new_upper={} tx_lsn={}",
+                                    new_upper,
+                                    commit_lsn
+                                );
+                                container.push((data, commit_lsn, diff));
                             }
-                            Some(Ok(_)) => return Err(TransientError::BareTransactionEvent),
-                            Some(Err(_)) => {
-                                return Err(stream.as_mut().next().await.unwrap().unwrap_err())
+                            new_upper = commit_lsn + 1;
+                            if container.len() > max_capacity {
+                                data_output
+                                    .give_container(&data_cap_set[0], &mut container)
+                                    .await;
+                                upper_cap_set.downgrade([&new_upper]);
+                                data_cap_set.downgrade([&new_upper]);
                             }
-                            None => break,
                         }
+                        _ => return Err(TransientError::BareTransactionEvent),
+                    },
+                    Ok(PrimaryKeepAlive(keepalive)) => {
+                        trace!(
+                            %id,
+                            "timely-{worker_id} received \
+                               keepalive lsn={}",
+                            keepalive.wal_end()
+                        );
+                        new_upper = std::cmp::max(new_upper, keepalive.wal_end().into());
                     }
-                    data_output.give_container(data_cap, &mut container).await;
-                    upper_cap.downgrade(&new_upper);
-                    data_cap.downgrade(&new_upper);
-                    rewinds.retain(|_, (_, req)| data_cap.time() <= &req.snapshot_lsn);
+                    Ok(_) => return Err(TransientError::UnknownReplicationMessage),
+                    Err(err) => return Err(err),
+                }
+
+                let will_yield = stream.as_mut().peek().now_or_never().is_none();
+                if will_yield {
+                    data_output
+                        .give_container(&data_cap_set[0], &mut container)
+                        .await;
+                    upper_cap_set.downgrade([&new_upper]);
+                    data_cap_set.downgrade([&new_upper]);
+                    rewinds.retain(|_, (_, req)| data_cap_set[0].time() <= &req.snapshot_lsn);
                 }
             }
+            // We never expect the replication stream to gracefully end
+            Err(TransientError::ReplicationEOF)
         })
     });
 
@@ -273,26 +411,38 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
     // We now process the slot updates and apply the cast expressions
     let mut final_row = Row::default();
     let mut datum_vec = DatumVec::new();
-    let replication_updates = raw_collection.map(move |(oid, event)| {
-        let (output_index, _, casts) = &table_info[&oid];
-        let event = event.and_then(|row| {
-            let mut datums = datum_vec.borrow();
-            for col in row.iter() {
-                let datum = col.as_deref().map(super::decode_utf8_text).transpose()?;
-                datums.push(datum.unwrap_or(Datum::Null));
-            }
-            super::cast_row(casts, &datums, &mut final_row)?;
-            Ok(final_row.clone())
-        });
+    let replication_updates = raw_collection
+        .map(move |(oid, event)| {
+            let (output_index, _, casts) = &table_info[&oid];
+            let event = event.and_then(|row| {
+                let mut datums = datum_vec.borrow();
+                for col in row.iter() {
+                    let datum = col.as_deref().map(super::decode_utf8_text).transpose()?;
+                    datums.push(datum.unwrap_or(Datum::Null));
+                }
+                super::cast_row(casts, &datums, &mut final_row)?;
+                Ok(final_row.clone())
+            });
 
-        (*output_index, event.err_into())
-    });
+            (*output_index, event.err_into())
+        })
+        .inner
+        .map_in_place(move |&mut ((_, ref data), _, ref mut diff)| {
+            // Ensure errors are never retracted.
+            if data.is_err() {
+                *diff = diff.abs();
+            }
+        })
+        .as_collection();
+
+    let errors = definite_errors.concat(&transient_errors.map(ReplicationError::from));
 
     (
         replication_updates,
         upper_stream,
+        stats_stream,
         errors,
-        Rc::new(button.press_on_drop()),
+        button.press_on_drop(),
     )
 }
 
@@ -300,41 +450,94 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
 /// keepalive messages with the provided `uppers` stream.
 ///
 /// The returned stream will contain all transactions that whose commit LSN is beyond `resume_lsn`.
-fn raw_stream<'a>(
+async fn raw_stream<'a>(
     config: &'a RawSourceCreationConfig,
-    connection_config: &'a mz_postgres_util::Config,
-    metadata_client: &'a Client,
+    replication_client: Client,
+    metadata_client: Client,
     slot: &'a str,
+    timeline_id: &'a Option<u64>,
     publication: &'a str,
     resume_lsn: MzOffset,
     uppers: impl futures::Stream<Item = Antichain<MzOffset>> + 'a,
-) -> impl AsyncStream<Item = Result<LogicalReplicationMessage, TransientError>> + 'a {
-    async_stream::try_stream!({
+    stats_output: &'a mut AsyncOutputHandle<
+        MzOffset,
+        Vec<ProgressStatisticsUpdate>,
+        TeeCore<MzOffset, Vec<ProgressStatisticsUpdate>>,
+    >,
+    stats_cap: &'a Capability<MzOffset>,
+) -> Result<
+    Result<
+        impl AsyncStream<
+                Item = Result<ReplicationMessage<LogicalReplicationMessage>, TransientError>,
+            > + 'a,
+        DefiniteError,
+    >,
+    TransientError,
+> {
+    if let Err(err) = ensure_publication_exists(&metadata_client, publication).await? {
+        // If the publication gets deleted there is nothing else to do. These errors
+        // are not retractable.
+        return Ok(Err(err));
+    }
+
+    // Skip the timeline ID check for sources without a known timeline ID
+    // (sources created before the timeline ID was added to the source details)
+    if let Some(expected_timeline_id) = timeline_id {
+        if let Err(err) =
+            ensure_replication_timeline_id(&replication_client, expected_timeline_id).await?
+        {
+            return Ok(Err(err));
+        }
+    }
+
+    // Postgres will return all transactions that commit *at or after* after the provided LSN,
+    // following the timely upper semantics.
+    let lsn = PgLsn::from(resume_lsn.offset);
+    let query = format!(
+        r#"START_REPLICATION SLOT "{}" LOGICAL {} ("proto_version" '1', "publication_names" '{}')"#,
+        Ident::new_unchecked(slot).to_ast_string(),
+        lsn,
+        publication,
+    );
+    let copy_stream = match replication_client.copy_both_simple(&query).await {
+        Ok(copy_stream) => copy_stream,
+        Err(err) if err.code() == Some(&SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE) => {
+            return Ok(Err(DefiniteError::InvalidReplicationSlot));
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    // According to the documentation [1] we must check that the slot LSN matches our
+    // expectations otherwise we risk getting silently fast-forwarded to a future LSN. In order
+    // to avoid a TOCTOU issue we must do this check after starting the replication stream. We
+    // cannot use the replication client to do that because it's already in CopyBoth mode.
+    // [1] https://www.postgresql.org/docs/15/protocol-replication.html#PROTOCOL-REPLICATION-START-REPLICATION-SLOT-LOGICAL
+    let min_resume_lsn = super::fetch_slot_resume_lsn(&metadata_client, slot).await?;
+
+    let progress_stat_shared_value = Arc::new(Mutex::new(None));
+    let progress_stat_task_value = Arc::clone(&progress_stat_shared_value);
+    let max_lsn_task_handle =
+        mz_ore::task::spawn(|| format!("pg_current_wal_lsn:{}", config.id), async move {
+            // TODO(guswynn): make configurable.
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+
+            loop {
+                interval.tick().await;
+                let lsn_or_err = super::fetch_max_lsn(&metadata_client).await;
+                *progress_stat_task_value.lock().expect("poisoned") = Some(lsn_or_err);
+            }
+        })
+        .abort_on_drop();
+
+    let stream = async_stream::try_stream!({
+        // Ensure we don't pre-drop the task
+        let _max_lsn_task_handle = max_lsn_task_handle;
+
         let mut uppers = pin!(uppers);
         let mut last_committed_upper = resume_lsn;
 
-        let replication_client = connection_config.connect_replication().await?;
-        super::ensure_replication_slot(&replication_client, slot).await?;
-
-        // Postgres will return all transactions that commit *strictly* after the provided LSN but
-        // we want to produce all transactions that commit *at or after* the provided LSN. We
-        // therefore subtract one.
-        let lsn = PgLsn::from(resume_lsn.offset.saturating_sub(1));
-        let query = format!(
-            r#"START_REPLICATION SLOT "{}" LOGICAL {} ("proto_version" '1', "publication_names" '{}')"#,
-            Ident::from(slot.clone()).to_ast_string(),
-            lsn,
-            publication,
-        );
-        let copy_stream = replication_client.copy_both_simple(&query).await?;
         let mut stream = pin!(LogicalReplicationStream::new(copy_stream));
 
-        // According to the documentation [1] we must check that the slot LSN matches our
-        // expectations otherwise we risk getting silently fast-forwarded to a future LSN. In order
-        // to avoid a TOCTOU issue we must do this check after starting the replication stream. We
-        // cannot use the replication client to do that because it's already in CopyBoth mode.
-        // [1] https://www.postgresql.org/docs/15/protocol-replication.html#PROTOCOL-REPLICATION-START-REPLICATION-SLOT-LOGICAL
-        let min_resume_lsn = super::fetch_slot_resume_lsn(metadata_client, slot).await?;
         if !(resume_lsn == MzOffset::from(0) || min_resume_lsn <= resume_lsn) {
             let err = TransientError::OvercompactedReplicationSlot {
                 available_lsn: min_resume_lsn,
@@ -349,10 +552,14 @@ fn raw_stream<'a>(
             let send_feedback = match select(stream.as_mut().next(), uppers.as_mut().next()).await {
                 future::Either::Left((next_message, _)) => match next_message.transpose()? {
                     Some(ReplicationMessage::XLogData(data)) => {
-                        yield data.into_data();
+                        yield ReplicationMessage::XLogData(data);
                         last_feedback.elapsed() > FEEDBACK_INTERVAL
                     }
-                    Some(ReplicationMessage::PrimaryKeepAlive(keepalive)) => keepalive.reply() == 1,
+                    Some(ReplicationMessage::PrimaryKeepAlive(keepalive)) => {
+                        let send_feedback = keepalive.reply() == 1;
+                        yield ReplicationMessage::PrimaryKeepAlive(keepalive);
+                        send_feedback
+                    }
                     Some(_) => Err(TransientError::UnknownReplicationMessage)?,
                     None => return,
                 },
@@ -366,23 +573,46 @@ fn raw_stream<'a>(
             };
             if send_feedback {
                 let ts: i64 = PG_EPOCH.elapsed().unwrap().as_micros().try_into().unwrap();
-                // For the same reason as above, we must subtract one here too.
-                let lsn = PgLsn::from(last_committed_upper.offset.saturating_sub(1));
+                let lsn = PgLsn::from(last_committed_upper.offset);
                 stream
                     .as_mut()
                     .standby_status_update(lsn, lsn, lsn, ts, 0)
                     .await?;
                 last_feedback = Instant::now();
+
+                // This is separate to ensure clippy doesn't get mad about a lock being held across
+                // an await point.
+                let upstream_stat = { progress_stat_shared_value.lock().expect("poisoned").take() };
+                if let Some(upstream_stat) = upstream_stat {
+                    let upstream_stat = upstream_stat?;
+                    stats_output
+                        .give(
+                            stats_cap,
+                            ProgressStatisticsUpdate::SteadyState {
+                                // Similar to the kafka source, we don't subtract 1 from the upper as we want to report the
+                                // _number of bytes_ we have processed/in upstream.
+                                offset_known: upstream_stat.offset,
+                                offset_committed: last_committed_upper.offset,
+                            },
+                        )
+                        .await;
+                }
             }
         }
-    })
+    });
+    Ok(Ok(stream))
 }
 
-/// Extracts a single transaction from the replication stream delimited by a BEGIN and COMMIT message.
+/// Extracts a single transaction from the replication stream delimited by a BEGIN and COMMIT
+/// message. The BEGIN message must have already been consumed from the stream before calling this
+/// function.
 fn extract_transaction<'a>(
-    stream: impl AsyncStream<Item = Result<LogicalReplicationMessage, TransientError>> + 'a,
+    stream: impl AsyncStream<Item = Result<ReplicationMessage<LogicalReplicationMessage>, TransientError>>
+        + 'a,
+    commit_lsn: MzOffset,
     table_info: &'a BTreeMap<u32, (usize, PostgresTableDesc, Vec<MirScalarExpr>)>,
     connection_config: &'a mz_postgres_util::Config,
+    ssh_tunnel_manager: &'a SshTunnelManager,
     metrics: &'a PgSourceMetrics,
     publication: &'a str,
     errored_tables: &'a mut HashSet<u32>,
@@ -392,16 +622,18 @@ fn extract_transaction<'a>(
     use LogicalReplicationMessage::*;
     async_stream::try_stream!({
         let mut stream = pin!(stream);
-        let commit_lsn = match stream.try_next().await? {
-            Some(Begin(body)) => body.final_lsn(),
-            Some(_) => Err(TransientError::UnmatchedTransaction)?,
-            None => Err(TransientError::ReplicationEOF)?,
-        };
         metrics.transactions.inc();
-        metrics.lsn.set(commit_lsn.into());
+        metrics.lsn.set(commit_lsn.offset);
         while let Some(event) = stream.try_next().await? {
+            // We can ignore keepalive messages while processing a transaction because the
+            // commit_lsn will drive progress.
+            let message = match event {
+                ReplicationMessage::XLogData(data) => data.into_data(),
+                ReplicationMessage::PrimaryKeepAlive(_) => continue,
+                _ => Err(TransientError::UnknownReplicationMessage)?,
+            };
             metrics.total.inc();
-            match event {
+            match message {
                 Insert(body) if errored_tables.contains(&body.rel_id()) => continue,
                 Update(body) if errored_tables.contains(&body.rel_id()) => continue,
                 Delete(body) if errored_tables.contains(&body.rel_id()) => continue,
@@ -448,6 +680,7 @@ fn extract_transaction<'a>(
                         // ensure e.g. we haven't received a schema update with the same terminal
                         // column name which is actually a different column.
                         let upstream_info = mz_postgres_util::publication_info(
+                            ssh_tunnel_manager,
                             connection_config,
                             publication,
                             Some(rel_id),
@@ -469,7 +702,7 @@ fn extract_transaction<'a>(
                     }
                 }
                 Commit(body) => {
-                    if commit_lsn != body.commit_lsn() {
+                    if commit_lsn != body.commit_lsn().into() {
                         Err(TransientError::InvalidTransaction)?
                     }
                     return;
@@ -485,44 +718,6 @@ fn extract_transaction<'a>(
         }
         Err(TransientError::ReplicationEOF)?;
     })
-}
-
-/// Discovers LSN of the next replication stream update that happens beyond `start_lsn`. If there
-/// is no such update the current upper LSN is returned.
-async fn advance_upper(
-    client: &Client,
-    slot: &str,
-    publication: &str,
-    cap: &mut Capability<MzOffset>,
-) -> Result<(), TransientError> {
-    // Figure out the last written LSN and then add one to convert it into an upper.
-    let row = client.query_one("SELECT pg_current_wal_lsn()", &[]).await?;
-    let last_write: PgLsn = row.get("pg_current_wal_lsn");
-    let pg_upper = PgLsn::from(u64::from(last_write) + 1);
-
-    // `pg_logical_slot_peek_binary_changes` will include only those transactions which commit
-    // *prior* to the specified LSN. i.e (commit_lsn < pg_upper).
-    let query = format!(
-        "SELECT data FROM pg_logical_slot_peek_binary_changes(
-        '{slot}', '{pg_upper}', NULL, 'proto_version', '1', 'publication_names', '{publication}')"
-    );
-    let rows = client.query(&query, &[]).await?;
-
-    for row in rows {
-        let data = Bytes::from(row.get::<_, Vec<u8>>("data"));
-        let message = LogicalReplicationMessage::parse(&data)
-            .map_err(TransientError::MalformedReplicationMessage)?;
-        if let LogicalReplicationMessage::Begin(body) = message {
-            let ts = MzOffset::from(body.final_lsn());
-            if cap.time() <= &ts {
-                cap.downgrade(&ts);
-                return Ok(());
-            }
-        }
-    }
-    // If there is no transaction with commit_lsn < pg_upper, the upper is pg_upper.
-    cap.downgrade(&MzOffset::from(pg_upper));
-    Ok(())
 }
 
 /// Unpacks an iterator of TupleData into a list of nullable bytes or an error if this can't be
@@ -563,5 +758,23 @@ async fn ensure_publication_exists(
         None => Ok(Err(DefiniteError::PublicationDropped(
             publication.to_owned(),
         ))),
+    }
+}
+
+/// Ensure the active replication timeline_id matches the one we expect such that we can safely
+/// resume replication. It returns an outer transient error in case of
+/// connection issues and an inner definite error if the timeline id does not match.
+async fn ensure_replication_timeline_id(
+    replication_client: &Client,
+    expected_timeline_id: &u64,
+) -> Result<Result<(), DefiniteError>, TransientError> {
+    let timeline_id = mz_postgres_util::get_timeline_id(replication_client).await?;
+    if timeline_id == *expected_timeline_id {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(DefiniteError::InvalidTimelineId {
+            expected: *expected_timeline_id,
+            actual: timeline_id,
+        }))
     }
 }

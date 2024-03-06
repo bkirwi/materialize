@@ -12,7 +12,7 @@
 use mz_expr::MirRelationExpr;
 
 use crate::attribute::subtree_size::SubtreeSize;
-use crate::attribute::{Attribute, DerivedAttributes, RequiredAttributes};
+use crate::attribute::{Attribute, DerivedAttributes, DerivedAttributesBuilder};
 
 /// Compute the column types of each subtree of a [MirRelationExpr] from the
 /// bottom-up.
@@ -36,15 +36,15 @@ impl Attribute for Arity {
             offset += &deps.get_results::<SubtreeSize>()[n - offset];
         }
         let subtree_arity =
-            expr.arity_with_input_arities(offsets.into_iter().rev().map(|o| &self.results[o]));
+            expr.arity_with_input_arities(offsets.into_iter().rev().map(|o| self.results[o]));
         self.results.push(subtree_arity);
     }
 
-    fn add_dependencies(builder: &mut RequiredAttributes)
+    fn add_dependencies(builder: &mut DerivedAttributesBuilder)
     where
         Self: Sized,
     {
-        builder.require::<SubtreeSize>();
+        builder.require(SubtreeSize::default());
     }
 
     fn get_results(&self) -> &Vec<Self::Value> {

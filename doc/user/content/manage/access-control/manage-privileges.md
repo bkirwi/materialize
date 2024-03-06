@@ -7,8 +7,6 @@ menu:
     weight: 20
 ---
 
-{{< alpha />}}
-
 This page outlines how to assign and manage role privileges.
 
 ## Grant privileges
@@ -22,18 +20,19 @@ GRANT USAGE ON <OBJECT_TYPE> <object_name> TO <role_name>;
 
 Materialize objects allow for the following privileges:
 
-| Object Type         | Privileges                             |
-|---------------------|----------------------------------------|
-| `DATABASE`          | `USAGE`, `CREATE`                      |
-| `SCHEMA`            | `USAGE`, `CREATE`                      |
-| `TABLE`             | `INSERT`, `SELECT`, `UPDATE`, `DELETE` |
-| `VIEW`              | `SELECT`                               |
-| `MATERIALIZED VIEW` | `SELECT`                               |
-| `TYPE`              | `USAGE`                                |
-| `SOURCE`            | `SELECT`                               |
-| `CONNECTION`        | `USAGE`                                |
-| `SECRET`            | `USAGE`                                |
-| `CLUSTER`           | `USAGE`, `CREATE`                      |
+| Object Type         | Privileges                                |
+|---------------------|-------------------------------------------|
+| `SYSTEM`            | `CREATEROLE`, `CREATEDB`, `CREATECLUSTER` |
+| `DATABASE`          | `USAGE`, `CREATE`                         |
+| `SCHEMA`            | `USAGE`, `CREATE`                         |
+| `TABLE`             | `INSERT`, `SELECT`, `UPDATE`, `DELETE`    |
+| `VIEW`              | `SELECT`                                  |
+| `MATERIALIZED VIEW` | `SELECT`                                  |
+| `TYPE`              | `USAGE`                                   |
+| `SOURCE`            | `SELECT`                                  |
+| `CONNECTION`        | `USAGE`                                   |
+| `SECRET`            | `USAGE`                                   |
+| `CLUSTER`           | `USAGE`, `CREATE`                         |
 
 Materialize object access is also dependent on cluster privileges.
 Roles that need access to an object that use compute resources must also have

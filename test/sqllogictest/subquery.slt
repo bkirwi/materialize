@@ -249,55 +249,59 @@ mode standard
 # Verify that the plans for some simple non-correlated subqueries are sane.
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT * FROM t1 WHERE EXISTS (SELECT * FROM t2)
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t1 WHERE EXISTS (SELECT * FROM t2)
 ----
 Explained Query:
   CrossJoin type=differential // { arity: 1 }
     implementation
       %1[×]UA » %0:t1[×]
     ArrangeBy keys=[[]] // { arity: 1 }
-      Get materialize.public.t1 // { arity: 1 }
+      ReadStorage materialize.public.t1 // { arity: 1 }
     ArrangeBy keys=[[]] // { arity: 0 }
-      Distinct // { arity: 0 }
+      Distinct project=[] // { arity: 0 }
         Project () // { arity: 0 }
-          Get materialize.public.t2 // { arity: 1 }
+          ReadStorage materialize.public.t2 // { arity: 1 }
 
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT *  FROM t1, t3 WHERE t1.a = t3.a AND EXISTS (SELECT * FROM t2)
+EXPLAIN WITH(arity, join implementations) SELECT *  FROM t1, t3 WHERE t1.a = t3.a AND EXISTS (SELECT * FROM t2)
 ----
 Explained Query:
   Project (#0, #0, #2) // { arity: 3 }
-    Join on=(#0 = #1) type=differential // { arity: 3 }
+    Join on=(#0 = #1) type=delta // { arity: 3 }
       implementation
-        %2[×]UA » %0:t1[×] » %1:t3[#0]K
-      ArrangeBy keys=[[]] // { arity: 1 }
-        Get materialize.public.t1 // { arity: 1 }
+        %0:t1 » %2[×]UA » %1:t3[#0]K
+        %1:t3 » %2[×]UA » %0:t1[#0]K
+        %2 » %0:t1[×] » %1:t3[#0]K
+      ArrangeBy keys=[[], [#0]] // { arity: 1 }
+        ReadStorage materialize.public.t1 // { arity: 1 }
       ArrangeBy keys=[[#0]] // { arity: 2 }
-        Get materialize.public.t3 // { arity: 2 }
+        ReadStorage materialize.public.t3 // { arity: 2 }
       ArrangeBy keys=[[]] // { arity: 0 }
-        Distinct // { arity: 0 }
+        Distinct project=[] // { arity: 0 }
           Project () // { arity: 0 }
-            Get materialize.public.t2 // { arity: 1 }
+            ReadStorage materialize.public.t2 // { arity: 1 }
 
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT *  FROM t1, t3 WHERE t1.a = t3.a AND EXISTS (SELECT * FROM t2 WHERE t3.b = t2.b)
+EXPLAIN WITH(arity, join implementations) SELECT *  FROM t1, t3 WHERE t1.a = t3.a AND EXISTS (SELECT * FROM t2 WHERE t3.b = t2.b)
 ----
 Explained Query:
   Project (#0, #0, #2) // { arity: 3 }
-    Join on=(#0 = #1 AND #2 = #3) type=differential // { arity: 4 }
+    Join on=(#0 = #1 AND #2 = #3) type=delta // { arity: 4 }
       implementation
-        %2[#0]UKA » %1:t3[#1]K » %0:t1[#0]K
+        %0:t1 » %1:t3[#0]K » %2[#0]UKA
+        %1:t3 » %2[#0]UKA » %0:t1[#0]K
+        %2 » %1:t3[#1]K » %0:t1[#0]K
       ArrangeBy keys=[[#0]] // { arity: 1 }
-        Get materialize.public.t1 // { arity: 1 }
-      ArrangeBy keys=[[#1]] // { arity: 2 }
-        Get materialize.public.t3 // { arity: 2 }
+        ReadStorage materialize.public.t1 // { arity: 1 }
+      ArrangeBy keys=[[#0], [#1]] // { arity: 2 }
+        ReadStorage materialize.public.t3 // { arity: 2 }
       ArrangeBy keys=[[#0]] // { arity: 1 }
-        Distinct group_by=[#0] // { arity: 1 }
-          Get materialize.public.t2 // { arity: 1 }
+        Distinct project=[#0] // { arity: 1 }
+          ReadStorage materialize.public.t2 // { arity: 1 }
 
 EOF
 
@@ -306,7 +310,7 @@ EOF
 # 4 scalars that refer to other scalars in the map. If query planning optimizes away
 # this particular case, replace with another query that generates such a plan
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 SELECT age, ascii_num * 2 as result FROM (
   SELECT age, ascii(letter) AS ascii_num FROM (
     SELECT age, substr(replaced, 2, 1) AS letter FROM (
@@ -325,10 +329,10 @@ Explained Query:
           %0:likes[#0]K » %1:age[#0]K
         ArrangeBy keys=[[#0]] // { arity: 2 }
           Filter (#0) IS NOT NULL // { arity: 2 }
-            Get materialize.public.likes // { arity: 2 }
+            ReadStorage materialize.public.likes // { arity: 2 }
         ArrangeBy keys=[[#0]] // { arity: 2 }
           Filter (#0) IS NOT NULL // { arity: 2 }
-            Get materialize.public.age // { arity: 2 }
+            ReadStorage materialize.public.age // { arity: 2 }
 
 Source materialize.public.likes
   filter=((#0) IS NOT NULL)
@@ -414,7 +418,17 @@ SELECT col FROM (SELECT 1 AS col) t WHERE col = ANY(VALUES (1))
 1
 
 query I
+SELECT col FROM (SELECT 1 AS col) t WHERE col = ANY((VALUES (1)))
+----
+1
+
+query I
 SELECT col FROM (SELECT 1 AS col) t WHERE col IN(VALUES(1))
+----
+1
+
+query I
+SELECT col FROM (SELECT 1 AS col) t WHERE col IN(((VALUES(1))))
 ----
 1
 
@@ -438,7 +452,7 @@ false
 true
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT b IN (SELECT a FROM x) FROM y
+EXPLAIN WITH(arity, join implementations) SELECT b IN (SELECT a FROM x) FROM y
 ----
 Explained Query:
   Return // { arity: 1 }
@@ -447,7 +461,7 @@ Explained Query:
         implementation
           %0:y[#0]K » %1[#0]K
         ArrangeBy keys=[[#0]] // { arity: 1 }
-          Get materialize.public.y // { arity: 1 }
+          ReadStorage materialize.public.y // { arity: 1 }
         ArrangeBy keys=[[#0]] // { arity: 2 }
           Union // { arity: 2 }
             Map (true) // { arity: 2 }
@@ -466,16 +480,16 @@ Explained Query:
           ArrangeBy keys=[[#0]] // { arity: 1 }
             Get l0 // { arity: 1 }
           ArrangeBy keys=[[#0]] // { arity: 1 }
-            Distinct group_by=[#0] // { arity: 1 }
-              Get materialize.public.x // { arity: 1 }
+            Distinct project=[#0] // { arity: 1 }
+              ReadStorage materialize.public.x // { arity: 1 }
     cte l0 =
-      Distinct group_by=[#0] // { arity: 1 }
-        Get materialize.public.y // { arity: 1 }
+      Distinct project=[#0] // { arity: 1 }
+        ReadStorage materialize.public.y // { arity: 1 }
 
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT b != ALL(SELECT a FROM x) FROM y
+EXPLAIN WITH(arity, join implementations) SELECT b != ALL(SELECT a FROM x) FROM y
 ----
 Explained Query:
   Return // { arity: 1 }
@@ -485,7 +499,7 @@ Explained Query:
           implementation
             %0:y[#0]K » %1[#0]K
           ArrangeBy keys=[[#0]] // { arity: 1 }
-            Get materialize.public.y // { arity: 1 }
+            ReadStorage materialize.public.y // { arity: 1 }
           ArrangeBy keys=[[#0]] // { arity: 2 }
             Union // { arity: 2 }
               Map (true) // { arity: 2 }
@@ -504,17 +518,17 @@ Explained Query:
           ArrangeBy keys=[[#0]] // { arity: 1 }
             Get l0 // { arity: 1 }
           ArrangeBy keys=[[#0]] // { arity: 1 }
-            Distinct group_by=[#0] // { arity: 1 }
-              Get materialize.public.x // { arity: 1 }
+            Distinct project=[#0] // { arity: 1 }
+              ReadStorage materialize.public.x // { arity: 1 }
     cte l0 =
-      Distinct group_by=[#0] // { arity: 1 }
-        Get materialize.public.y // { arity: 1 }
+      Distinct project=[#0] // { arity: 1 }
+        ReadStorage materialize.public.y // { arity: 1 }
 
 EOF
 
 # Check that we correctly invert the filter here via De Morgan.
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT b > ALL(SELECT a FROM x) FROM y
+EXPLAIN WITH(arity, join implementations) SELECT b > ALL(SELECT a FROM x) FROM y
 ----
 Explained Query:
   Return // { arity: 1 }
@@ -524,7 +538,7 @@ Explained Query:
           implementation
             %0:y[#0]K » %1[#0]K
           ArrangeBy keys=[[#0]] // { arity: 1 }
-            Get materialize.public.y // { arity: 1 }
+            ReadStorage materialize.public.y // { arity: 1 }
           ArrangeBy keys=[[#0]] // { arity: 2 }
             Union // { arity: 2 }
               Map (true) // { arity: 2 }
@@ -536,7 +550,7 @@ Explained Query:
                   Get l0 // { arity: 1 }
   With
     cte l1 =
-      Distinct group_by=[#0] // { arity: 1 }
+      Distinct project=[#0] // { arity: 1 }
         Project (#0) // { arity: 1 }
           Filter (#0 <= #1) // { arity: 2 }
             CrossJoin type=differential // { arity: 2 }
@@ -545,10 +559,10 @@ Explained Query:
               ArrangeBy keys=[[]] // { arity: 1 }
                 Get l0 // { arity: 1 }
               ArrangeBy keys=[[]] // { arity: 1 }
-                Get materialize.public.x // { arity: 1 }
+                ReadStorage materialize.public.x // { arity: 1 }
     cte l0 =
-      Distinct group_by=[#0] // { arity: 1 }
-        Get materialize.public.y // { arity: 1 }
+      Distinct project=[#0] // { arity: 1 }
+        ReadStorage materialize.public.y // { arity: 1 }
 
 EOF
 
@@ -639,7 +653,7 @@ WHERE a IN (9, 0)
 1
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT 1 FROM x RIGHT JOIN (SELECT 2 FROM y) ON  NULL
+EXPLAIN WITH(arity, join implementations) SELECT 1 FROM x RIGHT JOIN (SELECT 2 FROM y) ON  NULL
 WHERE a IN (9, 0)
   OR 0  <  ALL (
       SELECT agg1  NULL
@@ -650,8 +664,8 @@ WHERE a IN (9, 0)
 ----
 Explained Query:
   Map (1) // { arity: 1 }
-    Distinct // { arity: 0 }
+    Distinct project=[] // { arity: 0 }
       Project () // { arity: 0 }
-        Get materialize.public.y // { arity: 1 }
+        ReadStorage materialize.public.y // { arity: 1 }
 
 EOF

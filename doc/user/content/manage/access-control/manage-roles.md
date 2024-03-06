@@ -4,10 +4,8 @@ description: "Create and manage roles in Materialize"
 menu:
   main:
     parent: access-control
-    weight: 15
+    weight: 20
 ---
-
-{{< alpha />}}
 
 This page outlines how to create and manage roles in Materialize.
 
@@ -23,13 +21,7 @@ Materialize roles have the following available attributes:
 
 | Name              | Description                                                                 |
 |-------------------|-----------------------------------------------------------------------------|
-| `CREATEDB`        | Can create a database.                                                      |
-| `CREATEROLE`      | Can create, alter, delete roles and can grant and revoke role membership.   |
 | `INHERIT`         | **Read-only.** Can inherit privileges of other roles.                       |
-| `CREATECLUSTER`   | Can create a cluster.                                                       |
-| `NOCREATEDB`      | Denies the role the ability to create databases.                            |
-| `NOCREATEROLE`    | Denies the role the ability to create, alter, delete roles or grant/revoke. |
-| `NOCREATECLUSTER` | Denies the role the ability to create clusters.                             |
 
 ## Alter a role's attributes
 

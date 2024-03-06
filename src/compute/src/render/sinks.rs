@@ -14,21 +14,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use differential_dataflow::Collection;
-use mz_compute_client::types::sinks::{ComputeSinkConnection, ComputeSinkDesc};
-use mz_expr::{permutation_for_arrangement, MapFilterProject};
+use mz_compute_types::sinks::{ComputeSinkConnection, ComputeSinkDesc};
+use mz_expr::{permutation_for_arrangement, EvalError, MapFilterProject};
+use mz_ore::soft_assert_or_log;
+use mz_ore::str::StrExt;
+use mz_ore::vec::PartialOrdVecExt;
 use mz_repr::{Diff, GlobalId, Row};
-use mz_storage_client::controller::CollectionMetadata;
-use mz_storage_client::types::errors::DataflowError;
-use mz_timely_util::probe;
+use mz_storage_types::controller::CollectionMetadata;
+use mz_storage_types::errors::DataflowError;
+use mz_timely_util::operator::CollectionExt;
 use timely::dataflow::scopes::Child;
 use timely::dataflow::Scope;
 use timely::progress::Antichain;
 
 use crate::compute_state::SinkToken;
+use crate::logging::compute::LogDataflowErrors;
 use crate::render::context::Context;
 use crate::render::RenderTimestamp;
 
-impl<'g, G, T> Context<Child<'g, G, T>, Row>
+impl<'g, G, T> Context<Child<'g, G, T>>
 where
     G: Scope<Timestamp = mz_repr::Timestamp>,
     T: RenderTimestamp,
@@ -37,12 +41,16 @@ where
     pub(crate) fn export_sink(
         &mut self,
         compute_state: &mut crate::compute_state::ComputeState,
-        tokens: &mut BTreeMap<GlobalId, Rc<dyn std::any::Any>>,
+        tokens: &BTreeMap<GlobalId, Rc<dyn std::any::Any>>,
         dependency_ids: BTreeSet<GlobalId>,
         sink_id: GlobalId,
         sink: &ComputeSinkDesc<CollectionMetadata>,
-        probes: Vec<probe::Handle<mz_repr::Timestamp>>,
     ) {
+        soft_assert_or_log!(
+            sink.non_null_assertions.is_strictly_sorted(),
+            "non-null assertions not sorted"
+        );
+
         // put together tokens that belong to the export
         let mut needed_tokens = Vec::new();
         for dep_id in dependency_ids {
@@ -58,7 +66,7 @@ where
         let bundle = self
             .lookup_id(mz_expr::Id::Global(sink.from))
             .expect("Sink source collection not loaded");
-        let (ok_collection, err_collection) = if let Some(collection) = &bundle.collection {
+        let (ok_collection, mut err_collection) = if let Some(collection) = &bundle.collection {
             collection.clone()
         } else {
             let (key, _arrangement) = bundle
@@ -73,12 +81,46 @@ where
             bundle.as_collection_core(mfp, Some((key.clone(), None)), self.until.clone())
         };
 
-        let ok_collection = ok_collection.leave();
-        let err_collection = err_collection.leave();
+        // Attach logging of dataflow errors.
+        if let Some(logger) = compute_state.compute_logger.clone() {
+            err_collection = err_collection.log_dataflow_errors(logger, sink_id);
+        }
+
+        let mut ok_collection = ok_collection.leave();
+        let mut err_collection = err_collection.leave();
+
+        let non_null_assertions = sink.non_null_assertions.clone();
+        let from_desc = sink.from_desc.clone();
+        if !non_null_assertions.is_empty() {
+            let (oks, null_errs) =
+                ok_collection.map_fallible("NullAssertions({sink_id:?})", move |row| {
+                    let mut idx = 0;
+                    let mut iter = row.iter();
+                    for &i in &non_null_assertions {
+                        let skip = i - idx;
+                        let datum = iter.nth(skip).unwrap();
+                        idx += skip + 1;
+                        if datum.is_null() {
+                            return Err(DataflowError::EvalError(Box::new(
+                                EvalError::MustNotBeNull(format!(
+                                    "column {}",
+                                    from_desc.get_name(i).as_str().quoted()
+                                )),
+                            )));
+                        }
+                    }
+                    Ok(row)
+                });
+            ok_collection = oks;
+            err_collection = err_collection.concat(&null_errs);
+        }
 
         let region_name = match sink.connection {
             ComputeSinkConnection::Subscribe(_) => format!("SubscribeSink({:?})", sink_id),
             ComputeSinkConnection::Persist(_) => format!("PersistSink({:?})", sink_id),
+            ComputeSinkConnection::CopyToS3Oneshot(_) => {
+                format!("CopyToS3OneshotSink({:?})", sink_id)
+            }
         };
         self.scope
             .parent
@@ -93,16 +135,14 @@ where
                     self.as_of_frontier.clone(),
                     ok_collection.enter_region(inner),
                     err_collection.enter_region(inner),
-                    probes,
                 );
 
                 if let Some(sink_token) = sink_token {
                     needed_tokens.push(sink_token);
                 }
 
-                compute_state
-                    .sink_tokens
-                    .insert(sink_id, SinkToken::new(Box::new(needed_tokens)));
+                let collection = compute_state.expect_collection_mut(sink_id);
+                collection.sink_token = Some(SinkToken::new(Box::new(needed_tokens)));
             });
     }
 }
@@ -120,7 +160,6 @@ where
         as_of: Antichain<mz_repr::Timestamp>,
         sinked_collection: Collection<G, Row, Diff>,
         err_collection: Collection<G, DataflowError, Diff>,
-        probes: Vec<probe::Handle<mz_repr::Timestamp>>,
     ) -> Option<Rc<dyn Any>>
     where
         G: Scope<Timestamp = mz_repr::Timestamp>;
@@ -135,5 +174,6 @@ where
     match connection {
         ComputeSinkConnection::Subscribe(connection) => Box::new(connection.clone()),
         ComputeSinkConnection::Persist(connection) => Box::new(connection.clone()),
+        ComputeSinkConnection::CopyToS3Oneshot(connection) => Box::new(connection.clone()),
     }
 }

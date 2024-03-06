@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::bail;
 use reqwest::{Method, Url};
@@ -24,6 +25,7 @@ pub struct Client {
     inner: reqwest::Client,
     url: Arc<dyn Fn() -> Url + Send + Sync + 'static>,
     auth: Option<Auth>,
+    timeout: Duration,
 }
 
 impl fmt::Debug for Client {
@@ -41,11 +43,17 @@ impl Client {
         inner: reqwest::Client,
         url: Arc<dyn Fn() -> Url + Send + Sync + 'static>,
         auth: Option<Auth>,
+        timeout: Duration,
     ) -> Result<Self, anyhow::Error> {
         if url().cannot_be_a_base() {
             bail!("cannot construct a CCSR client with a cannot-be-a-base URL");
         }
-        Ok(Client { inner, url, auth })
+        Ok(Client {
+            inner,
+            url,
+            auth,
+            timeout,
+        })
     }
 
     fn make_request<P>(&self, method: Method, path: P) -> reqwest::RequestBuilder
@@ -64,6 +72,10 @@ impl Client {
             request = request.basic_auth(&auth.username, auth.password.as_ref());
         }
         request
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Gets the schema with the associated ID.
@@ -368,6 +380,8 @@ struct GetBySubjectResponse {
 pub enum GetBySubjectError {
     /// The requested subject does not exist.
     SubjectNotFound,
+    /// The requested version does not exist.
+    VersionNotFound(String),
     /// The underlying HTTP transport failed.
     Transport(reqwest::Error),
     /// An internal server error occurred.
@@ -380,6 +394,7 @@ impl From<UnhandledError> for GetBySubjectError {
             UnhandledError::Transport(err) => GetBySubjectError::Transport(err),
             UnhandledError::Api { code, message } => match code {
                 40401 => GetBySubjectError::SubjectNotFound,
+                40402 => GetBySubjectError::VersionNotFound(message),
                 _ => GetBySubjectError::Server { code, message },
             },
         }
@@ -389,7 +404,9 @@ impl From<UnhandledError> for GetBySubjectError {
 impl Error for GetBySubjectError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            GetBySubjectError::SubjectNotFound | GetBySubjectError::Server { .. } => None,
+            GetBySubjectError::SubjectNotFound
+            | GetBySubjectError::VersionNotFound(_)
+            | GetBySubjectError::Server { .. } => None,
             GetBySubjectError::Transport(err) => Some(err),
         }
     }
@@ -399,6 +416,9 @@ impl fmt::Display for GetBySubjectError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             GetBySubjectError::SubjectNotFound => write!(f, "subject not found"),
+            GetBySubjectError::VersionNotFound(message) => {
+                write!(f, "version not found: {}", message)
+            }
             GetBySubjectError::Transport(err) => write!(f, "transport: {}", err),
             GetBySubjectError::Server { code, message } => {
                 write!(f, "server error {}: {}", code, message)

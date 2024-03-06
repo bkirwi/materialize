@@ -19,26 +19,28 @@ use std::time::{Duration, Instant};
 
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
+use mz_ore::instrument;
 use mz_ore::metrics::MetricsRegistry;
+use mz_ore::task::{AbortOnDropHandle, JoinHandle};
 use mz_persist::cfg::{BlobConfig, ConsensusConfig};
 use mz_persist::location::{
-    Blob, Consensus, ExternalError, VersionedData, BLOB_GET_LIVENESS_KEY,
+    Blob, Consensus, ExternalError, Tasked, VersionedData, BLOB_GET_LIVENESS_KEY,
     CONSENSUS_HEAD_LIVENESS_KEY,
 };
 use mz_persist_types::{Codec, Codec64};
 use timely::progress::Timestamp;
 use tokio::sync::{Mutex, OnceCell};
-use tokio::task::JoinHandle;
-use tracing::{debug, instrument};
+use tracing::debug;
 
-use crate::async_runtime::CpuHeavyRuntime;
+use crate::async_runtime::IsolatedRuntime;
 use crate::error::{CodecConcreteType, CodecMismatch};
+use crate::internal::cache::BlobMemCache;
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{LockMetrics, Metrics, MetricsBlob, MetricsConsensus, ShardMetrics};
 use crate::internal::state::TypedState;
 use crate::internal::watch::StateWatchNotifier;
 use crate::rpc::{PubSubClientConnection, PubSubSender, ShardSubscriptionToken};
-use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
+use crate::{Diagnostics, PersistClient, PersistConfig, PersistLocation, ShardId};
 
 /// A cache of [PersistClient]s indexed by [PersistLocation]s.
 ///
@@ -50,24 +52,19 @@ use crate::{PersistClient, PersistConfig, PersistLocation, ShardId};
 /// share, for example, these Postgres connections.
 #[derive(Debug)]
 pub struct PersistClientCache {
-    pub(crate) cfg: PersistConfig,
+    /// The tunable knobs for persist.
+    pub cfg: PersistConfig,
     pub(crate) metrics: Arc<Metrics>,
     blob_by_uri: Mutex<BTreeMap<String, (RttLatencyTask, Arc<dyn Blob + Send + Sync>)>>,
     consensus_by_uri: Mutex<BTreeMap<String, (RttLatencyTask, Arc<dyn Consensus + Send + Sync>)>>,
-    cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
+    isolated_runtime: Arc<IsolatedRuntime>,
     pub(crate) state_cache: Arc<StateCache>,
     pubsub_sender: Arc<dyn PubSubSender>,
     _pubsub_receiver_task: JoinHandle<()>,
 }
 
 #[derive(Debug)]
-struct RttLatencyTask(JoinHandle<()>);
-
-impl Drop for RttLatencyTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
+struct RttLatencyTask(AbortOnDropHandle<()>);
 
 impl PersistClientCache {
     /// Returns a new [PersistClientCache].
@@ -87,13 +84,14 @@ impl PersistClientCache {
             Arc::clone(&state_cache),
             pubsub_client.receiver,
         );
+        let isolated_runtime = IsolatedRuntime::new(cfg.isolated_runtime_worker_threads);
 
         PersistClientCache {
             cfg,
             metrics,
             blob_by_uri: Mutex::new(BTreeMap::new()),
             consensus_by_uri: Mutex::new(BTreeMap::new()),
-            cpu_heavy_runtime: Arc::new(CpuHeavyRuntime::new()),
+            isolated_runtime: Arc::new(isolated_runtime),
             state_cache,
             pubsub_sender: pubsub_client.sender,
             _pubsub_receiver_task,
@@ -102,7 +100,6 @@ impl PersistClientCache {
 
     /// A test helper that returns a [PersistClientCache] disconnected from
     /// metrics.
-    #[cfg(test)]
     pub fn new_no_metrics() -> Self {
         Self::new(
             PersistConfig::new_for_tests(),
@@ -116,11 +113,32 @@ impl PersistClientCache {
         &self.cfg
     }
 
+    /// Returns persist `Metrics`.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
+    /// Returns `ShardMetrics` for the given shard.
+    pub fn shard_metrics(&self, shard_id: &ShardId, name: &str) -> Arc<ShardMetrics> {
+        self.metrics.shards.shard(shard_id, name)
+    }
+
+    /// Clears the state cache, allowing for tests with disconnected states.
+    ///
+    /// Only exposed for testing.
+    pub fn clear_state_cache(&mut self) {
+        self.state_cache = Arc::new(StateCache::new(
+            &self.cfg,
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.pubsub_sender),
+        ))
+    }
+
     /// Returns a new [PersistClient] for interfacing with persist shards made
     /// durable to the given [PersistLocation].
     ///
     /// The same `location` may be used concurrently from multiple processes.
-    #[instrument(level = "debug", skip_all)]
+    #[instrument(level = "debug")]
     pub async fn open(&self, location: PersistLocation) -> Result<PersistClient, ExternalError> {
         let blob = self.open_blob(location.blob_uri).await?;
         let consensus = self.open_consensus(location.consensus_uri).await?;
@@ -129,7 +147,7 @@ impl PersistClientCache {
             blob,
             consensus,
             Arc::clone(&self.metrics),
-            Arc::clone(&self.cpu_heavy_runtime),
+            Arc::clone(&self.isolated_runtime),
             Arc::clone(&self.state_cache),
             Arc::clone(&self.pubsub_sender),
         )
@@ -160,13 +178,17 @@ impl PersistClientCache {
                     .await;
                 let consensus =
                     Arc::new(MetricsConsensus::new(consensus, Arc::clone(&self.metrics)));
+                let consensus = Arc::new(Tasked(consensus));
                 let task = consensus_rtt_latency_task(
                     Arc::clone(&consensus),
                     Arc::clone(&self.metrics),
                     Self::PROMETHEUS_SCRAPE_INTERVAL,
                 )
                 .await;
-                Arc::clone(&x.insert((RttLatencyTask(task), consensus)).1)
+                Arc::clone(
+                    &x.insert((RttLatencyTask(task.abort_on_drop()), consensus))
+                        .1,
+                )
             }
         };
         Ok(consensus)
@@ -186,6 +208,7 @@ impl PersistClientCache {
                     x.key(),
                     Box::new(self.cfg.clone()),
                     self.metrics.s3_blob.clone(),
+                    self.cfg.configs.clone(),
                 )
                 .await?;
                 let blob = retry_external(&self.metrics.retries.external.blob_open, || {
@@ -193,13 +216,17 @@ impl PersistClientCache {
                 })
                 .await;
                 let blob = Arc::new(MetricsBlob::new(blob, Arc::clone(&self.metrics)));
+                let blob = Arc::new(Tasked(blob));
                 let task = blob_rtt_latency_task(
                     Arc::clone(&blob),
                     Arc::clone(&self.metrics),
                     Self::PROMETHEUS_SCRAPE_INTERVAL,
                 )
                 .await;
-                Arc::clone(&x.insert((RttLatencyTask(task), blob)).1)
+                // This is intentionally "outside" (wrapping) MetricsBlob so
+                // that we don't include cached responses in blob metrics.
+                let blob = BlobMemCache::new(&self.cfg, Arc::clone(&self.metrics), blob);
+                Arc::clone(&x.insert((RttLatencyTask(task.abort_on_drop()), blob)).1)
             }
         };
         Ok(blob)
@@ -213,14 +240,15 @@ impl PersistClientCache {
 /// traffic, so that we minimize any issues around Futures not being polled
 /// promptly (as can and does happen with the Timely-polled Futures).
 ///
-/// The caller is responsible for shutdown via [JoinHandle::abort].
+/// The caller is responsible for shutdown via aborting the `JoinHandle`.
 ///
 /// No matter whether we wrap MetricsConsensus before or after we start up the
 /// rtt latency task, there's the possibility for it being confusing at some
 /// point. Err on the side of more data (including the latency measurements) to
 /// start.
+#[allow(clippy::unused_async)]
 async fn blob_rtt_latency_task(
-    blob: Arc<MetricsBlob>,
+    blob: Arc<Tasked<MetricsBlob>>,
     metrics: Arc<Metrics>,
     measurement_interval: Duration,
 ) -> JoinHandle<()> {
@@ -253,18 +281,19 @@ async fn blob_rtt_latency_task(
 /// traffic, so that we minimize any issues around Futures not being polled
 /// promptly (as can and does happen with the Timely-polled Futures).
 ///
-/// The caller is responsible for shutdown via [JoinHandle::abort].
+/// The caller is responsible for shutdown via aborting the `JoinHandle`.
 ///
 /// No matter whether we wrap MetricsConsensus before or after we start up the
 /// rtt latency task, there's the possibility for it being confusing at some
 /// point. Err on the side of more data (including the latency measurements) to
 /// start.
+#[allow(clippy::unused_async)]
 async fn consensus_rtt_latency_task(
-    consensus: Arc<MetricsConsensus>,
+    consensus: Arc<Tasked<MetricsConsensus>>,
     metrics: Arc<Metrics>,
     measurement_interval: Duration,
 ) -> JoinHandle<()> {
-    mz_ore::task::spawn(|| "persist::blob_rtt_latency", async move {
+    mz_ore::task::spawn(|| "persist::consensus_rtt_latency", async move {
         // Use the tokio Instant for next_measurement because the reclock tests
         // mess with the tokio sleep clock.
         let mut next_measurement = tokio::time::Instant::now();
@@ -401,6 +430,7 @@ impl StateCache {
         &self,
         shard_id: ShardId,
         mut init_fn: InitFn,
+        diagnostics: &Diagnostics,
     ) -> Result<Arc<LockingTypedState<K, V, T, D>>, Box<CodecMismatch>>
     where
         K: Debug + Codec,
@@ -442,6 +472,7 @@ impl StateCache {
                                 Arc::clone(&self.metrics),
                                 Arc::clone(&self.cfg),
                                 Arc::clone(&self.pubsub_sender).subscribe(&shard_id),
+                                diagnostics,
                             ));
                             let ret = Arc::downgrade(&state);
                             did_init = Some(state);
@@ -568,13 +599,14 @@ impl<K, V, T, D> LockingTypedState<K, V, T, D> {
         metrics: Arc<Metrics>,
         cfg: Arc<PersistConfig>,
         subscription_token: Arc<ShardSubscriptionToken>,
+        diagnostics: &Diagnostics,
     ) -> Self {
         Self {
             shard_id,
             notifier: StateWatchNotifier::new(Arc::clone(&metrics)),
             state: RwLock::new(initial_state),
             cfg: Arc::clone(&cfg),
-            shard_metrics: metrics.shards.shard(&shard_id),
+            shard_metrics: metrics.shards.shard(&shard_id, &diagnostics.shard_name),
             metrics,
             _subscription_token: subscription_token,
         }
@@ -650,16 +682,15 @@ mod tests {
 
     use futures::stream::{FuturesUnordered, StreamExt};
     use mz_build_info::DUMMY_BUILD_INFO;
-    use mz_ore::now::SYSTEM_TIME;
     use mz_ore::task::spawn;
 
     use super::*;
 
     #[mz_ore::test(tokio::test)]
-    #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `epoll_wait` on OS `linux`
+    #[cfg_attr(miri, ignore)] // unsupported operation: returning ready events from epoll_wait is not yet implemented
     async fn client_cache() {
         let cache = PersistClientCache::new(
-            PersistConfig::new(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone()),
+            PersistConfig::new_for_tests(),
             &MetricsRegistry::new(),
             |_, _| PubSubClientConnection::noop(),
         );
@@ -724,6 +755,7 @@ mod tests {
     }
 
     #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // unsupported operation: returning ready events from epoll_wait is not yet implemented
     async fn state_cache() {
         mz_ore::test::init_logging();
         fn new_state<K, V, T, D>(shard_id: ShardId) -> TypedState<K, V, T, D>
@@ -758,8 +790,12 @@ mod tests {
         // Panic'ing during init_fn .
         let s = Arc::clone(&states);
         let res = spawn(|| "test", async move {
-            s.get::<(), (), u64, i64, _, _>(s1, || async { panic!("boom") })
-                .await
+            s.get::<(), (), u64, i64, _, _>(
+                s1,
+                || async { panic!("forced panic") },
+                &Diagnostics::for_tests(),
+            )
+            .await
         })
         .await;
         assert!(res.is_err());
@@ -767,12 +803,16 @@ mod tests {
 
         // Returning an error from init_fn doesn't initialize an entry in the cache.
         let res = states
-            .get::<(), (), u64, i64, _, _>(s1, || async {
-                Err(Box::new(CodecMismatch {
-                    requested: ("".into(), "".into(), "".into(), "".into(), None),
-                    actual: ("".into(), "".into(), "".into(), "".into(), None),
-                }))
-            })
+            .get::<(), (), u64, i64, _, _>(
+                s1,
+                || async {
+                    Err(Box::new(CodecMismatch {
+                        requested: ("".into(), "".into(), "".into(), "".into(), None),
+                        actual: ("".into(), "".into(), "".into(), "".into(), None),
+                    }))
+                },
+                &Diagnostics::for_tests(),
+            )
             .await;
         assert!(res.is_err());
         assert_eq!(states.initialized_count(), 0);
@@ -780,13 +820,17 @@ mod tests {
         // Initialize one shard.
         let did_work = Arc::new(AtomicBool::new(false));
         let s1_state1 = states
-            .get::<(), (), u64, i64, _, _>(s1, || {
-                let did_work = Arc::clone(&did_work);
-                async move {
-                    did_work.store(true, Ordering::SeqCst);
-                    Ok(new_state(s1))
-                }
-            })
+            .get::<(), (), u64, i64, _, _>(
+                s1,
+                || {
+                    let did_work = Arc::clone(&did_work);
+                    async move {
+                        did_work.store(true, Ordering::SeqCst);
+                        Ok(new_state(s1))
+                    }
+                },
+                &Diagnostics::for_tests(),
+            )
             .await
             .expect("should successfully initialize");
         assert_eq!(did_work.load(Ordering::SeqCst), true);
@@ -796,14 +840,18 @@ mod tests {
         // Trying to initialize it again does no work and returns the same state.
         let did_work = Arc::new(AtomicBool::new(false));
         let s1_state2 = states
-            .get::<(), (), u64, i64, _, _>(s1, || {
-                let did_work = Arc::clone(&did_work);
-                async move {
-                    did_work.store(true, Ordering::SeqCst);
-                    did_work.store(true, Ordering::SeqCst);
-                    Ok(new_state(s1))
-                }
-            })
+            .get::<(), (), u64, i64, _, _>(
+                s1,
+                || {
+                    let did_work = Arc::clone(&did_work);
+                    async move {
+                        did_work.store(true, Ordering::SeqCst);
+                        did_work.store(true, Ordering::SeqCst);
+                        Ok(new_state(s1))
+                    }
+                },
+                &Diagnostics::for_tests(),
+            )
             .await
             .expect("should successfully initialize");
         assert_eq!(did_work.load(Ordering::SeqCst), false);
@@ -814,13 +862,17 @@ mod tests {
         // Trying to initialize with different types doesn't work.
         let did_work = Arc::new(AtomicBool::new(false));
         let res = states
-            .get::<String, (), u64, i64, _, _>(s1, || {
-                let did_work = Arc::clone(&did_work);
-                async move {
-                    did_work.store(true, Ordering::SeqCst);
-                    Ok(new_state(s1))
-                }
-            })
+            .get::<String, (), u64, i64, _, _>(
+                s1,
+                || {
+                    let did_work = Arc::clone(&did_work);
+                    async move {
+                        did_work.store(true, Ordering::SeqCst);
+                        Ok(new_state(s1))
+                    }
+                },
+                &Diagnostics::for_tests(),
+            )
             .await;
         assert_eq!(did_work.load(Ordering::SeqCst), false);
         assert_eq!(
@@ -833,13 +885,21 @@ mod tests {
         // We can add a shard of a different type.
         let s2 = ShardId::new();
         let s2_state1 = states
-            .get::<String, (), u64, i64, _, _>(s2, || async { Ok(new_state(s2)) })
+            .get::<String, (), u64, i64, _, _>(
+                s2,
+                || async { Ok(new_state(s2)) },
+                &Diagnostics::for_tests(),
+            )
             .await
             .expect("should successfully initialize");
         assert_eq!(states.initialized_count(), 2);
         assert_eq!(states.strong_count(), 2);
         let s2_state2 = states
-            .get::<String, (), u64, i64, _, _>(s2, || async { Ok(new_state(s2)) })
+            .get::<String, (), u64, i64, _, _>(
+                s2,
+                || async { Ok(new_state(s2)) },
+                &Diagnostics::for_tests(),
+            )
             .await
             .expect("should successfully initialize");
         assert_same(&s2_state1, &s2_state2);
@@ -855,7 +915,11 @@ mod tests {
 
         // But we can re-init that shard if necessary.
         let s1_state1 = states
-            .get::<(), (), u64, i64, _, _>(s1, || async { Ok(new_state(s1)) })
+            .get::<(), (), u64, i64, _, _>(
+                s1,
+                || async { Ok(new_state(s1)) },
+                &Diagnostics::for_tests(),
+            )
             .await
             .expect("should successfully initialize");
         assert_eq!(states.initialized_count(), 2);
@@ -865,23 +929,29 @@ mod tests {
     }
 
     #[mz_ore::test(tokio::test(flavor = "multi_thread"))]
+    #[cfg_attr(miri, ignore)] // too slow
     async fn state_cache_concurrency() {
         mz_ore::test::init_logging();
 
         const COUNT: usize = 1000;
         let id = ShardId::new();
         let cache = StateCache::new_no_metrics();
+        let diagnostics = Diagnostics::for_tests();
 
         let mut futures = (0..COUNT)
             .map(|_| {
-                cache.get::<(), (), u64, i64, _, _>(id, || async {
-                    Ok(TypedState::new(
-                        DUMMY_BUILD_INFO.semver_version(),
-                        id,
-                        "host".into(),
-                        0,
-                    ))
-                })
+                cache.get::<(), (), u64, i64, _, _>(
+                    id,
+                    || async {
+                        Ok(TypedState::new(
+                            DUMMY_BUILD_INFO.semver_version(),
+                            id,
+                            "host".into(),
+                            0,
+                        ))
+                    },
+                    &diagnostics,
+                )
             })
             .collect::<FuturesUnordered<_>>();
 

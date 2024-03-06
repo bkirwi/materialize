@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::rc::Rc;
 
-use anyhow::Context;
+use anyhow::{Context, Error};
 use mz_avro::error::{DecodeError, Error as AvroError};
 use mz_avro::{
     define_unexpected, give_value, AvroArrayAccess, AvroDecode, AvroDeserializer, AvroMapAccess,
@@ -56,12 +56,12 @@ mod tests {
         let mut decoder = Decoder::new(schema, None, "Test".to_string(), false).unwrap();
         // This is not a valid Avro blob for the given schema
         let mut bad_bytes: &[u8] = &[0];
-        assert!(decoder.decode(&mut bad_bytes).await.is_err());
+        assert!(decoder.decode(&mut bad_bytes).await.unwrap().is_err());
         // This is the blob that will make both ints in the value zero.
         let mut good_bytes: &[u8] = &[0, 0];
         // The decode should succeed with the correct value.
         assert_eq!(
-            decoder.decode(&mut good_bytes).await.unwrap(),
+            decoder.decode(&mut good_bytes).await.unwrap().unwrap(),
             Row::pack([Datum::Int32(0), Datum::Int32(0)])
         );
     }
@@ -91,13 +91,17 @@ impl Decoder {
     }
 
     /// Decodes Avro-encoded `bytes` into a `Row`.
-    pub async fn decode(&mut self, bytes: &mut &[u8]) -> anyhow::Result<Row> {
+    pub async fn decode(&mut self, bytes: &mut &[u8]) -> Result<Result<Row, Error>, Error> {
         // Clear out any bytes that might be left over from
         // an earlier run. This can happen if the
         // `dsr.deserialize` call returns an error,
         // causing us to return early.
         let mut packer = self.row_buf.packer();
-        let (bytes2, resolved_schema, csr_schema_id) = self.csr_avro.resolve(bytes).await?;
+        // The outer Result describes transient errors so use ? here to propagate
+        let (bytes2, resolved_schema, csr_schema_id) = match self.csr_avro.resolve(bytes).await? {
+            Ok(ok) => ok,
+            Err(err) => return Ok(Err(err)),
+        };
         *bytes = bytes2;
         let dec = AvroFlatDecoder {
             packer: &mut packer,
@@ -107,21 +111,26 @@ impl Decoder {
         let dsr = GeneralDeserializer {
             schema: resolved_schema.top_node(),
         };
-        dsr.deserialize(bytes, dec).with_context(|| {
-            format!(
-                "unable to decode row {}",
-                match csr_schema_id {
-                    Some(id) => format!("(Avro schema id = {:?})", id),
-                    None => "".to_string(),
-                }
-            )
-        })?;
-        trace!(
-            "[customer-data] Decoded row {:?} in {}",
-            self.row_buf,
-            self.debug_name
-        );
-        Ok(self.row_buf.clone())
+        let result = dsr
+            .deserialize(bytes, dec)
+            .with_context(|| {
+                format!(
+                    "unable to decode row {}",
+                    match csr_schema_id {
+                        Some(id) => format!("(Avro schema id = {:?})", id),
+                        None => "".to_string(),
+                    }
+                )
+            })
+            .map(|_| self.row_buf.clone());
+        if result.is_ok() {
+            trace!(
+                "[customer-data] Decoded row {:?} in {}",
+                self.row_buf,
+                self.debug_name
+            );
+        }
+        Ok(result)
     }
 }
 
@@ -442,16 +451,28 @@ impl<'a, 'row> AvroDecode for AvroFlatDecoder<'a, 'row> {
             ValueOrReader::Value(val) => {
                 JsonbPacker::new(self.packer)
                     .pack_serde_json(val.clone())
-                    .map_err(|e| e.to_string_with_causes())
-                    .map_err(DecodeError::Custom)?;
+                    .map_err(|e| {
+                        // Technically, these are not the original bytes;
+                        // they've gone through a deserialize-serialize
+                        // round trip. Hopefully they will be close enough to still
+                        // be useful for debugging.
+                        let bytes = val.to_string().into_bytes();
+
+                        DecodeError::BadJson {
+                            category: e.classify(),
+                            bytes,
+                        }
+                    })?;
             }
             ValueOrReader::Reader { len, r } => {
                 self.buf.resize_with(len, Default::default);
                 r.read_exact(self.buf)?;
                 JsonbPacker::new(self.packer)
                     .pack_slice(self.buf)
-                    .map_err(|e| e.to_string_with_causes())
-                    .map_err(DecodeError::Custom)?;
+                    .map_err(|e| DecodeError::BadJson {
+                        category: e.classify(),
+                        bytes: self.buf.to_owned(),
+                    })?;
             }
         }
         Ok(())

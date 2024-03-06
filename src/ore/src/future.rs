@@ -16,7 +16,7 @@
 //! Future and stream utilities.
 //!
 //! This module provides future and stream combinators that are missing from
-//! the [`futures`](futures) crate.
+//! the [`futures`] crate.
 
 use std::any::Any;
 use std::error::Error;
@@ -27,16 +27,19 @@ use std::panic::UnwindSafe;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use async_trait::async_trait;
 use futures::future::{CatchUnwind, FutureExt};
 use futures::sink::Sink;
+use futures::Stream;
 use pin_project::pin_project;
 use tokio::task::futures::TaskLocalFuture;
 use tokio::time::{self, Duration, Instant};
 
 use crate::panic::CATCHING_UNWIND_ASYNC;
-use crate::task;
+use crate::task::{self, JoinHandleExt};
 
 /// Extension methods for futures.
+#[async_trait::async_trait]
 pub trait OreFutureExt {
     /// Wraps a future in a [`SpawnIfCanceled`] future, which will spawn a
     /// task to poll the inner future to completion if it is dropped.
@@ -50,6 +53,15 @@ pub trait OreFutureExt {
         Self: Future + Send + 'static,
         Self::Output: Send + 'static;
 
+    /// Run a `'static` future in a Tokio task, naming that task, using a convenient
+    /// postfix call notation.
+    async fn run_in_task<Name, NameClosure>(self, nc: NameClosure) -> Self::Output
+    where
+        Name: AsRef<str>,
+        NameClosure: FnOnce() -> Name + Unpin + Send,
+        Self: Future + Send + 'static,
+        Self::Output: Send + 'static;
+
     /// Like [`FutureExt::catch_unwind`], but can unwind panics even if
     /// [`set_abort_on_panic`] has been called.
     ///
@@ -59,6 +71,7 @@ pub trait OreFutureExt {
         Self: Sized + UnwindSafe;
 }
 
+#[async_trait::async_trait]
 impl<T> OreFutureExt for T
 where
     T: Future,
@@ -77,6 +90,16 @@ where
             inner: Some(Box::pin(self)),
             nc: Some(nc),
         }
+    }
+
+    async fn run_in_task<Name, NameClosure>(self, nc: NameClosure) -> T::Output
+    where
+        Name: AsRef<str>,
+        NameClosure: FnOnce() -> Name + Unpin + Send,
+        T: Send + 'static,
+        T::Output: Send + 'static,
+    {
+        task::spawn(nc, self).wait_and_assert_finished().await
     }
 
     fn ore_catch_unwind(self) -> OreCatchUnwind<Self>
@@ -373,5 +396,52 @@ impl<T, E> Sink<T> for DevNull<T, E> {
 
     fn poll_close(self: Pin<&mut Self>, _: &mut Context) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+/// Extension methods for streams.
+#[async_trait]
+pub trait OreStreamExt: Stream {
+    /// Awaits the stream for an event to be available and returns all currently buffered
+    /// events on the stream up to some `max`.
+    ///
+    /// This method returns `None` if the stream has ended.
+    ///
+    /// If there are no events ready on the stream this method will sleep until an event is
+    /// sent or the stream is closed. When woken it will return up to `max` currently buffered
+    /// events.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe. If `recv_many` is used as the event in a `select!` statement
+    /// and some other branch completes first, it is guaranteed that no messages were received on
+    /// this channel.
+    async fn recv_many(&mut self, max: usize) -> Option<Vec<Self::Item>>;
+}
+
+#[async_trait]
+impl<T> OreStreamExt for T
+where
+    T: futures::stream::Stream + futures::StreamExt + Send + Unpin,
+{
+    async fn recv_many(&mut self, max: usize) -> Option<Vec<Self::Item>> {
+        // Wait for an event to be ready on the stream
+        let first = self.next().await?;
+        let mut buffer = Vec::from([first]);
+
+        // Note(parkmycar): It's very important for cancelation safety that we don't add any more
+        // .await points other than the initial one.
+
+        // Pull all other ready events off the stream, up to the max
+        while let Some(v) = self.next().now_or_never().and_then(|e| e) {
+            buffer.push(v);
+
+            // Break so we don't loop here continuously.
+            if buffer.len() >= max {
+                break;
+            }
+        }
+
+        Some(buffer)
     }
 }

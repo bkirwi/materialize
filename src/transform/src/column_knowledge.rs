@@ -22,7 +22,7 @@ use mz_ore::soft_panic_or_log;
 use mz_ore::stack::{CheckedRecursion, RecursionGuard};
 use mz_repr::{ColumnType, Datum, RelationType, Row, ScalarType};
 
-use crate::{TransformArgs, TransformError};
+use crate::{TransformCtx, TransformError};
 
 /// Harvest and act upon per-column information.
 #[derive(Debug)]
@@ -46,16 +46,15 @@ impl CheckedRecursion for ColumnKnowledge {
 
 impl crate::Transform for ColumnKnowledge {
     /// Transforms an expression through accumulated knowledge.
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "column_knowledge")
     )]
     fn transform(
         &self,
         expr: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), TransformError> {
         let mut knowledge_stack = Vec::<DatumKnowledge>::new();
         let result = self
@@ -81,7 +80,7 @@ impl ColumnKnowledge {
                 MirRelationExpr::ArrangeBy { input, .. } => {
                     self.harvest(input, knowledge, knowledge_stack)
                 }
-                MirRelationExpr::Get { id, typ } => {
+                MirRelationExpr::Get { id, typ, .. } => {
                     Ok(knowledge.get(id).cloned().unwrap_or_else(|| {
                         typ.column_types.iter().map(DatumKnowledge::from).collect()
                     }))
@@ -444,8 +443,17 @@ impl ColumnKnowledge {
                     }
                     Ok(output)
                 }
-                MirRelationExpr::TopK { input, .. } => {
-                    self.harvest(input, knowledge, knowledge_stack)
+                MirRelationExpr::TopK { input, limit, .. } => {
+                    let input_knowledge = self.harvest(input, knowledge, knowledge_stack)?;
+                    if let Some(limit) = limit.as_mut() {
+                        optimize(
+                            limit,
+                            &input.typ().column_types,
+                            &input_knowledge[..],
+                            knowledge_stack,
+                        )?;
+                    }
+                    Ok(input_knowledge)
                 }
                 MirRelationExpr::Negate { input } => {
                     self.harvest(input, knowledge, knowledge_stack)
@@ -608,10 +616,18 @@ impl DatumKnowledge {
         // + + + + : Any { false }
         // + + + + : Any { true }
         else {
-            let Lit { value: s_val, typ: s_typ} = self else {
+            let Lit {
+                value: s_val,
+                typ: s_typ,
+            } = self
+            else {
                 unreachable!();
             };
-            let Lit { value: o_val, typ: o_typ} = other else {
+            let Lit {
+                value: o_val,
+                typ: o_typ,
+            } = other
+            else {
                 unreachable!();
             };
 
@@ -700,10 +716,18 @@ impl DatumKnowledge {
         // + + + + : Any { false }
         // + + + + : Any { true }
         else {
-            let Lit { value: s_val, typ: s_typ} = self else {
+            let Lit {
+                value: s_val,
+                typ: s_typ,
+            } = self
+            else {
                 unreachable!();
             };
-            let Lit { value: o_val, typ: o_typ} = other else {
+            let Lit {
+                value: o_val,
+                typ: o_typ,
+            } = other
+            else {
                 unreachable!();
             };
 

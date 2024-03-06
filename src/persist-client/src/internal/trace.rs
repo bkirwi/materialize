@@ -191,6 +191,13 @@ impl<T: Timestamp + Lattice> Trace<T> {
         debug_assert_eq!(self.spine.validate(), Ok(()), "{:?}", self);
     }
 
+    /// Validates invariants.
+    ///
+    /// See `Spine::validate` for details.
+    pub fn validate(&self) -> Result<(), String> {
+        self.spine.validate()
+    }
+
     pub fn apply_merge_res(&mut self, res: &FueledMergeRes<T>) -> ApplyMergeResult {
         for batch in self.spine.merging.iter_mut().rev() {
             match batch {
@@ -628,13 +635,7 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
         match self {
             SpineBatch::Merged(b) => b.id,
             SpineBatch::Fueled { id, parts, .. } => {
-                debug_assert_eq!(
-                    parts.first().map(|x| x.id.0),
-                    Some(id.0),
-                    "{:?} vs {:?}",
-                    id,
-                    parts
-                );
+                debug_assert_eq!(parts.first().map(|x| x.id.0), Some(id.0));
                 debug_assert_eq!(parts.last().map(|x| x.id.1), Some(id.1));
                 *id
             }
@@ -699,7 +700,7 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
         }
     }
 
-    // WIP roundtrip the SpineId through FueledMergeReq/FueledMergeRes?
+    // TODO: Roundtrip the SpineId through FueledMergeReq/FueledMergeRes?
     fn maybe_replace(&mut self, res: &FueledMergeRes<T>) -> ApplyMergeResult {
         // The spine's and merge res's sinces don't need to match (which could occur if Spine
         // has been reloaded from state due to compare_and_set mismatch), but if so, the Spine
@@ -1070,10 +1071,12 @@ impl<T: Timestamp + Lattice> Spine<T> {
     pub fn insert(&mut self, batch: HollowBatch<T>, log: &mut SpineLog<'_, T>) {
         assert!(batch.desc.lower() != batch.desc.upper());
         assert_eq!(batch.desc.lower(), &self.upper);
-        let id = self.next_id;
-        self.next_id += 1;
-        let id = SpineId(id, self.next_id);
-        // eprintln!("WIP ASSIGNED {:?} to {:?}", id, batch);
+
+        let id = {
+            let id = self.next_id;
+            self.next_id += 1;
+            SpineId(id, self.next_id)
+        };
         let batch = SpineBatch::Merged(Arc::new(IdHollowBatch { id, batch }));
 
         self.upper.clone_from(batch.upper());
@@ -1106,7 +1109,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
     ///
     /// When this function is called, `effort` must be non-negative
     #[allow(dead_code)]
-    pub fn exert(&mut self, effort: &mut isize, merge_reqs: &mut Vec<FueledMergeReq<T>>) {
+    pub fn exert(&mut self, effort: &isize, merge_reqs: &mut Vec<FueledMergeReq<T>>) {
         let mut log = SpineLog::Enabled { merge_reqs };
         // If there is work to be done, ...
         self.tidy_layers();
@@ -1214,7 +1217,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
         // Convert to an `isize` so we can observe any fuel shortfall.
         // TODO(benesch): avoid dangerous usage of `as`.
         #[allow(clippy::as_conversions)]
-        let mut fuel = fuel as isize;
+        let fuel = fuel as isize;
 
         // Step 1.  Apply fuel to each in-progress merge.
         //
@@ -1222,7 +1225,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
         //          fuel to in-progress merges, as this fuel is what ensures
         //          that the merges will be complete by the time we insert
         //          the updates.
-        self.apply_fuel(&mut fuel, log);
+        self.apply_fuel(&fuel, log);
 
         // Step 2.  We must ensure the invariant that adjacent layers do not
         //          contain two batches will be satisfied when we insert the
@@ -1299,7 +1302,7 @@ impl<T: Timestamp + Lattice> Spine<T> {
     /// could do so in order to maintain fewer batches on average (at the risk
     /// of completing merges of large batches later, but tbh probably not much
     /// later).
-    pub fn apply_fuel(&mut self, fuel: &mut isize, log: &mut SpineLog<'_, T>) {
+    pub fn apply_fuel(&mut self, fuel: &isize, log: &mut SpineLog<'_, T>) {
         // For the moment our strategy is to apply fuel independently to each
         // merge in progress, rather than prioritizing small merges. This sounds
         // like a great idea, but we need better accounting in place to ensure
@@ -1427,6 +1430,13 @@ impl<T: Timestamp + Lattice> Spine<T> {
         }
     }
 
+    /// Checks invariants:
+    /// - The lowers and uppers of all batches "line up".
+    /// - The lower of the "minimum" batch is `antichain[T::minimum]`.
+    /// - The upper of the "maximum" batch is `== self.upper`.
+    /// - The since of each batch is `less_equal self.since`.
+    /// - The `SpineIds` all "line up" and cover from `0` to `self.next_id`.
+    /// - TODO: Verify fuel and level invariants.
     fn validate(&self) -> Result<(), String> {
         let mut id = SpineId(0, 0);
         let mut frontier = Antichain::from_elem(T::minimum());
@@ -1437,12 +1447,11 @@ impl<T: Timestamp + Lattice> Spine<T> {
                 | MergeState::Double(MergeVariant::Complete(None)) => vec![],
                 MergeState::Single(Some(x))
                 | MergeState::Double(MergeVariant::Complete(Some(x))) => vec![x],
-                MergeState::Double(MergeVariant::InProgress(x0, x1, m)) => {
-                    // WIP this might be too aggressive in the presence of
-                    // compactions?
-                    //
-                    // if m.remaining_work > x0.len() + x1.len() { return
-                    //     Err(format!("too much remaining work: {:?}", x)); }
+                MergeState::Double(MergeVariant::InProgress(x0, x1, _m)) => {
+                    // TODO: Anything we can validate about remaining_work? It'd
+                    // be nice to assert that it's bigger than the len of the
+                    // two batches, but apply_merge_res might swap those lengths
+                    // out from under us.
                     vec![x0, x1]
                 }
             };
@@ -1673,6 +1682,54 @@ impl<T: Timestamp + Lattice> MergeVariant<T> {
         }
     }
 }
+//
+// impl<T: Timestamp + Lattice + Codec64> RustType<ProtoTrace> for Trace<T> {
+//     fn into_proto(&self) -> ProtoTrace {
+//         let mut spine = Vec::new();
+//         self.map_batches(|b| {
+//             spine.push(b.into_proto());
+//         });
+//         ProtoTrace {
+//             since: Some(self.since().into_proto()),
+//             spine,
+//         }
+//     }
+//
+//     fn from_proto(proto: ProtoTrace) -> Result<Self, TryFromProtoError> {
+//         let mut ret = Trace::default();
+//         ret.downgrade_since(&proto.since.into_rust_if_some("since")?);
+//         let mut batches_pushed = 0;
+//         for batch in proto.spine.into_iter() {
+//             let batch: HollowBatch<T> = batch.into_rust()?;
+//             if PartialOrder::less_than(ret.since(), batch.desc.since()) {
+//                 return Err(TryFromProtoError::InvalidPersistState(format!(
+//                     "invalid ProtoTrace: the spine's since {:?} was less than a batch's since {:?}",
+//                     ret.since(),
+//                     batch.desc.since()
+//                 )));
+//             }
+//             // We could perhaps more directly serialize and rehydrate the
+//             // internals of the Spine, but this is nice because it insulates
+//             // us against changes in the Spine logic. The current logic has
+//             // turned out to be relatively expensive in practice, but as we
+//             // tune things (especially when we add inc state) the rate of
+//             // this deserialization should go down. Revisit as necessary.
+//             //
+//             // Ignore merge_reqs because whichever process generated this diff is
+//             // assigned the work.
+//             let () = ret.push_batch_no_merge_reqs(batch);
+//
+//             batches_pushed += 1;
+//             if batches_pushed % 1000 == 0 {
+//                 let mut batch_count = 0;
+//                 ret.map_batches(|_| batch_count += 1);
+//                 debug!("Decoded and pushed {batches_pushed} batches; trace size {batch_count}");
+//             }
+//         }
+//         debug_assert_eq!(ret.validate(), Ok(()), "{:?}", ret);
+//         Ok(ret)
+//     }
+// }
 
 impl<T: Timestamp + Lattice + Codec64> RustType<ProtoTrace> for Trace<T> {
     fn into_proto(&self) -> ProtoTrace {
@@ -1735,7 +1792,7 @@ pub mod datadriven {
     }
 
     pub fn since_upper(
-        datadriven: &mut TraceState,
+        datadriven: &TraceState,
         _args: DirectiveArgs,
     ) -> Result<String, anyhow::Error> {
         Ok(format!(
@@ -1745,10 +1802,7 @@ pub mod datadriven {
         ))
     }
 
-    pub fn batches(
-        datadriven: &mut TraceState,
-        _args: DirectiveArgs,
-    ) -> Result<String, anyhow::Error> {
+    pub fn batches(datadriven: &TraceState, _args: DirectiveArgs) -> Result<String, anyhow::Error> {
         let mut s = String::new();
         datadriven.trace.spine.map_batches(|b| {
             s.push_str(b.describe(true).as_str());

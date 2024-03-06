@@ -367,6 +367,20 @@ contains:creating source would violate max_sources limit (desired: 5, limit: 3, 
 > SELECT * FROM t4
 4
 
+$ postgres-execute connection=postgres://postgres:postgres@postgres
+ALTER PUBLICATION mz_source2 ADD TABLE t1, t2, t3;
+
+! ALTER SOURCE mz_source2 ADD SUBSOURCE t1, t2, t3;
+contains:creating source would violate max_sources limit (desired: 4, limit: 3, current: 1)
+
+# Can add them in smaller quantities
+> ALTER SOURCE mz_source2 ADD SUBSOURCE t1, t2;
+
+> ALTER SOURCE mz_source2 DROP SUBSOURCE t1;
+
+! ALTER SOURCE mz_source2 ADD SUBSOURCE t1, t3;
+contains:creating source would violate max_sources limit (desired: 4, limit: 3, current: 2)
+
 > DROP SOURCE mz_source2
 
 > SHOW max_aws_privatelink_connections
@@ -379,7 +393,7 @@ ALTER SYSTEM SET max_aws_privatelink_connections = 42
 42
 
 $ postgres-execute connection=mz_system
-DROP CLUSTER default CASCADE
+DROP CLUSTER quickstart CASCADE
 
 $ postgres-execute connection=mz_system
 ALTER SYSTEM SET max_replicas_per_cluster = 100
@@ -396,9 +410,6 @@ ALTER SYSTEM SET max_credit_consumption_rate = 3
 
 ! CREATE CLUSTER REPLICA c1.r3 SIZE '1'
 contains:creating cluster replica would violate max_credit_consumption_rate limit (desired: 4, limit: 3, current: 3)
-
-! CREATE SOURCE lg2 FROM LOAD GENERATOR COUNTER WITH (SIZE = '8-8');
-contains:creating cluster replica would violate max_credit_consumption_rate limit (desired: 11, limit: 3, current: 3)
 
 $ postgres-execute connection=mz_system
 ALTER SYSTEM SET max_credit_consumption_rate = 4.0

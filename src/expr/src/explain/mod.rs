@@ -13,18 +13,24 @@ use std::collections::BTreeMap;
 use std::fmt::Formatter;
 use std::time::Duration;
 
-use mz_ore::stack::RecursionLimitError;
-use mz_ore::str::{separated, Indent};
+use mz_ore::str::{separated, Indent, IndentLike};
 use mz_repr::explain::text::DisplayText;
 use mz_repr::explain::ExplainError::LinearChainsPlusRecursive;
 use mz_repr::explain::{
     AnnotatedPlan, Explain, ExplainConfig, ExplainError, ExprHumanizer, ScalarOps,
     UnsupportedFormat, UsedIndexes,
 };
+use mz_repr::GlobalId;
 
 use crate::interpret::{Interpreter, MfpEval, Trace};
 use crate::visit::Visit;
-use crate::{Id, LocalId, MapFilterProject, MirRelationExpr, MirScalarExpr, RowSetFinishing};
+use crate::{
+    AccessStrategy, Id, LocalId, MapFilterProject, MirRelationExpr, MirScalarExpr, RowSetFinishing,
+};
+
+pub use crate::explain::text::{
+    fmt_text_constant_rows, HumanizedExplain, HumanizedExpr, HumanizedNotice, HumanizerMode,
+};
 
 mod json;
 mod text;
@@ -38,6 +44,10 @@ pub struct ExplainContext<'a> {
     pub used_indexes: UsedIndexes,
     pub finishing: Option<RowSetFinishing>,
     pub duration: Duration,
+    // This is a String so that we don't have to move `OptimizerNotice` to `mz-expr`. We can revisit
+    // this decision if we want to every make this print in the json output in a machine readable
+    // way.
+    pub optimizer_notices: Vec<String>,
 }
 
 /// A structure produced by the `explain_$format` methods in
@@ -58,13 +68,18 @@ pub struct PushdownInfo<'a> {
     pub pushdown: Vec<&'a MirScalarExpr>,
 }
 
-impl<C: AsMut<Indent>> DisplayText<C> for PushdownInfo<'_> {
+impl<'a, C, M> DisplayText<C> for HumanizedExpr<'a, PushdownInfo<'a>, M>
+where
+    C: AsMut<Indent>,
+    M: HumanizerMode,
+{
     fn fmt_text(&self, f: &mut Formatter<'_>, ctx: &mut C) -> std::fmt::Result {
-        let Self { pushdown } = self;
+        let PushdownInfo { pushdown } = self.expr;
 
         if !pushdown.is_empty() {
-            let separated = separated(" AND ", pushdown);
-            writeln!(f, "{}pushdown=({})", ctx.as_mut(), separated)?;
+            let pushdown = pushdown.iter().map(|e| self.mode.expr(*e, self.cols));
+            let pushdown = separated(" AND ", pushdown);
+            writeln!(f, "{}pushdown=({})", ctx.as_mut(), pushdown)?;
         }
 
         Ok(())
@@ -73,23 +88,19 @@ impl<C: AsMut<Indent>> DisplayText<C> for PushdownInfo<'_> {
 
 #[allow(missing_debug_implementations)]
 pub struct ExplainSource<'a> {
-    pub id: String,
+    pub id: GlobalId,
     pub op: &'a MapFilterProject,
     pub pushdown_info: Option<PushdownInfo<'a>>,
 }
 
 impl<'a> ExplainSource<'a> {
-    pub fn new(
-        id: String,
-        op: &'a MapFilterProject,
-        context: &ExplainContext<'a>,
-    ) -> ExplainSource<'a> {
-        let pushdown_info = if context.config.mfp_pushdown {
+    pub fn new(id: GlobalId, op: &'a MapFilterProject, filter_pushdown: bool) -> ExplainSource<'a> {
+        let pushdown_info = if filter_pushdown {
             let mfp_mapped = MfpEval::new(&Trace, op.input_arity, &op.expressions);
             let pushdown = op
                 .predicates
                 .iter()
-                .filter(|(_, e)| mfp_mapped.expr(e))
+                .filter(|(_, e)| mfp_mapped.expr(e).pushdownable())
                 .map(|(_, e)| e)
                 .collect();
             Some(PushdownInfo { pushdown })
@@ -102,6 +113,32 @@ impl<'a> ExplainSource<'a> {
             op,
             pushdown_info,
         }
+    }
+
+    #[inline]
+    pub fn is_identity(&self) -> bool {
+        self.op.is_identity()
+    }
+}
+
+impl<'a, 'h, C, M> DisplayText<C> for HumanizedExpr<'a, ExplainSource<'a>, M>
+where
+    C: AsMut<Indent> + AsRef<&'h dyn ExprHumanizer>,
+    M: HumanizerMode,
+{
+    fn fmt_text(&self, f: &mut std::fmt::Formatter<'_>, ctx: &mut C) -> std::fmt::Result {
+        let id = ctx
+            .as_ref()
+            .humanize_id(self.expr.id)
+            .unwrap_or_else(|| self.expr.id.to_string());
+        writeln!(f, "{}Source {}", ctx.as_mut(), id)?;
+        ctx.indented(|ctx| {
+            self.child(self.expr.op).fmt_text(f, ctx)?;
+            if let Some(pushdown_info) = &self.expr.pushdown_info {
+                self.child(pushdown_info).fmt_text(f, ctx)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -174,7 +211,7 @@ pub fn enforce_linear_chains(expr: &mut MirRelationExpr) -> Result<(), ExplainEr
     }
 
     // helper struct: a generator of fresh local ids
-    let mut id_gen = id_gen(expr)?.peekable();
+    let mut id_gen = id_gen(expr).peekable();
 
     let mut wrap_in_let = |input: &mut MirRelationExpr| {
         match input {
@@ -194,6 +231,7 @@ pub fn enforce_linear_chains(expr: &mut MirRelationExpr) -> Result<(), ExplainEr
                     body: Box::new(Get {
                         id: Id::Local(id.clone()),
                         typ: input.typ(),
+                        access_strategy: AccessStrategy::UnknownOrLocal,
                     }),
                 };
                 // swap the current body with the replacement
@@ -223,17 +261,17 @@ pub fn enforce_linear_chains(expr: &mut MirRelationExpr) -> Result<(), ExplainEr
 
 // Create an [`Iterator`] for [`LocalId`] values that are guaranteed to be
 // fresh within the scope of the given [`MirRelationExpr`].
-fn id_gen(expr: &MirRelationExpr) -> Result<impl Iterator<Item = LocalId>, RecursionLimitError> {
+fn id_gen(expr: &MirRelationExpr) -> impl Iterator<Item = LocalId> {
     let mut max_id = 0_u64;
 
-    expr.visit_post(&mut |expr| {
+    expr.visit_pre(|expr| {
         match expr {
             MirRelationExpr::Let { id, .. } => max_id = std::cmp::max(max_id, id.into()),
             _ => (),
         };
-    })?;
+    });
 
-    Ok((max_id + 1..).map(LocalId::new))
+    (max_id + 1..).map(LocalId::new)
 }
 
 impl ScalarOps for MirScalarExpr {

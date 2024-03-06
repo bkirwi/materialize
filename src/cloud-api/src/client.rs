@@ -10,18 +10,18 @@
 //! # Materialize cloud API client
 //!
 //! This module provides an API client with typed methods for
-//! interacting with the Materialize cloud API. This client i,
+//! interacting with the Materialize cloud API. This client includes,
 //! token management, and basic requests against the API.
 //!
 //! The [`Client`] requires an [`mz_frontegg_client::client::Client`] as a parameter. The
 //! Frontegg client is used to request and manage the access token.
 use std::sync::Arc;
 
-use reqwest::{Method, RequestBuilder, Url};
+use reqwest::{header::HeaderMap, Method, RequestBuilder, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
-use crate::client::region::Region;
+use crate::config::API_VERSION_HEADER;
 use crate::error::{ApiError, Error};
 
 use self::cloud_provider::CloudProvider;
@@ -34,19 +34,18 @@ pub struct Client {
 }
 
 pub mod cloud_provider;
-pub mod environment;
 pub mod region;
 
 /// Cloud endpoints architecture:
 ///
-/// (CloudProvider)                         (Region)                                 (Environment)
-///   ---------              --------------------------------------            ------------------------
-///  |          |           |          Region Controller           |          | Environment Controller |
-///  |  Cloud   |  api_url  |    ----------        -------------   |  ec_url  |                        |
-///  |  Sync    | --------> |   | Provider | ---- |    Region   |  | -------> |       Environment      |
-///  |          |           |   | (aws..)  |      |  (east-1..) |  |          |  (pgwire_address...)   |
-///  |          |           |    ----------        -------------   |          |                        |
-///   ----------             --------------------------------------            -----------------------
+/// (CloudProvider)                                (Region)
+///   ---------                     --------------------------------------
+///  |          |                  |              Region API              |
+///  |  Cloud   |        url       |    ----------        -------------   |
+///  |  Sync    | ---------------> |   | Provider | ---- |    Region   |  |
+///  |          |                  |   | (aws..)  |      |  (east-1..) |  |
+///  |          |                  |    ----------        -------------   |
+///   ----------                    --------------------------------------
 ///
 impl Client {
     /// Builds a request towards the `Client`'s endpoint
@@ -59,51 +58,39 @@ impl Client {
         P: IntoIterator,
         P::Item: AsRef<str>,
     {
-        let mut endpoint = self.endpoint.clone();
-        endpoint.set_host(Some(&format!(
-            "sync.{}",
-            self.endpoint
-                .domain()
-                .ok_or_else(|| Error::InvalidEndpointDomain)?
-        )))?;
-
-        self.build_request(method, path, endpoint).await
+        self.build_request(method, path, self.endpoint.clone(), None)
+            .await
     }
 
     /// Builds a request towards the `Client`'s endpoint
     /// The function requires a [CloudProvider] as parameter
-    /// since it contains the api url (region controller url)
+    /// since it contains the api url (Region API url)
     /// to interact with the region.
+    /// Specify an api_version corresponding to the request/response
+    /// schema your code will handle. Refer to the Region API docs
+    /// for schema information.
     async fn build_region_request<P>(
         &self,
         method: Method,
         path: P,
-        cloud_provider: CloudProvider,
+        cloud_provider: &CloudProvider,
+        api_version: Option<u16>,
     ) -> Result<RequestBuilder, Error>
     where
         P: IntoIterator,
         P::Item: AsRef<str>,
     {
-        self.build_request(method, path, cloud_provider.api_url)
-            .await
-    }
-
-    /// Builds a request towards the `Client`'s endpoint.
-    /// The function requires a [Region] as parameter
-    /// since it contains the environment controller url
-    /// to interact with the environment.
-    async fn build_environment_request<P>(
-        &self,
-        method: Method,
-        path: P,
-        region: Region,
-    ) -> Result<RequestBuilder, Error>
-    where
-        P: IntoIterator,
-        P::Item: AsRef<str>,
-    {
-        self.build_request(method, path, region.environment_controller_url)
-            .await
+        self.build_request(
+            method,
+            path,
+            cloud_provider.url.clone(),
+            api_version.and_then(|api_ver| {
+                let mut headers = HeaderMap::with_capacity(1);
+                headers.insert(API_VERSION_HEADER, api_ver.into());
+                Some(headers)
+            }),
+        )
+        .await
     }
 
     /// Builds a request towards the `Client`'s endpoint
@@ -112,6 +99,7 @@ impl Client {
         method: Method,
         path: P,
         mut domain: Url,
+        headers: Option<HeaderMap>,
     ) -> Result<RequestBuilder, Error>
     where
         P: IntoIterator,
@@ -123,7 +111,10 @@ impl Client {
             .clear()
             .extend(path);
 
-        let req = self.inner.request(method, domain);
+        let mut req = self.inner.request(method, domain);
+        if let Some(header_map) = headers {
+            req = req.headers(header_map);
+        }
         let token = self.auth_client.auth().await?;
 
         Ok(req.bearer_auth(token))
@@ -145,7 +136,11 @@ impl Client {
         let res = req.send().await?;
         let status_code = res.status();
         if status_code.is_success() {
-            Ok(res.json().await?)
+            if status_code == StatusCode::NO_CONTENT {
+                Err(Error::SuccesfullButNoContent)
+            } else {
+                Ok(res.json().await?)
+            }
         } else {
             match res.json::<ErrorResponse>().await {
                 Ok(e) => {

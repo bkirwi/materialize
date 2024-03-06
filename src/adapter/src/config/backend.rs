@@ -10,9 +10,10 @@
 use std::collections::BTreeMap;
 
 use mz_sql::session::user::SYSTEM_USER;
-use tracing::{debug, error};
+use tracing::{error, info};
 
 use crate::config::SynchronizedParameters;
+use crate::session::SessionConfig;
 use crate::{AdapterError, Client, SessionClient};
 
 /// A backend client for pushing and pulling [SynchronizedParameters].
@@ -26,8 +27,12 @@ pub struct SystemParameterBackend {
 impl SystemParameterBackend {
     pub async fn new(client: Client) -> Result<Self, AdapterError> {
         let conn_id = client.new_conn_id()?;
-        let session = client.new_session(conn_id, SYSTEM_USER.clone());
-        let (session_client, _) = client.startup(session).await?;
+        let session = client.new_session(SessionConfig {
+            conn_id,
+            user: SYSTEM_USER.name.clone(),
+            external_metadata_rx: None,
+        });
+        let session_client = client.startup(session).await?;
         Ok(Self { session_client })
     }
 
@@ -40,7 +45,7 @@ impl SystemParameterBackend {
             vars.insert(param.name.clone(), param.value.clone());
             match self.session_client.set_system_vars(vars).await {
                 Ok(()) => {
-                    debug!(name = param.name, value = param.value, "sync parameter");
+                    info!(name = param.name, value = param.value, "sync parameter");
                 }
                 Err(error) => {
                     error!(
@@ -60,9 +65,7 @@ impl SystemParameterBackend {
         match self.session_client.get_system_vars().await {
             Ok(vars) => {
                 for (name, value) in vars {
-                    if params.is_synchronized(&name) {
-                        params.modify(&name, &value);
-                    }
+                    params.modify(&name, &value);
                 }
             }
             Err(error) => {

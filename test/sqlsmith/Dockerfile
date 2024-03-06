@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-# Build and run SQLsmith ported for Materialize
+# Build and run SQLsmith, a random query generator, ported for Materialize
 
 MZFROM ubuntu-base
 
@@ -23,12 +23,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nlohmann-json3-dev
 
 # Rebuild since SQLsmith repo might have changed
-ADD https://api.github.com/repos/def-/sqlsmith/git/refs/heads/materialize version.json
+ADD https://api.github.com/repos/MaterializeInc/sqlsmith/git/refs/heads/master version.json
 
 # Build SQLsmith
-RUN git clone --depth=1 --single-branch --branch=materialize https://github.com/def-/sqlsmith \
+RUN git clone --single-branch --branch=master https://github.com/MaterializeInc/sqlsmith \
     && cd sqlsmith \
+    && git checkout 2483b0a3fed576e9a8575dc1ad65894d56958602 \
     && cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ . \
-    && cmake --build . -j $(nproc)
+    && cmake --build . -j `nproc`
 
 ENTRYPOINT ["sqlsmith/sqlsmith"]

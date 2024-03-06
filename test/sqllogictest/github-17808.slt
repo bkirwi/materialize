@@ -7,11 +7,6 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-simple conn=mz_system,user=mz_system
-ALTER SYSTEM SET enable_with_mutually_recursive = true
-----
-COMPLETE 0
-
 # Regression test for issues corrected by https://github.com/MaterializeInc/materialize/issues/17808.
 
 # The following query should not frustrate the system, although it did prior to
@@ -43,12 +38,12 @@ Explained Query:
   Return
     Threshold
       Union
-        Get materialize.public.foo
+        ReadStorage materialize.public.foo
         Negate
           Get l0
   With Mutually Recursive
     cte l1 =
-      Get materialize.public.foo
+      ReadStorage materialize.public.foo
     cte l0 =
       Get l1
 

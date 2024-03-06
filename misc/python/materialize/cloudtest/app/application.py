@@ -8,23 +8,23 @@
 # by the Apache License, Version 2.0.
 
 import subprocess
-from textwrap import dedent
-from typing import List, Optional
 
 from materialize import ui
-from materialize.cloudtest.k8s import K8sResource
+from materialize.cloudtest import DEFAULT_K8S_CLUSTER_NAME, DEFAULT_K8S_CONTEXT_NAME
+from materialize.cloudtest.k8s.api.k8s_resource import K8sResource
+from materialize.cloudtest.util.common import log_subprocess_error
 
 
 class Application:
-    resources: List[K8sResource]
-    images: List[str]
+    resources: list[K8sResource]
+    images: list[str]
     release_mode: bool
-    aws_region: Optional[str]
+    aws_region: str | None
 
     def __init__(self) -> None:
-        self.create()
+        pass
 
-    def create(self) -> None:
+    def create_resources(self) -> None:
         self.acquire_images()
         for resource in self.resources:
             resource.create()
@@ -35,23 +35,20 @@ class Application:
     def acquire_images(self) -> None:
         raise NotImplementedError
 
-    def kubectl(self, *args: str) -> str:
+    def kubectl(self, *args: str, namespace: str | None = None) -> str:
         try:
-            return subprocess.check_output(
-                ["kubectl", "--context", self.context(), *args], text=True
-            )
+            cmd = ["kubectl", "--context", self.context(), *args]
+
+            if namespace is not None:
+                cmd.extend(["--namespace", namespace])
+
+            return subprocess.check_output(cmd, text=True)
         except subprocess.CalledProcessError as e:
-            print(
-                dedent(
-                    f"""
-                    cmd: {e.cmd}
-                    returncode: {e.returncode}
-                    stdout: {e.stdout}
-                    stderr: {e.stderr}
-                    """
-                )
-            )
+            log_subprocess_error(e)
             raise e
 
     def context(self) -> str:
-        return "kind-cloudtest"
+        return DEFAULT_K8S_CONTEXT_NAME
+
+    def cluster_name(self) -> str:
+        return DEFAULT_K8S_CLUSTER_NAME

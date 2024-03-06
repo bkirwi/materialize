@@ -60,21 +60,21 @@
 //!
 //! Note also that after snapshot consolidation, additional space may be used if `StateValue` is
 //! used.
+//!
 
+use std::fmt;
 use std::num::Wrapping;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bincode::Options;
 use itertools::Itertools;
-use mz_ore::cast::{CastFrom, CastLossy};
-use mz_ore::collections::HashMap;
+use mz_ore::cast::CastFrom;
 use mz_ore::error::ErrorExt;
 
+use crate::metrics::upsert::{UpsertMetrics, UpsertSharedMetrics};
 use crate::render::upsert::{UpsertKey, UpsertValue};
-use crate::source::metrics::UpsertSharedMetrics;
-use crate::source::types::UpsertMetrics;
-use crate::source::SourceStatistics;
+use crate::statistics::SourceStatistics;
 
 /// The default set of `bincode` options used for consolidating
 /// upsert snapshots (and writing values to RocksDB).
@@ -134,6 +134,16 @@ pub struct Snapshotting {
     len_sum: Wrapping<i64>,
     checksum_sum: Wrapping<i64>,
     diff_sum: Wrapping<i64>,
+}
+
+impl fmt::Display for Snapshotting {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Snapshotting")
+            .field("len_sum", &self.len_sum)
+            .field("checksum_sum", &self.checksum_sum)
+            .field("diff_sum", &self.checksum_sum)
+            .finish_non_exhaustive()
+    }
 }
 
 impl From<UpsertValue> for StateValue {
@@ -232,31 +242,68 @@ impl StateValue {
     #[allow(clippy::as_conversions)]
     pub fn ensure_decoded(&mut self, bincode_opts: BincodeOpts) {
         match self {
-            StateValue::Snapshotting(Snapshotting {
-                value_xor,
-                len_sum,
-                checksum_sum,
-                diff_sum,
-            }) => match diff_sum.0 {
-                1 => {
-                    let len = usize::try_from(len_sum.0).expect("invalid upsert state");
-                    let value = &value_xor[..len];
-                    // Truncation is fine (using `as`) as this is just a checksum
-                    assert_eq!(
-                        checksum_sum.0,
-                        // Hash the value, not the full buffer, which may have extra 0's
-                        seahash::hash(value) as i64,
-                        "invalid upsert state"
-                    );
-                    *self = Self::Decoded(bincode_opts.deserialize(value).unwrap());
+            StateValue::Snapshotting(snapshotting) => {
+                match snapshotting.diff_sum.0 {
+                    1 => {
+                        let len = usize::try_from(snapshotting.len_sum.0)
+                            .map_err(|_| {
+                                format!(
+                                    "len_sum can't be made into a usize, state: {}",
+                                    snapshotting
+                                )
+                            })
+                            .expect("invalid upsert state");
+                        let value = &snapshotting
+                            .value_xor
+                            .get(..len)
+                            .ok_or_else(|| {
+                                format!(
+                                    "value_xor is not the same length ({}) as len ({}), state: {}",
+                                    snapshotting.value_xor.len(),
+                                    len,
+                                    snapshotting
+                                )
+                            })
+                            .expect("invalid upsert state");
+                        // Truncation is fine (using `as`) as this is just a checksum
+                        assert_eq!(
+                            snapshotting.checksum_sum.0,
+                            // Hash the value, not the full buffer, which may have extra 0's
+                            seahash::hash(value) as i64,
+                            "invalid upsert state: checksum_sum does not match, state: {}",
+                            snapshotting
+                        );
+                        *self = Self::Decoded(bincode_opts.deserialize(value).unwrap());
+                    }
+                    0 => {
+                        assert_eq!(
+                            snapshotting.len_sum.0, 0,
+                            "invalid upsert state: len_sum is non-0, state: {}",
+                            snapshotting
+                        );
+                        assert_eq!(
+                            snapshotting.checksum_sum.0, 0,
+                            "invalid upsert state: checksum_sum is non-0, state: {}",
+                            snapshotting
+                        );
+                        assert!(
+                            snapshotting.value_xor.iter().all(|&x| x == 0),
+                            "invalid upsert state: value_xor not all 0s with 0 diff. \
+                            Non-zero positions: {:?}, state: {}",
+                            snapshotting
+                                .value_xor
+                                .iter()
+                                .positions(|&x| x != 0)
+                                .collect::<Vec<_>>(),
+                            snapshotting
+                        );
+                    }
+                    other => panic!(
+                        "invalid upsert state: non 0/1 diff_sum: {}, state: {}",
+                        other, snapshotting
+                    ),
                 }
-                0 => {
-                    assert_eq!(len_sum.0, 0, "invalid upsert state");
-                    assert_eq!(checksum_sum.0, 0, "invalid upsert state");
-                    assert!(value_xor.iter().all(|&x| x == 0), "invalid upsert state");
-                }
-                _ => panic!("invalid upsert state"),
-            },
+            }
             _ => {}
         }
     }
@@ -312,6 +359,10 @@ pub struct MergeStats {
     /// If the current call to `merge_snapshot_chunk` deletes a lot of values,
     /// or updates values to smaller ones, this can be negative!
     pub size_diff: i64,
+    /// The number of inserts i.e. +1 diff
+    pub inserts: u64,
+    /// The number of deletes i.e. -1 diffs
+    pub deletes: u64,
 }
 
 impl std::ops::AddAssign for MergeStats {
@@ -319,6 +370,8 @@ impl std::ops::AddAssign for MergeStats {
         self.updates += rhs.updates;
         self.values_diff += rhs.values_diff;
         self.size_diff += rhs.size_diff;
+        self.inserts += rhs.inserts;
+        self.deletes += rhs.deletes;
     }
 }
 
@@ -326,6 +379,7 @@ impl std::ops::AddAssign for MergeStats {
 #[derive(Clone, Default, Debug)]
 pub struct PutStats {
     /// The number of puts/deletes processed
+    /// Should be equal to number of inserts + updates + deletes
     pub processed_puts: u64,
     /// The aggregated number of values inserted or deleted into `state`
     pub values_diff: i64,
@@ -333,13 +387,23 @@ pub struct PutStats {
     /// If the current call to `multi_put` deletes a lot of values,
     /// or updates values to smaller ones, this can be negative!
     pub size_diff: i64,
+    /// The number of inserts
+    pub inserts: u64,
+    /// The number of updates
+    pub updates: u64,
+    /// The number of deletes
+    pub deletes: u64,
 }
 
 /// Statistics for a single call to `multi_get`.
 #[derive(Clone, Default, Debug)]
 pub struct GetStats {
-    /// The number of puts/deletes processed
+    /// The number of gets processed
     pub processed_gets: u64,
+    /// The total size in bytes returned
+    pub processed_gets_size: u64,
+    /// The number of non-empty records returned
+    pub returned_gets: u64,
 }
 
 /// A trait that defines the fundamental primitives required by a state-backing of
@@ -365,79 +429,9 @@ pub trait UpsertStateBackend {
         R: IntoIterator<Item = &'r mut UpsertValueAndSize>;
 }
 
-/// A `HashMap` with additional scratch space used in some
-/// methods.
-pub struct InMemoryHashMap {
-    state: HashMap<UpsertKey, StateValue>,
-}
-
-impl Default for InMemoryHashMap {
-    fn default() -> Self {
-        Self {
-            state: HashMap::new(),
-        }
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl UpsertStateBackend for InMemoryHashMap {
-    async fn multi_put<P>(&mut self, puts: P) -> Result<PutStats, anyhow::Error>
-    where
-        P: IntoIterator<Item = (UpsertKey, PutValue<StateValue>)>,
-    {
-        let mut stats = PutStats::default();
-        for (key, p_value) in puts {
-            stats.processed_puts += 1;
-            match p_value.value {
-                Some(value) => {
-                    let size: i64 = value.memory_size().try_into().expect("less than i64 size");
-                    match p_value.previous_persisted_size {
-                        Some(previous_size) => {
-                            stats.size_diff -= previous_size;
-                            stats.size_diff += size;
-                        }
-                        None => {
-                            stats.values_diff += 1;
-                            stats.size_diff += size;
-                        }
-                    }
-                    self.state.insert(key, value);
-                }
-                None => {
-                    if let Some(previous_size) = p_value.previous_persisted_size {
-                        stats.size_diff -= previous_size;
-                        stats.values_diff -= 1;
-                    }
-                    self.state.remove(&key);
-                }
-            }
-        }
-        Ok(stats)
-    }
-
-    async fn multi_get<'r, G, R>(
-        &mut self,
-        gets: G,
-        results_out: R,
-    ) -> Result<GetStats, anyhow::Error>
-    where
-        G: IntoIterator<Item = UpsertKey>,
-        R: IntoIterator<Item = &'r mut UpsertValueAndSize>,
-    {
-        let mut stats = GetStats::default();
-        for (key, result_out) in gets.into_iter().zip_eq(results_out) {
-            stats.processed_gets += 1;
-            let value = self.state.get(&key).cloned();
-            let size = value.as_ref().map(|v| v.memory_size());
-            *result_out = UpsertValueAndSize { value, size };
-        }
-        Ok(stats)
-    }
-}
-
 /// An `UpsertStateBackend` wrapper that supports
 /// snapshot merging, and reports basic metrics about the usage of the `UpsertStateBackend`.
-pub struct UpsertState<S> {
+pub struct UpsertState<'metrics, S> {
     inner: S,
 
     // The status, start time, and stats about calls to `merge_snapshot_chunk`.
@@ -448,7 +442,7 @@ pub struct UpsertState<S> {
     // Metrics shared across all workers running the `upsert` operator.
     metrics: Arc<UpsertSharedMetrics>,
     // Metrics for a specific worker.
-    worker_metrics: UpsertMetrics,
+    worker_metrics: &'metrics UpsertMetrics,
     // User-facing statistics.
     stats: SourceStatistics,
 
@@ -464,14 +458,16 @@ pub struct UpsertState<S> {
     // scratch vector for calling `multi_get`
     merge_upsert_scratch: indexmap::IndexMap<UpsertKey, UpsertValueAndSize>,
     multi_get_scratch: Vec<UpsertKey>,
+    shrink_upsert_unused_buffers_by_ratio: usize,
 }
 
-impl<S> UpsertState<S> {
+impl<'metrics, S> UpsertState<'metrics, S> {
     pub(crate) fn new(
         inner: S,
         metrics: Arc<UpsertSharedMetrics>,
-        worker_metrics: UpsertMetrics,
+        worker_metrics: &'metrics UpsertMetrics,
         stats: SourceStatistics,
+        shrink_upsert_unused_buffers_by_ratio: usize,
     ) -> Self {
         Self {
             inner,
@@ -486,18 +482,19 @@ impl<S> UpsertState<S> {
             merge_scratch: Vec::new(),
             merge_upsert_scratch: indexmap::IndexMap::new(),
             multi_get_scratch: Vec::new(),
+            shrink_upsert_unused_buffers_by_ratio,
         }
     }
 }
 
-impl<S> UpsertState<S>
+impl<S> UpsertState<'_, S>
 where
     S: UpsertStateBackend,
 {
     /// Merge and consolidate the following updates into the state, during snapshotting.
     ///
     /// After an entire snapshot has been `merged`, all values must be in the correct state
-    /// (as determined by `StateValue::ensure_decoded`, and `merge_snapshot_chunk` must NOT
+    /// (as determined by `StateValue::ensure_decoded`), and `merge_snapshot_chunk` must NOT
     /// be called again.
     ///
     /// The `completed` boolean communicates whether or not this is the final chunk of updates
@@ -522,7 +519,7 @@ where
         completed: bool,
     ) -> Result<(), anyhow::Error>
     where
-        M: IntoIterator<Item = (UpsertKey, UpsertValue, mz_repr::Diff)>,
+        M: IntoIterator<Item = (UpsertKey, UpsertValue, mz_repr::Diff)> + ExactSizeIterator,
     {
         fail::fail_point!("fail_merge_snapshot_chunk", |_| {
             Err(anyhow::anyhow!("Error merging snapshot values"))
@@ -532,11 +529,24 @@ where
             panic!("attempted completion of already completed upsert snapshot")
         }
         let now = Instant::now();
+        let batch_size = merges.len();
         let mut merges = merges.into_iter().peekable();
 
         self.merge_scratch.clear();
         self.merge_upsert_scratch.clear();
         self.multi_get_scratch.clear();
+
+        // Shrinking the scratch vectors if the capacity is significantly more than batch size
+        if self.shrink_upsert_unused_buffers_by_ratio > 0 {
+            let reduced_capacity =
+                self.merge_scratch.capacity() / self.shrink_upsert_unused_buffers_by_ratio;
+            if reduced_capacity > batch_size {
+                // These vectors have already been cleared above and should be empty here
+                self.merge_scratch.shrink_to(reduced_capacity);
+                self.merge_upsert_scratch.shrink_to(reduced_capacity);
+                self.multi_get_scratch.shrink_to(reduced_capacity);
+            }
+        }
 
         let mut stats = MergeStats::default();
 
@@ -558,6 +568,11 @@ where
 
             for (key, value, diff) in self.merge_scratch.drain(..) {
                 stats.updates += 1;
+                if diff > 0 {
+                    stats.inserts += 1;
+                } else if diff < 0 {
+                    stats.deletes += 1;
+                }
                 let entry = self.merge_upsert_scratch.get_mut(&key).unwrap();
                 let val = entry.value.get_or_insert_with(Default::default);
 
@@ -591,38 +606,51 @@ where
         self.metrics
             .merge_snapshot_latency
             .observe(now.elapsed().as_secs_f64());
-        self.metrics
+        self.worker_metrics
             .merge_snapshot_updates
-            .observe(f64::cast_lossy(stats.updates));
+            .inc_by(stats.updates);
+        self.worker_metrics
+            .merge_snapshot_inserts
+            .inc_by(stats.inserts);
+        self.worker_metrics
+            .merge_snapshot_deletes
+            .inc_by(stats.deletes);
 
         self.snapshot_stats += stats;
+        // Updating the metrics
+        self.worker_metrics.rehydration_total.set(
+            self.snapshot_stats.values_diff.try_into().unwrap_or_else(
+                |e: std::num::TryFromIntError| {
+                    tracing::warn!(
+                        "rehydration_total metric overflowed or is negative \
+                        and is innacurate: {}. Defaulting to 0",
+                        e.display_with_causes(),
+                    );
+
+                    0
+                },
+            ),
+        );
+        self.worker_metrics
+            .rehydration_updates
+            .set(self.snapshot_stats.updates);
+        // These `set_` functions also ensure that these values are non-negative.
+        self.stats.set_bytes_indexed(self.snapshot_stats.size_diff);
+        self.stats
+            .set_records_indexed(self.snapshot_stats.values_diff);
 
         if completed {
+            if self.shrink_upsert_unused_buffers_by_ratio > 0 {
+                // After rehydration is done, these scratch buffers should now be empty
+                // Shrinking them entirely
+                self.merge_scratch.shrink_to_fit();
+                self.merge_upsert_scratch.shrink_to_fit();
+                self.multi_get_scratch.shrink_to_fit();
+            }
+
             self.worker_metrics
                 .rehydration_latency
                 .set(self.snapshot_start.elapsed().as_secs_f64());
-            self.worker_metrics
-                .rehydration_updates
-                .set(self.snapshot_stats.updates);
-            self.worker_metrics.rehydration_total.set(
-                self.snapshot_stats.values_diff.try_into().unwrap_or_else(
-                    |e: std::num::TryFromIntError| {
-                        tracing::warn!(
-                            "rehydration_total metric overflowed or is negative \
-                            and is innacurate: {}. Defaulting to 0",
-                            e.display_with_causes(),
-                        );
-
-                        0
-                    },
-                ),
-            );
-
-            // These `set_` functions also ensure that these values are non-negative.
-            self.stats
-                .set_envelope_state_bytes(self.snapshot_stats.size_diff);
-            self.stats
-                .set_envelope_state_count(self.snapshot_stats.values_diff);
 
             self.snapshot_completed = true;
         }
@@ -655,12 +683,15 @@ where
         self.metrics
             .multi_put_latency
             .observe(now.elapsed().as_secs_f64());
-        self.metrics
+        self.worker_metrics
             .multi_put_size
-            .observe(f64::cast_lossy(stats.processed_puts));
+            .inc_by(stats.processed_puts);
+        self.worker_metrics.upsert_inserts.inc_by(stats.inserts);
+        self.worker_metrics.upsert_updates.inc_by(stats.updates);
+        self.worker_metrics.upsert_deletes.inc_by(stats.deletes);
 
-        self.stats.update_envelope_state_bytes_by(stats.size_diff);
-        self.stats.update_envelope_state_count_by(stats.values_diff);
+        self.stats.update_bytes_indexed_by(stats.size_diff);
+        self.stats.update_records_indexed_by(stats.values_diff);
 
         Ok(())
     }
@@ -686,9 +717,15 @@ where
         self.metrics
             .multi_get_latency
             .observe(now.elapsed().as_secs_f64());
-        self.metrics
+        self.worker_metrics
             .multi_get_size
-            .observe(f64::cast_lossy(stats.processed_gets));
+            .inc_by(stats.processed_gets);
+        self.worker_metrics
+            .multi_get_result_count
+            .inc_by(stats.returned_gets);
+        self.worker_metrics
+            .multi_get_result_bytes
+            .inc_by(stats.processed_gets_size);
 
         Ok(())
     }
@@ -714,6 +751,60 @@ mod tests {
         s.merge_update(longer_row, 1, opts, &mut buf);
 
         // Assert that the `Snapshotting` value is fully merged.
+        s.ensure_decoded(opts);
+    }
+
+    #[mz_ore::test]
+    #[should_panic(
+        expected = "invalid upsert state: len_sum is non-0, state: Snapshotting { len_sum: 1"
+    )]
+    fn test_merge_update_len_0_assert() {
+        let mut buf = Vec::new();
+        let opts = upsert_bincode_opts();
+
+        let mut s = StateValue::Snapshotting(Snapshotting::default());
+
+        let small_row = Ok(mz_repr::Row::default());
+        let longer_row = Ok(mz_repr::Row::pack([mz_repr::Datum::Null]));
+        s.merge_update(longer_row.clone(), 1, opts, &mut buf);
+        s.merge_update(small_row.clone(), -1, opts, &mut buf);
+
+        s.ensure_decoded(opts);
+    }
+
+    #[mz_ore::test]
+    #[should_panic(
+        expected = "invalid upsert state: \"value_xor is not the same length (3) as len (4), state: Snapshotting { len_sum: 4"
+    )]
+    fn test_merge_update_len_to_long_assert() {
+        let mut buf = Vec::new();
+        let opts = upsert_bincode_opts();
+
+        let mut s = StateValue::Snapshotting(Snapshotting::default());
+
+        let small_row = Ok(mz_repr::Row::default());
+        let longer_row = Ok(mz_repr::Row::pack([mz_repr::Datum::Null]));
+        s.merge_update(longer_row.clone(), 1, opts, &mut buf);
+        s.merge_update(small_row.clone(), -1, opts, &mut buf);
+        s.merge_update(longer_row.clone(), 1, opts, &mut buf);
+
+        s.ensure_decoded(opts);
+    }
+
+    #[mz_ore::test]
+    #[should_panic(expected = "invalid upsert state: checksum_sum does not match")]
+    fn test_merge_update_checksum_doesnt_match() {
+        let mut buf = Vec::new();
+        let opts = upsert_bincode_opts();
+
+        let mut s = StateValue::Snapshotting(Snapshotting::default());
+
+        let small_row = Ok(mz_repr::Row::pack([mz_repr::Datum::Int64(2)]));
+        let longer_row = Ok(mz_repr::Row::pack([mz_repr::Datum::Int64(1)]));
+        s.merge_update(longer_row.clone(), 1, opts, &mut buf);
+        s.merge_update(small_row.clone(), -1, opts, &mut buf);
+        s.merge_update(longer_row.clone(), 1, opts, &mut buf);
+
         s.ensure_decoded(opts);
     }
 }

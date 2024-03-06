@@ -7,12 +7,16 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+# The expected number of rows in system tables depends on the number of replicas
+$ skip-if
+SELECT ${arg.replicas} > 1;
+
 $ postgres-connect name=mz_system url=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 
-> SHOW CLUSTERS
+> SELECT name FROM (SHOW CLUSTERS)
 mz_system
 mz_introspection
-default
+quickstart
 
 $ postgres-execute connection=postgres://mz_system@${testdrive.materialize-internal-sql-addr}/materialize
 ALTER SYSTEM SET enable_rbac_checks TO false
@@ -49,7 +53,7 @@ ALTER SYSTEM SET enable_rbac_checks TO true
 > SET CLUSTER TO mz_introspection
 
 > SHOW MATERIALIZED VIEWS
-mv default
+mv quickstart
 
 #! CREATE MATERIALIZED VIEW mv1 AS SELECT MIN(1)
 #contains:system cluster 'mz_introspection' cannot be modified
@@ -58,12 +62,12 @@ mv default
 
 # Query gets automatically run on mz_introspection, despite mz_system being set
 > SHOW MATERIALIZED VIEWS
-mv default
+mv quickstart
 
 #! CREATE MATERIALIZED VIEW mv1 AS SELECT MIN(1)
 #contains:system cluster 'mz_system' cannot be modified
 
-> SET CLUSTER TO default
+> SET CLUSTER TO quickstart
 
 > CREATE TABLE temp (a INT)
 
@@ -95,5 +99,3 @@ CREATE CLUSTER REPLICA mz_system.r1 SIZE '${arg.default-replica-size}';
 
 > SHOW CLUSTER REPLICAS WHERE cluster = 'mz_system'
 mz_system r1 ${arg.default-replica-size} <TRUE_OR_FALSE>
-
-$ unset-regex

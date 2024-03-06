@@ -11,382 +11,27 @@
 // documentation on `RocksDBTuningParameters`.
 #![allow(missing_docs)]
 
-//! This module offers a `serde::Deserialize` implementation (to be used
-//! with LaunchDarkly) `RocksDBTuningParameters` that can be used
-//! to tune a RocksDB instance. The supported options are carefully
-//! considered to be a minimal set required to tune RocksDB to perform
-//! well for the `UPSERT` usecase. This usecase is slightly odd:
-//! - Very high write rate (1:1 with reads)
-//! - No durability requirements
-//! - Minimal space amplification
-//! - Relatively relaxed read and write latency requirements
-//!     - (note that `UPSERT` RocksDB instances are NOT in the
-//!     critical path for any sort of query.
-//!
-//! The defaults (so, the values resulting from derserializing `{}`
-//! into a `RocksDBTuningParameters`) should be reasonable defaults.
-//!
-//! The documentation on each field in `RocksDBTuningParameters` has more
-//! information
-//!
-//! Note that the following documents are required reading to deeply understand
-//! this module:
-//! - <https://github.com/EighteenZi/rocksdb_wiki/blob/master/RocksDB-Tuning-Guide.md>
-//! - <https://github.com/EighteenZi/rocksdb_wiki/blob/master/Compression.md>
-//! - <https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning>
-//! - <https://www.eecg.toronto.edu/~stumm/Papers/Dong-CIDR-16.pdf>
-//! - <http://smalldatum.blogspot.com/2015/11/read-write-space-amplification-pick-2_23.html>
+//! This module handles converting `mz_rocksdb_types` into `rocksdb` types.
 
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
-use mz_ore::cast::CastFrom;
-use mz_proto::{RustType, TryFromProtoError};
-use proptest_derive::Arbitrary;
-use rocksdb::{DBCompactionStyle, DBCompressionType};
-use serde::{Deserialize, Serialize};
-use uncased::UncasedStr;
+use mz_ore::cast::CastLossy;
 
-include!(concat!(env!("OUT_DIR"), "/mz_rocksdb.config.rs"));
+use derivative::Derivative;
+use rocksdb::{DBCompactionStyle, DBCompressionType, WriteBufferManager};
 
-/// A set of parameters to tune RocksDB. This struct is plain-old-data, and is
-/// used to update `RocksDBConfig`, which contains some dynamic value for some
-/// parameters.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Arbitrary)]
-pub struct RocksDBTuningParameters {
-    /// RocksDB has 2 primary styles of compaction:
-    /// - The default, usually referred to as "level" compaction
-    /// - "universal"
-    ///
-    /// Universal is simpler and for some workloads could be
-    /// better. Also, you can directly configure its space-amplification ratio
-    /// (using `universal_compaction_target_ratio`). However, its unclear
-    /// if the `UPSERT` workload is a good workload for universal compaction,
-    /// and its also might be the case that universal compaction uses significantly
-    /// more space temporarily while performing compaction.
-    ///
-    /// For these reasons, the default is `CompactionStyle::Level`.
-    pub compaction_style: CompactionStyle,
-    /// The `RocksDB` api offers a single configuration method that sets some
-    /// reasonable defaults for heavy-write workloads, either
-    /// <https://docs.rs/rocksdb/latest/rocksdb/struct.Options.html#method.optimize_level_style_compaction>
-    /// or
-    /// <https://docs.rs/rocksdb/latest/rocksdb/struct.Options.html#method.optimize_universal_style_compaction>
-    /// depending on `compaction_style`. We ALSO enable this configuration, which is tuned
-    /// by the size of the memtable (basically the in-memory buffer used to avoid IO). The default
-    /// here is ~512MB, which is the default from here: <https://github.com/facebook/rocksdb/blob/main/include/rocksdb/options.h#L102>,
-    /// and about twice the global RocksDB default.
-    pub optimize_compaction_memtable_budget: usize,
-
-    /// This option, when enabled, dynamically tunes
-    /// the size of the various LSM levels to put a bound on space-amplification.
-    /// With the default level-ratio of `10`, this means space-amplification is
-    /// O(1.11 * the size of data). Note this is big-O notation, and the actual
-    /// amplification factor depends on the workload.
-    ///
-    /// See <https://www.eecg.toronto.edu/~stumm/Papers/Dong-CIDR-16.pdf> for more details.
-    ///
-    /// This option defaults to true, as its basically free saved-space, and only applies to
-    /// `CompactionStyle::Level`.
-    pub level_compaction_dynamic_level_bytes: bool,
-
-    /// The additional space-amplification used with universal compaction.
-    /// Only applies to `CompactionStyle::Universal`.
-    ///
-    /// See `compaction_style` for more information.
-    pub universal_compaction_target_ratio: i32,
-
-    /// By default, RocksDB uses only 1 thread to perform compaction and other background tasks.
-    ///
-    /// The default here is the number of cores, as mentioned by
-    /// <https://docs.rs/rocksdb/latest/rocksdb/struct.Options.html#method.increase_parallelism>.
-    ///
-    /// Note that this option is shared across all RocksDB instances that share a `rocksdb::Env`.
-    pub parallelism: Option<i32>,
-
-    /// The most important way to reduce space amplification in RocksDB is compression.
-    ///
-    /// In RocksDB, data on disk is stored in an LSM tree. Because the higher layers (which are
-    /// smaller) will need to be read during reads that aren't cached, we want a relatively
-    /// lightweight compression scheme, choosing `Lz4` as the default, which is considered almost
-    /// always better than `Snappy`.
-    ///
-    /// The meat of the data is stored in the largest, bottom layer, which can be configured
-    /// (using `bottommost_compression_type`) to use a more expensive compression scheme to save
-    /// more space. The default is `Zstd`, which many think has the best compression ratio. Note
-    /// that tuning the bottommost layer separately only makes sense when you have free cpu,
-    /// which we have in the case of the `UPSERT` usecase.
-    pub compression_type: CompressionType,
-
-    /// See `compression_type` for more information.
-    pub bottommost_compression_type: CompressionType,
-
-    /// The size of the `multi_get` and `multi_put` batches sent to RocksDB. The default is 1024.
-    pub batch_size: usize,
-}
-
-impl Default for RocksDBTuningParameters {
-    fn default() -> Self {
-        Self {
-            compaction_style: defaults::DEFAULT_COMPACTION_STYLE,
-            optimize_compaction_memtable_budget:
-                defaults::DEFAULT_OPTIMIZE_COMPACTION_MEMTABLE_BUDGET,
-            level_compaction_dynamic_level_bytes:
-                defaults::DEFAULT_LEVEL_COMPACTION_DYNAMIC_LEVEL_BYTES,
-            universal_compaction_target_ratio: defaults::DEFAULT_UNIVERSAL_COMPACTION_RATIO,
-            parallelism: defaults::DEFAULT_PARALLELISM,
-            compression_type: defaults::DEFAULT_COMPRESSION_TYPE,
-            bottommost_compression_type: defaults::DEFAULT_BOTTOMMOST_COMPRESSION_TYPE,
-            batch_size: defaults::DEFAULT_BATCH_SIZE,
-        }
-    }
-}
-
-impl RocksDBTuningParameters {
-    /// Build a `RocksDBTuningParameters` from strings and values from LD parameters.
-    pub fn from_parameters(
-        compaction_style: CompactionStyle,
-        optimize_compaction_memtable_budget: usize,
-        level_compaction_dynamic_level_bytes: bool,
-        universal_compaction_target_ratio: i32,
-        parallelism: Option<i32>,
-        compression_type: CompressionType,
-        bottommost_compression_type: CompressionType,
-        batch_size: usize,
-    ) -> Result<Self, anyhow::Error> {
-        Ok(Self {
-            compaction_style,
-            optimize_compaction_memtable_budget,
-            level_compaction_dynamic_level_bytes,
-            universal_compaction_target_ratio: if universal_compaction_target_ratio > 100 {
-                universal_compaction_target_ratio
-            } else {
-                return Err(anyhow::anyhow!(
-                    "universal_compaction_target_ratio ({}) must be > 100",
-                    universal_compaction_target_ratio
-                ));
-            },
-            parallelism: match parallelism {
-                Some(parallelism) => {
-                    if parallelism < 1 {
-                        return Err(anyhow::anyhow!(
-                            "parallelism({}) must be > 1, or not specified",
-                            universal_compaction_target_ratio
-                        ));
-                    }
-                    Some(parallelism)
-                }
-                None => None,
-            },
-            compression_type,
-            bottommost_compression_type,
-            batch_size,
-        })
-    }
-}
-
-/// The 2 primary compaction styles in RocksDB`. See `RocksDBTuningParameters::compaction_style`
-/// for more information.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Arbitrary)]
-pub enum CompactionStyle {
-    Level,
-    Universal,
-}
-
-impl FromStr for CompactionStyle {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = UncasedStr::new(s);
-        if s == "level" {
-            Ok(Self::Level)
-        } else if s == "universal" {
-            Ok(Self::Universal)
-        } else {
-            Err(anyhow::anyhow!("{} is not a supported compaction style", s))
-        }
-    }
-}
-
-impl std::fmt::Display for CompactionStyle {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            CompactionStyle::Level => write!(f, "level"),
-            CompactionStyle::Universal => write!(f, "universal"),
-        }
-    }
-}
-
-impl From<CompactionStyle> for DBCompactionStyle {
-    fn from(cs: CompactionStyle) -> DBCompactionStyle {
-        use CompactionStyle::*;
-        match cs {
-            Level => DBCompactionStyle::Level,
-            Universal => DBCompactionStyle::Universal,
-        }
-    }
-}
-
-/// Mz-supported compression types in RocksDB`. See `RocksDBTuningParameters::compression_type`
-/// for more information.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Arbitrary)]
-pub enum CompressionType {
-    Zstd,
-    Snappy,
-    Lz4,
-    None,
-}
-
-impl FromStr for CompressionType {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = UncasedStr::new(s);
-        if s == "zstd" {
-            Ok(Self::Zstd)
-        } else if s == "snappy" {
-            Ok(Self::Snappy)
-        } else if s == "lz4" {
-            Ok(Self::Lz4)
-        } else if s == "none" {
-            Ok(Self::None)
-        } else {
-            Err(anyhow::anyhow!("{} is not a supported compression type", s))
-        }
-    }
-}
-
-impl std::fmt::Display for CompressionType {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            CompressionType::Zstd => write!(f, "zstd"),
-            CompressionType::Snappy => write!(f, "snappy"),
-            CompressionType::Lz4 => write!(f, "lz4"),
-            CompressionType::None => write!(f, "none"),
-        }
-    }
-}
-
-impl From<CompressionType> for DBCompressionType {
-    fn from(ct: CompressionType) -> DBCompressionType {
-        use CompressionType::*;
-        match ct {
-            Zstd => DBCompressionType::Zstd,
-            Snappy => DBCompressionType::Snappy,
-            Lz4 => DBCompressionType::Lz4,
-            None => DBCompressionType::None,
-        }
-    }
-}
-
-impl RustType<ProtoRocksDbTuningParameters> for RocksDBTuningParameters {
-    fn into_proto(&self) -> ProtoRocksDbTuningParameters {
-        use proto_rocks_db_tuning_parameters::{
-            proto_compaction_style, proto_compression_type, ProtoCompactionStyle,
-            ProtoCompressionType,
-        };
-
-        fn compression_into_proto(compression_type: &CompressionType) -> ProtoCompressionType {
-            ProtoCompressionType {
-                kind: Some(match compression_type {
-                    CompressionType::Zstd => proto_compression_type::Kind::Zstd(()),
-                    CompressionType::Snappy => proto_compression_type::Kind::Snappy(()),
-                    CompressionType::Lz4 => proto_compression_type::Kind::Lz4(()),
-                    CompressionType::None => proto_compression_type::Kind::None(()),
-                }),
-            }
-        }
-        ProtoRocksDbTuningParameters {
-            compaction_style: Some(ProtoCompactionStyle {
-                kind: Some(match self.compaction_style {
-                    CompactionStyle::Level => proto_compaction_style::Kind::Level(()),
-                    CompactionStyle::Universal => proto_compaction_style::Kind::Universal(()),
-                }),
-            }),
-            optimize_compaction_memtable_budget: u64::cast_from(
-                self.optimize_compaction_memtable_budget,
-            ),
-            level_compaction_dynamic_level_bytes: self.level_compaction_dynamic_level_bytes,
-            universal_compaction_target_ratio: self.universal_compaction_target_ratio,
-            parallelism: self.parallelism,
-            compression_type: Some(compression_into_proto(&self.compression_type)),
-            bottommost_compression_type: Some(compression_into_proto(
-                &self.bottommost_compression_type,
-            )),
-            batch_size: u64::cast_from(self.batch_size),
-        }
-    }
-
-    fn from_proto(proto: ProtoRocksDbTuningParameters) -> Result<Self, TryFromProtoError> {
-        use proto_rocks_db_tuning_parameters::{
-            proto_compaction_style, proto_compression_type, ProtoCompactionStyle,
-            ProtoCompressionType,
-        };
-
-        fn compression_from_proto(
-            compression_type: Option<ProtoCompressionType>,
-        ) -> Result<CompressionType, TryFromProtoError> {
-            match compression_type {
-                Some(ProtoCompressionType {
-                    kind: Some(proto_compression_type::Kind::Zstd(())),
-                }) => Ok(CompressionType::Zstd),
-                Some(ProtoCompressionType {
-                    kind: Some(proto_compression_type::Kind::Snappy(())),
-                }) => Ok(CompressionType::Snappy),
-                Some(ProtoCompressionType {
-                    kind: Some(proto_compression_type::Kind::Lz4(())),
-                }) => Ok(CompressionType::Lz4),
-                Some(ProtoCompressionType {
-                    kind: Some(proto_compression_type::Kind::None(())),
-                }) => Ok(CompressionType::None),
-                Some(ProtoCompressionType { kind: None }) => Err(TryFromProtoError::MissingField(
-                    "ProtoRocksDbTuningParameters::compression_type::kind".into(),
-                )),
-                None => Err(TryFromProtoError::MissingField(
-                    "ProtoRocksDbTuningParameters::compression_type".into(),
-                )),
-            }
-        }
-        Ok(Self {
-            compaction_style: match proto.compaction_style {
-                Some(ProtoCompactionStyle {
-                    kind: Some(proto_compaction_style::Kind::Level(())),
-                }) => CompactionStyle::Level,
-                Some(ProtoCompactionStyle {
-                    kind: Some(proto_compaction_style::Kind::Universal(())),
-                }) => CompactionStyle::Universal,
-                Some(ProtoCompactionStyle { kind: None }) => {
-                    return Err(TryFromProtoError::MissingField(
-                        "ProtoRocksDbTuningParameters::compaction_style::kind".into(),
-                    ))
-                }
-                None => {
-                    return Err(TryFromProtoError::MissingField(
-                        "ProtoRocksDbTuningParameters::compaction_style".into(),
-                    ))
-                }
-            },
-            optimize_compaction_memtable_budget: usize::cast_from(
-                proto.optimize_compaction_memtable_budget,
-            ),
-            level_compaction_dynamic_level_bytes: proto.level_compaction_dynamic_level_bytes,
-            universal_compaction_target_ratio: proto.universal_compaction_target_ratio,
-            parallelism: proto.parallelism,
-            compression_type: compression_from_proto(proto.compression_type)?,
-            bottommost_compression_type: compression_from_proto(proto.bottommost_compression_type)?,
-            batch_size: usize::cast_from(proto.batch_size),
-        })
-    }
-}
+pub use mz_rocksdb_types::config::defaults;
+pub use mz_rocksdb_types::config::*;
 
 #[derive(Debug, Clone)]
-pub(crate) struct RocksDBDynamicConfig {
+pub struct RocksDBDynamicConfig {
     batch_size: Arc<AtomicUsize>,
 }
 
 impl RocksDBDynamicConfig {
-    pub(crate) fn batch_size(&self) -> usize {
+    pub fn batch_size(&self) -> usize {
         // SeqCst is probably not required here, but its the easiest to reason about
         self.batch_size.load(Ordering::SeqCst)
     }
@@ -394,26 +39,48 @@ impl RocksDBDynamicConfig {
 
 /// Configurable options for a `RocksDBInstance`. Some can be updated
 /// dynamically, as cloned instances of this object will shared dynamic values.
-#[derive(Debug, Clone)]
+#[derive(Clone, Derivative)]
+#[derivative(Debug)]
 pub struct RocksDBConfig {
-    compaction_style: CompactionStyle,
-    optimize_compaction_memtable_budget: usize,
-    level_compaction_dynamic_level_bytes: bool,
-    universal_compaction_target_ratio: i32,
-    parallelism: Option<i32>,
-    compression_type: CompressionType,
-    bottommost_compression_type: CompressionType,
-    pub(crate) dynamic: RocksDBDynamicConfig,
-}
+    pub compaction_style: CompactionStyle,
+    pub optimize_compaction_memtable_budget: usize,
+    pub level_compaction_dynamic_level_bytes: bool,
+    pub universal_compaction_target_ratio: i32,
+    pub parallelism: Option<i32>,
+    pub compression_type: CompressionType,
+    pub bottommost_compression_type: CompressionType,
+    pub retry_max_duration: Duration,
+    pub stats_log_interval_seconds: u32,
+    pub stats_persist_interval_seconds: u32,
+    pub point_lookup_block_cache_size_mb: Option<u32>,
+    pub shrink_buffers_by_ratio: usize,
+    pub dynamic: RocksDBDynamicConfig,
 
-impl Default for RocksDBConfig {
-    fn default() -> Self {
-        RocksDBConfig::new(RocksDBTuningParameters::default())
-    }
+    /// Write buffer manager configs
+    pub write_buffer_manager_config: RocksDbWriteBufferManagerConfig,
+    /// Shared write buffer manager instance,
+    /// can only be instantiated once via `get_or_init_handle`
+    #[derivative(Debug = "ignore")]
+    pub shared_write_buffer_manager: SharedWriteBufferManager,
 }
 
 impl RocksDBConfig {
-    fn new(params: RocksDBTuningParameters) -> Self {
+    pub fn new(
+        shared_write_buffer_manager: SharedWriteBufferManager,
+        cluster_memory_limit: Option<usize>,
+    ) -> Self {
+        Self::new_from_params(
+            RocksDBTuningParameters::default(),
+            shared_write_buffer_manager,
+            cluster_memory_limit,
+        )
+    }
+
+    fn new_from_params(
+        params: RocksDBTuningParameters,
+        shared_write_buffer_manager: SharedWriteBufferManager,
+        cluster_memory_limit: Option<usize>,
+    ) -> Self {
         let RocksDBTuningParameters {
             compaction_style,
             optimize_compaction_memtable_budget,
@@ -423,6 +90,14 @@ impl RocksDBConfig {
             compression_type,
             bottommost_compression_type,
             batch_size,
+            retry_max_duration,
+            stats_log_interval_seconds,
+            stats_persist_interval_seconds,
+            point_lookup_block_cache_size_mb,
+            shrink_buffers_by_ratio,
+            write_buffer_manager_memory_bytes,
+            write_buffer_manager_memory_fraction,
+            write_buffer_manager_allow_stall,
         } = params;
 
         Self {
@@ -433,9 +108,21 @@ impl RocksDBConfig {
             parallelism,
             compression_type,
             bottommost_compression_type,
+            retry_max_duration,
+            stats_log_interval_seconds,
+            stats_persist_interval_seconds,
+            point_lookup_block_cache_size_mb,
+            shrink_buffers_by_ratio,
             dynamic: RocksDBDynamicConfig {
                 batch_size: Arc::new(AtomicUsize::new(batch_size)),
             },
+            write_buffer_manager_config: RocksDbWriteBufferManagerConfig {
+                write_buffer_manager_memory_bytes,
+                write_buffer_manager_memory_fraction,
+                write_buffer_manager_allow_stall,
+                cluster_memory_limit,
+            },
+            shared_write_buffer_manager,
         }
     }
 
@@ -451,6 +138,14 @@ impl RocksDBConfig {
             compression_type,
             bottommost_compression_type,
             batch_size,
+            retry_max_duration,
+            stats_log_interval_seconds,
+            stats_persist_interval_seconds,
+            point_lookup_block_cache_size_mb,
+            shrink_buffers_by_ratio,
+            write_buffer_manager_memory_bytes,
+            write_buffer_manager_memory_fraction,
+            write_buffer_manager_allow_stall,
         } = params;
 
         self.compaction_style = compaction_style;
@@ -460,120 +155,229 @@ impl RocksDBConfig {
         self.parallelism = parallelism;
         self.compression_type = compression_type;
         self.bottommost_compression_type = bottommost_compression_type;
+        self.retry_max_duration = retry_max_duration;
+        self.stats_log_interval_seconds = stats_log_interval_seconds;
+        self.stats_persist_interval_seconds = stats_persist_interval_seconds;
+        self.point_lookup_block_cache_size_mb = point_lookup_block_cache_size_mb;
+        self.shrink_buffers_by_ratio = shrink_buffers_by_ratio;
+
+        self.write_buffer_manager_config
+            .write_buffer_manager_memory_bytes = write_buffer_manager_memory_bytes;
+        self.write_buffer_manager_config
+            .write_buffer_manager_memory_fraction = write_buffer_manager_memory_fraction;
+        self.write_buffer_manager_config
+            .write_buffer_manager_allow_stall = write_buffer_manager_allow_stall;
 
         // SeqCst is probably not required here, but its the easiest to reason about
         self.dynamic.batch_size.store(batch_size, Ordering::SeqCst);
     }
+}
 
-    /// Apply these tuning parameters to a `rocksdb::Options`. Some may
-    /// be applied to a shared `Env` underlying the `Options`.
-    pub fn apply_to_options(&self, options: &mut rocksdb::Options) {
-        let RocksDBConfig {
-            compaction_style,
-            optimize_compaction_memtable_budget,
-            level_compaction_dynamic_level_bytes,
-            universal_compaction_target_ratio,
-            parallelism,
-            compression_type,
-            bottommost_compression_type,
-            dynamic: _,
-        } = self;
+#[derive(Clone, Default)]
+pub struct SharedWriteBufferManager {
+    /// Keeping a Weak pointer to [WriteBufferManager] here behind an Arc and a Mutex.
+    /// The strong pointers will be owned by each `RocksDBInstance`.
+    /// When the rocksdb instances are cleaned up, the [WriteBufferManager] here will
+    /// be cleaned up as well.
+    /// Updates to config values via [RocksDbWriteBufferManagerConfig] will not update
+    /// the [WriteBufferManager] once it's initialized here and there's at least one RocksDBInstance
+    /// keeping a strong reference to it.
+    shared: Arc<Mutex<Weak<WriteBufferManager>>>,
+}
 
-        options.set_compression_type((*compression_type).into());
+#[derive(Derivative)]
+#[derivative(Debug)]
+/// A handle to the [WriteBufferManager] which will be dropped when the
+/// rocksdb thread is dropped.
+pub struct WriteBufferManagerHandle {
+    #[derivative(Debug(format_with = "fmt_write_buffer_manager"))]
+    inner: Arc<WriteBufferManager>,
+}
 
-        if *bottommost_compression_type != CompressionType::None {
-            options.set_bottommost_compression_type((*bottommost_compression_type).into())
-        }
+fn fmt_write_buffer_manager(
+    buf: &Arc<WriteBufferManager>,
+    fmt: &mut std::fmt::Formatter,
+) -> Result<(), std::fmt::Error> {
+    fmt.debug_struct("WriteBufferManager")
+        .field("enabled", &buf.enabled())
+        .field("buffer_size", &buf.buffer_size())
+        .field("memory_usage", &buf.memory_usage())
+        .finish()
+}
 
-        options.set_compaction_style((*compaction_style).into());
-        match compaction_style {
-            CompactionStyle::Level => {
-                options.optimize_level_style_compaction(*optimize_compaction_memtable_budget);
-                options.set_level_compaction_dynamic_level_bytes(
-                    *level_compaction_dynamic_level_bytes,
-                );
+impl SharedWriteBufferManager {
+    /// If a shared [WriteBufferManager] does not already exist, then it's initialized
+    /// with given `initializer`.
+    /// A strong reference is returned for the shared buffer manager.
+    pub(crate) fn get_or_init<F>(&self, initializer: F) -> WriteBufferManagerHandle
+    where
+        F: FnOnce() -> WriteBufferManager,
+    {
+        let mut lock = self.shared.lock().expect("lock poisoned");
+
+        let wbm = match lock.upgrade() {
+            Some(wbm) => wbm,
+            None => {
+                let new_wbm: Arc<WriteBufferManager> = Arc::new(initializer());
+                *lock = Arc::downgrade(&new_wbm);
+                new_wbm
             }
-            CompactionStyle::Universal => {
-                options.optimize_universal_style_compaction(*optimize_compaction_memtable_budget);
-                options.set_level_compaction_dynamic_level_bytes(
-                    *level_compaction_dynamic_level_bytes,
-                );
-
-                let mut universal_options = rocksdb::UniversalCompactOptions::default();
-                universal_options
-                    .set_max_size_amplification_percent(*universal_compaction_target_ratio);
-
-                options.set_universal_compaction_options(&universal_options);
-            }
-        }
-
-        let parallelism = if let Some(parallelism) = parallelism {
-            *parallelism
-        } else {
-            // TODO(guswynn): it's unclear if this should be `get_physical`. The
-            // RocksDB docs do not make it clear.
-            num_cpus::get()
-                .try_into()
-                .expect("More than 3 billion cores")
         };
-        options.increase_parallelism(parallelism);
+        WriteBufferManagerHandle { inner: wbm }
+    }
+
+    /// This will return a non-empty [WriteBufferManager] only after it has been
+    /// initialized by a RocksDBInstance.
+    /// This method is only used in tests.
+    pub fn get(&self) -> Option<Arc<WriteBufferManager>> {
+        self.shared.lock().expect("lock poisoned").upgrade()
     }
 }
 
-/// The following are defaults (and default strings for LD parameters)
-/// for `RocksDBTuningParameters`.
-pub mod defaults {
-    use super::*;
+/// An `Into` we can implement on foreign types
+trait IntoRocksDBType {
+    type Type;
+    fn into_rocksdb(self) -> Self::Type;
+}
 
-    pub const DEFAULT_COMPACTION_STYLE: CompactionStyle = CompactionStyle::Level;
+impl IntoRocksDBType for CompactionStyle {
+    type Type = DBCompactionStyle;
+    fn into_rocksdb(self) -> Self::Type {
+        use CompactionStyle::*;
+        match self {
+            Level => DBCompactionStyle::Level,
+            Universal => DBCompactionStyle::Universal,
+        }
+    }
+}
 
-    /// From here: <https://github.com/facebook/rocksdb/blob/main/include/rocksdb/options.h#L102>
-    pub const DEFAULT_OPTIMIZE_COMPACTION_MEMTABLE_BUDGET: usize = 512 * 1024 * 1024;
+impl IntoRocksDBType for CompressionType {
+    type Type = DBCompressionType;
+    fn into_rocksdb(self) -> Self::Type {
+        use CompressionType::*;
+        match self {
+            Zstd => DBCompressionType::Zstd,
+            Snappy => DBCompressionType::Snappy,
+            Lz4 => DBCompressionType::Lz4,
+            None => DBCompressionType::None,
+        }
+    }
+}
+/// Apply these tuning parameters to a `rocksdb::Options`. Some may
+/// be applied to a shared `Env` underlying the `Options`.
+/// If configured, then a write buffer manager will be initialized
+/// and a handle to it will be returned.
+pub fn apply_to_options(
+    config: &RocksDBConfig,
+    options: &mut rocksdb::Options,
+) -> Option<WriteBufferManagerHandle> {
+    let RocksDBConfig {
+        compaction_style,
+        optimize_compaction_memtable_budget,
+        level_compaction_dynamic_level_bytes,
+        universal_compaction_target_ratio,
+        parallelism,
+        compression_type,
+        bottommost_compression_type,
+        retry_max_duration: _,
+        stats_log_interval_seconds,
+        stats_persist_interval_seconds,
+        point_lookup_block_cache_size_mb,
+        shrink_buffers_by_ratio: _,
+        dynamic: _,
+        shared_write_buffer_manager,
+        write_buffer_manager_config,
+    } = config;
 
-    pub const DEFAULT_LEVEL_COMPACTION_DYNAMIC_LEVEL_BYTES: bool = true;
+    options.set_compression_type((*compression_type).into_rocksdb());
 
-    /// From here: <https://docs.rs/rocksdb/latest/rocksdb/struct.UniversalCompactOptions.html>
-    pub const DEFAULT_UNIVERSAL_COMPACTION_RATIO: i32 = 200;
+    if *bottommost_compression_type != CompressionType::None {
+        options.set_bottommost_compression_type((*bottommost_compression_type).into_rocksdb())
+    }
 
-    pub const DEFAULT_PARALLELISM: Option<i32> = None;
+    options.set_compaction_style((*compaction_style).into_rocksdb());
+    match compaction_style {
+        CompactionStyle::Level => {
+            options.optimize_level_style_compaction(*optimize_compaction_memtable_budget);
+            options.set_level_compaction_dynamic_level_bytes(*level_compaction_dynamic_level_bytes);
+        }
+        CompactionStyle::Universal => {
+            options.optimize_universal_style_compaction(*optimize_compaction_memtable_budget);
+            options.set_level_compaction_dynamic_level_bytes(*level_compaction_dynamic_level_bytes);
 
-    pub const DEFAULT_COMPRESSION_TYPE: CompressionType = CompressionType::Lz4;
+            let mut universal_options = rocksdb::UniversalCompactOptions::default();
+            universal_options
+                .set_max_size_amplification_percent(*universal_compaction_target_ratio);
 
-    pub const DEFAULT_BOTTOMMOST_COMPRESSION_TYPE: CompressionType = CompressionType::Zstd;
+            options.set_universal_compaction_options(&universal_options);
+        }
+    }
 
-    /// A reasonable default batch size for gets and puts in RocksDB. Based
-    /// on advice here: <https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ>.
-    pub const DEFAULT_BATCH_SIZE: usize = 1024;
+    let parallelism = if let Some(parallelism) = parallelism {
+        *parallelism
+    } else {
+        // TODO(guswynn): it's unclear if this should be `get_physical`. The
+        // RocksDB docs do not make it clear.
+        num_cpus::get()
+            .try_into()
+            .expect("More than 3 billion cores")
+    };
+    options.increase_parallelism(parallelism);
+
+    options.set_stats_dump_period_sec(*stats_log_interval_seconds);
+    options.set_stats_persist_period_sec(*stats_persist_interval_seconds);
+
+    if let Some(block_cache_size_mb) = point_lookup_block_cache_size_mb {
+        options.optimize_for_point_lookup((*block_cache_size_mb).into());
+    }
+
+    let write_buffer_manager = get_write_buffer_manager(write_buffer_manager_config);
+    let write_buffer_manager_handle = write_buffer_manager.map(|buf| {
+        let handle = shared_write_buffer_manager.get_or_init(|| buf);
+        options.set_write_buffer_manager(&handle.inner);
+        handle
+    });
+
+    write_buffer_manager_handle
+}
+
+/// Getting write buffer manager based on configured values
+pub(crate) fn get_write_buffer_manager(
+    write_buffer_manager_config: &RocksDbWriteBufferManagerConfig,
+) -> Option<WriteBufferManager> {
+    let RocksDbWriteBufferManagerConfig {
+        write_buffer_manager_memory_bytes,
+        write_buffer_manager_memory_fraction,
+        write_buffer_manager_allow_stall,
+        cluster_memory_limit,
+    } = write_buffer_manager_config;
+
+    if write_buffer_manager_memory_bytes.is_some() {
+        let current_cluster_max_buffer_limit =
+            cluster_memory_limit.as_ref().and_then(|cluster_memory| {
+                write_buffer_manager_memory_fraction
+                    .map(|fraction| usize::cast_lossy(f64::cast_lossy(*cluster_memory) * fraction))
+            });
+        let write_buffer_manager_bytes = current_cluster_max_buffer_limit
+            .or(*write_buffer_manager_memory_bytes)
+            .unwrap();
+        Some(WriteBufferManager::new_with_allow_stall(
+            write_buffer_manager_bytes,
+            *write_buffer_manager_allow_stall,
+        ))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use mz_proto::protobuf_roundtrip;
-    use proptest::prelude::*;
-
+mod test {
     use super::*;
-
-    #[mz_ore::test]
-    fn defaults_equality() {
-        let r = RocksDBTuningParameters::from_parameters(
-            defaults::DEFAULT_COMPACTION_STYLE,
-            defaults::DEFAULT_OPTIMIZE_COMPACTION_MEMTABLE_BUDGET,
-            defaults::DEFAULT_LEVEL_COMPACTION_DYNAMIC_LEVEL_BYTES,
-            defaults::DEFAULT_UNIVERSAL_COMPACTION_RATIO,
-            defaults::DEFAULT_PARALLELISM,
-            defaults::DEFAULT_COMPRESSION_TYPE,
-            defaults::DEFAULT_BOTTOMMOST_COMPRESSION_TYPE,
-            defaults::DEFAULT_BATCH_SIZE,
-        )
-        .unwrap();
-
-        assert_eq!(r, RocksDBTuningParameters::default());
-    }
 
     #[mz_ore::test]
     fn dynamic_defaults() {
         assert_eq!(
-            RocksDBConfig::default()
+            RocksDBConfig::new(Default::default(), None)
                 .dynamic
                 .batch_size
                 .load(Ordering::SeqCst),
@@ -582,13 +386,53 @@ mod tests {
     }
 
     #[mz_ore::test]
-    #[cfg_attr(miri, ignore)] // too slow
-    fn rocksdb_tuning_roundtrip() {
-        proptest!(|(expect in any::<RocksDBTuningParameters>())| {
-            let actual = protobuf_roundtrip::<_, ProtoRocksDbTuningParameters>(&expect);
-            assert!(actual.is_ok());
-            assert_eq!(actual.unwrap(), expect);
+    fn test_no_default() {
+        let config = RocksDbWriteBufferManagerConfig {
+            write_buffer_manager_memory_bytes: None,
+            write_buffer_manager_memory_fraction: Some(0.5),
+            write_buffer_manager_allow_stall: false,
+            cluster_memory_limit: Some(1000),
+        };
 
-        });
+        let write_buffer_manager = get_write_buffer_manager(&config);
+        assert!(write_buffer_manager.is_none());
+    }
+
+    #[mz_ore::test]
+    fn test_default() {
+        let config = RocksDbWriteBufferManagerConfig {
+            write_buffer_manager_memory_bytes: Some(1000),
+            write_buffer_manager_memory_fraction: Some(0.5),
+            write_buffer_manager_allow_stall: false,
+            cluster_memory_limit: None,
+        };
+
+        let write_buffer_manager = get_write_buffer_manager(&config);
+
+        assert!(write_buffer_manager.is_some());
+        let write_buffer_manager = write_buffer_manager.unwrap();
+        assert!(write_buffer_manager.enabled());
+        assert_eq!(
+            write_buffer_manager.buffer_size(),
+            config.write_buffer_manager_memory_bytes.unwrap()
+        )
+    }
+
+    #[mz_ore::test]
+    fn test_calculated_cluster_limit() {
+        let config = RocksDbWriteBufferManagerConfig {
+            write_buffer_manager_memory_bytes: Some(30000),
+            write_buffer_manager_memory_fraction: Some(0.5),
+            write_buffer_manager_allow_stall: false,
+            cluster_memory_limit: Some(2000),
+        };
+
+        let write_buffer_manager = get_write_buffer_manager(&config);
+
+        assert!(write_buffer_manager.is_some());
+        let write_buffer_manager = write_buffer_manager.unwrap();
+        assert!(write_buffer_manager.enabled());
+        // the limit should be 50% of 2000 i.e. 1000
+        assert_eq!(write_buffer_manager.buffer_size(), 1000)
     }
 }

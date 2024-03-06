@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [[example]]
 name = "upsert_open_loop"
 bench = false
@@ -28,11 +31,13 @@ fail = { version = "0.5.1", features = ["failpoints"] }
 futures = "0.3.25"
 globset = { version = "0.4.9", features = ["serde1"] }
 http = "0.2.8"
-indexmap = { version = "1.9.1", default-features = false, features = ["std"] }
+indexmap = { version = "2.0.0", default-features = false, features = ["std"] }
 itertools = { version = "0.10.5" }
 maplit = "1.0.2"
+mysql_async = { version = "0.33.0", default-features = false, features = ["minimal", "binlog"] }
+mysql_common = { version = "0.31.0", default-features = false, features = ["chrono"] }
 mz-avro = { path = "../avro", features = ["snappy"] }
-mz-aws-s3-util = { path = "../aws-s3-util" }
+mz-aws-util = { path = "../aws-util", features = ["s3"] }
 mz-build-info = { path = "../build-info" }
 mz-ccsr = { path = "../ccsr" }
 mz-cloud-resources = { path = "../cloud-resources" }
@@ -40,7 +45,8 @@ mz-expr = { path = "../expr" }
 mz-cluster = { path = "../cluster" }
 mz-interchange = { path = "../interchange" }
 mz-kafka-util = { path = "../kafka-util" }
-mz-ore = { path = "../ore", features = ["async", "tracing_", "chrono"] }
+mz-mysql-util = { path = "../mysql-util" }
+mz-ore = { path = "../ore", features = ["async", "tracing_", "chrono", "metrics"] }
 mz-persist = { path = "../persist" }
 mz-persist-client = { path = "../persist-client" }
 mz-persist-types = { path = "../persist-types" }
@@ -52,22 +58,36 @@ mz-rocksdb = { path = "../rocksdb" }
 mz-secrets = { path = "../secrets" }
 mz-service = { path = "../service" }
 mz-sql-parser = { path = "../sql-parser" }
+mz-ssh-util = { path = "../ssh-util" }
 mz-storage-client = { path = "../storage-client" }
+mz-storage-operators = { path = "../storage-operators" }
+mz-storage-types = { path = "../storage-types" }
 mz-timely-util = { path = "../timely-util" }
 once_cell = { version = "1.16.0" }
 postgres-protocol = { version = "0.6.5" }
 prometheus = { version = "0.13.3", default-features = false }
 prost = { version = "0.11.3", features = ["no-recursion-limit"] }
 rand = "0.8.5"
-rdkafka = { version = "0.29.0", features = ["cmake-build", "ssl-vendored", "libz-static", "zstd"] }
+rdkafka = { version = "0.29.0", features = [
+    "cmake-build",
+    "ssl-vendored",
+    "libz-static",
+    "zstd",
+] }
 regex = { version = "1.7.0" }
-rocksdb = { version = "0.21.0", default-features = false, features = ["snappy"] }
+rocksdb = { git = "https://github.com/MaterializeInc/rust-rocksdb", branch = "master", default-features = false, features = [
+    "snappy",
+    "zstd",
+    "lz4",
+] }
 seahash = "4"
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = { version = "1.0.89" }
 sha2 = "0.10.6"
-timely = { version = "0.12.0", default-features = false, features = ["bincode"] }
-tokio = { version = "1.24.2", features = ["fs", "rt", "sync", "test-util"] }
+timely = { version = "0.12.0", default-features = false, features = [
+    "bincode",
+] }
+tokio = { version = "1.32.0", features = ["fs", "rt", "sync", "test-util"] }
 tokio-postgres = { version = "0.7.8", features = ["serde"] }
 tokio-stream = "0.1.11"
 tokio-util = { version = "0.7.4", features = ["io"] }
@@ -75,16 +95,16 @@ tracing = "0.1.37"
 tracing-subscriber = "0.3.16"
 thiserror = { version = "1.0.37" }
 url = { version = "2.3.1", features = ["serde"] }
-uuid = { version = "1.2.2", features = ["serde", "v4"] }
+uuid = { version = "1.7.0", features = ["serde", "v4"] }
 workspace-hack = { version = "0.0.0", path = "../workspace-hack" }
 
 [build-dependencies]
 protobuf-src = "1.1.0"
-tonic-build = "0.8.2"
+tonic-build = "0.9.2"
 
 [dev-dependencies]
 async-trait = "0.1.68"
-axum = { version = "0.6.7" }
+axum = { version = "0.6.20" }
 clap = { version = "3.2.24", features = ["derive", "env"] }
 datadriven = { version = "0.6.0", features = ["async"] }
 humantime = "2.1.0"
@@ -92,8 +112,8 @@ mz-http-util = { path = "../http-util" }
 mz-orchestrator-tracing = { path = "../orchestrator-tracing" }
 itertools = "0.10.5"
 num_cpus = "1.14.0"
-tempfile = "3.2.0"
-tokio = { version = "1.24.2", features = ["test-util"] }
+tempfile = "3.8.1"
+tokio = { version = "1.32.0", features = ["test-util"] }
 
 [package.metadata.cargo-udeps.ignore]
 # only used on linux

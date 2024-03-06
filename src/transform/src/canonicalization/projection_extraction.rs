@@ -12,7 +12,7 @@
 use mz_expr::visit::Visit;
 use mz_expr::{MirRelationExpr, MirScalarExpr};
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Transform column references in a `Map` into a `Project`, or repeated
 /// aggregations in a `Reduce` into a `Project`.
@@ -20,16 +20,15 @@ use crate::TransformArgs;
 pub struct ProjectionExtraction;
 
 impl crate::Transform for ProjectionExtraction {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "projection_extraction")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         relation.visit_mut_post(&mut Self::action)?;
         mz_repr::explain::trace_plan(&*relation);

@@ -3,9 +3,10 @@ title: "JOIN"
 description: "`JOIN` lets you combine two or more table expressions."
 aliases:
   - /sql/join/
+  - /transform-data/join/
 menu:
   main:
-    parent: 'transform'
+    parent: 'transform-overview'
     name: Joins
     weight: 20
 ---
@@ -82,7 +83,7 @@ left-hand row according to the usual rules of the selected join type.
 {{< warning >}}
 `LATERAL` subqueries can be very expensive to compute. For best results, do not
 materialize a view containing a `LATERAL` subquery without first inspecting the
-plan via the [`EXPLAIN`](/sql/explain/) statement. In many common patterns
+plan via the [`EXPLAIN PLAN`](/sql/explain-plan/) statement. In many common patterns
 involving `LATERAL` joins, Materialize can optimize away the join entirely.
 {{< /warning >}}
 

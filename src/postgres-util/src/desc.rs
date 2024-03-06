@@ -12,9 +12,9 @@
 use std::collections::BTreeSet;
 
 use anyhow::bail;
-use mz_proto::{RustType, TryFromProtoError};
-use proptest::prelude::{any, Arbitrary};
-use proptest::strategy::{BoxedStrategy, Strategy};
+use mz_proto::{IntoRustIfSome, RustType, TryFromProtoError};
+use proptest::prelude::any;
+use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::types::Oid;
 use tracing::warn;
@@ -35,7 +35,7 @@ pub struct PostgresSchemaDesc {
 }
 
 /// Describes a table in a PostgreSQL database.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Arbitrary)]
 pub struct PostgresTableDesc {
     /// The OID of the table.
     pub oid: Oid,
@@ -44,9 +44,11 @@ pub struct PostgresTableDesc {
     /// The name of the table.
     pub name: String,
     /// The description of each column, in order of their position in the table.
+    #[proptest(strategy = "proptest::collection::vec(any::<PostgresColumnDesc>(), 1..4)")]
     pub columns: Vec<PostgresColumnDesc>,
     /// Applicable keys for this table (i.e. primary key and unique
     /// constraints).
+    #[proptest(strategy = "proptest::collection::btree_set(any::<PostgresKeyDesc>(), 1..4)")]
     pub keys: BTreeSet<PostgresKeyDesc>,
 }
 
@@ -128,39 +130,14 @@ impl RustType<ProtoPostgresTableDesc> for PostgresTableDesc {
     }
 }
 
-impl Arbitrary for PostgresTableDesc {
-    type Strategy = BoxedStrategy<Self>;
-    type Parameters = ();
-
-    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        (
-            any::<String>(),
-            any::<String>(),
-            any::<u32>(),
-            any::<Vec<PostgresColumnDesc>>(),
-            any::<BTreeSet<PostgresKeyDesc>>(),
-        )
-            .prop_map(|(name, namespace, oid, columns, keys)| PostgresTableDesc {
-                name,
-                namespace,
-                oid,
-                columns,
-                keys,
-            })
-            .boxed()
-    }
-}
-
 /// Describes a column in a [`PostgresTableDesc`].
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Arbitrary)]
 pub struct PostgresColumnDesc {
     /// The name of the column.
     pub name: String,
     /// The column's monotonic position in its table, i.e. "this was the _i_th
     /// column created" irrespective of the current number of columns.
-    // TODO(migration): remove option in version v.51 (released in v0.49 + 1
-    // additional release)
-    pub col_num: Option<u16>,
+    pub col_num: u16,
     /// The OID of the column's type.
     pub type_oid: Oid,
     /// The modifier for the column's type.
@@ -193,7 +170,7 @@ impl RustType<ProtoPostgresColumnDesc> for PostgresColumnDesc {
     fn into_proto(&self) -> ProtoPostgresColumnDesc {
         ProtoPostgresColumnDesc {
             name: self.name.clone(),
-            col_num: self.col_num.map(|c| c.into()),
+            col_num: Some(self.col_num.into()),
             type_oid: self.type_oid,
             type_mod: self.type_mod,
             nullable: self.nullable,
@@ -203,9 +180,12 @@ impl RustType<ProtoPostgresColumnDesc> for PostgresColumnDesc {
     fn from_proto(proto: ProtoPostgresColumnDesc) -> Result<Self, TryFromProtoError> {
         Ok(PostgresColumnDesc {
             name: proto.name,
-            col_num: proto
-                .col_num
-                .map(|c| c.try_into().expect("values roundtrip")),
+            col_num: {
+                let v: u32 = proto
+                    .col_num
+                    .into_rust_if_some("ProtoPostgresColumnDesc::col_num")?;
+                u16::try_from(v).expect("u16 must roundtrip")
+            },
             type_oid: proto.type_oid,
             type_mod: proto.type_mod,
             nullable: proto.nullable,
@@ -213,33 +193,8 @@ impl RustType<ProtoPostgresColumnDesc> for PostgresColumnDesc {
     }
 }
 
-impl Arbitrary for PostgresColumnDesc {
-    type Strategy = BoxedStrategy<Self>;
-    type Parameters = ();
-
-    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        (
-            any::<String>(),
-            any::<u16>(),
-            any::<u32>(),
-            any::<i32>(),
-            any::<bool>(),
-        )
-            .prop_map(
-                |(name, col_num, type_oid, type_mod, nullable)| PostgresColumnDesc {
-                    name,
-                    col_num: Some(col_num),
-                    type_oid,
-                    type_mod,
-                    nullable,
-                },
-            )
-            .boxed()
-    }
-}
-
 /// Describes a key in a [`PostgresTableDesc`].
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, PartialOrd, Ord)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, PartialOrd, Ord, Arbitrary)]
 pub struct PostgresKeyDesc {
     /// This key is derived from the `pg_constraint` with this OID.
     pub oid: Oid,
@@ -247,6 +202,7 @@ pub struct PostgresKeyDesc {
     pub name: String,
     /// The `attnum` of the columns comprising the key. `attnum` is a unique identifier for a column
     /// in a PG table; see <https://www.postgresql.org/docs/current/catalog-pg-attribute.html>
+    #[proptest(strategy = "proptest::collection::vec(any::<u16>(), 0..4)")]
     pub cols: Vec<u16>,
     /// Whether or not this key is the primary key.
     pub is_primary: bool,
@@ -278,30 +234,5 @@ impl RustType<ProtoPostgresKeyDesc> for PostgresKeyDesc {
             is_primary: proto.is_primary,
             nulls_not_distinct: proto.nulls_not_distinct,
         })
-    }
-}
-
-impl Arbitrary for PostgresKeyDesc {
-    type Strategy = BoxedStrategy<Self>;
-    type Parameters = ();
-
-    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        (
-            any::<u32>(),
-            any::<String>(),
-            any::<Vec<u16>>(),
-            any::<bool>(),
-            any::<bool>(),
-        )
-            .prop_map(
-                |(oid, name, cols, is_primary, nulls_not_distinct)| PostgresKeyDesc {
-                    oid,
-                    name,
-                    cols,
-                    is_primary,
-                    nulls_not_distinct,
-                },
-            )
-            .boxed()
     }
 }

@@ -164,7 +164,7 @@ function Views(props) {
         SET cluster = ${formatNameForQuery(props.clusterName)};
         SET cluster_replica = ${formatNameForQuery(props.replicaName)};
         SELECT
-          id, name, records, size, capacity, allocations
+          id, name, batches, records, size, capacity, allocations
         FROM
           mz_internal.mz_records_per_dataflow
         ${whereFragment}
@@ -209,11 +209,12 @@ function Views(props) {
         <div>error: {error}</div>
       ) : (
         <div>
-          <table>
+          <table class="dataflows">
             <thead>
               <tr>
                 <th>dataflow id</th>
                 <th>index name</th>
+                <th>batches</th>
                 <th>records</th>
                 <th>size [KiB]</th>
                 <th>capacity [KiB]</th>
@@ -233,9 +234,10 @@ function Views(props) {
                     {v[1]}
                   </td>
                   <td>{v[2]}</td>
-                  <td>{Math.round(v[3]/1024)}</td>
+                  <td>{v[3]}</td>
                   <td>{Math.round(v[4]/1024)}</td>
-                  <td>{v[5]}</td>
+                  <td>{Math.round(v[5]/1024)}</td>
+                  <td>{v[6]}</td>
                 </tr>
               ))}
             </tbody>
@@ -277,7 +279,7 @@ function View(props) {
         SET cluster = ${formatNameForQuery(props.clusterName)};
         SET cluster_replica = ${formatNameForQuery(props.replicaName)};
         SELECT
-          name, records, size
+          name, batches, records, size
         FROM
           mz_internal.mz_records_per_dataflow
         WHERE
@@ -291,23 +293,7 @@ function View(props) {
         FROM
           mz_internal.mz_dataflow_addresses
         WHERE
-          id
-          IN (
-              SELECT
-                id
-              FROM
-                mz_internal.mz_dataflow_addresses
-              WHERE
-                address[1]
-                  = (
-                      SELECT
-                        address[1]
-                      FROM
-                        mz_internal.mz_dataflow_addresses
-                      WHERE
-                        id = ${props.dataflowId}
-                    )
-            );
+          address[1] = ${props.dataflowId};
 
         SELECT
           id, name
@@ -321,19 +307,11 @@ function View(props) {
               FROM
                 mz_internal.mz_dataflow_addresses
               WHERE
-                address[1]
-                  = (
-                      SELECT
-                        address[1]
-                      FROM
-                        mz_internal.mz_dataflow_addresses
-                      WHERE
-                        id = ${props.dataflowId}
-                    )
+                address[1] = ${props.dataflowId}
             );
 
         SELECT
-          id, from_index, to_index, sent
+          id, from_index, to_index, sent, batch_sent
         FROM
           mz_internal.mz_dataflow_channels AS channels
           LEFT JOIN mz_internal.mz_message_counts AS counts
@@ -346,15 +324,7 @@ function View(props) {
               FROM
                 mz_internal.mz_dataflow_addresses
               WHERE
-                address[1]
-                  = (
-                      SELECT
-                        address[1]
-                      FROM
-                        mz_internal.mz_dataflow_addresses
-                      WHERE
-                        id = ${props.dataflowId}
-                    )
+                address[1] = ${props.dataflowId}
             );
 
         SELECT
@@ -369,15 +339,7 @@ function View(props) {
               FROM
                 mz_internal.mz_dataflow_addresses
               WHERE
-                address[1]
-                  = (
-                      SELECT
-                        address[1]
-                      FROM
-                        mz_internal.mz_dataflow_addresses
-                      WHERE
-                        id = ${props.dataflowId}
-                    )
+                address[1] = ${props.dataflowId}
             );
 
         SELECT
@@ -393,8 +355,9 @@ function View(props) {
       const stats_row = stats_table.rows[0];
       const stats = {
         name: stats_row[0],
-        records: stats_row[1],
-        size: stats_row[2],
+        batches: stats_row[1],
+        records: stats_row[2],
+        size: stats_row[3],
       };
       setStats(stats);
 
@@ -413,7 +376,7 @@ function View(props) {
 
       // {id: [source, target]}.
       const chans = Object.fromEntries(
-        chan_table.rows.map(([id, source, target, sent]) => [id, [source, target, sent]])
+        chan_table.rows.map(([id, source, target, sent, batch_sent]) => [id, [source, target, sent, batch_sent]])
       );
       setChans(chans);
 
@@ -480,7 +443,7 @@ function View(props) {
       sg.push('}');
       return sg.join('\n');
     });
-    const edges = Object.entries(chans).map(([id, [source, target, sent]]) => {
+    const edges = Object.entries(chans).map(([id, [source, target, sent, batch_sent]]) => {
       if (!(id in addrs)) {
         return `// ${id} not in addrs`;
       }
@@ -496,7 +459,7 @@ function View(props) {
       }
       return sent == null
         ? `_${from_id} -> _${to_id} [style="dashed"];`
-        : `_${from_id} -> _${to_id} [label="sent ${sent}"];`;
+        : `_${from_id} -> _${to_id} [label="sent ${sent} (${batch_sent})"];`;
     });
     const oper_labels = Object.entries(opers).map(([id, name]) => {
       if (!addrs[id].length) {
@@ -504,7 +467,7 @@ function View(props) {
       }
       const notes = [`id: ${id}`];
       let style = '';
-      if (id in records) {
+      if (id in records && records[id][0] > 0) {
         const record_count = records[id][0];
         const size = Math.ceil(records[id][1]/1024);
         // Any operator that can have records will have a red border (even if it
@@ -648,7 +611,7 @@ async function getCreateView(dataflow_name) {
 function makeAddrStr(addrs, id, other) {
   let addr = addrs[id].slice();
   // The 0 source or target should not append itself to the address.
-  if (other !== 0) {
+  if (other !== "0") {
     addr.push(other);
   }
   return addrStr(addr);

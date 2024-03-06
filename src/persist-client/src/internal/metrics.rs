@@ -9,37 +9,46 @@
 
 //! Prometheus monitoring metrics.
 
+use async_stream::stream;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use mz_ore::bytes::SegmentedBytes;
 use mz_ore::cast::{CastFrom, CastLossy};
+use mz_ore::instrument;
 use mz_ore::metric;
 use mz_ore::metrics::{
-    ComputedGauge, ComputedIntGauge, Counter, CounterVecExt, DeleteOnDropCounter,
-    DeleteOnDropGauge, GaugeVecExt, IntCounter, MetricsRegistry, UIntGauge,
+    raw, ComputedGauge, ComputedIntGauge, Counter, CounterVecExt, DeleteOnDropCounter,
+    DeleteOnDropGauge, GaugeVecExt, IntCounter, MakeCollector, MetricsRegistry, UIntGauge,
+    UIntGaugeVec,
 };
 use mz_ore::stats::histogram_seconds_buckets;
 use mz_persist::location::{
-    Atomicity, Blob, BlobMetadata, CaSResult, Consensus, ExternalError, SeqNo, VersionedData,
+    Atomicity, Blob, BlobMetadata, CaSResult, Consensus, ExternalError, ResultStream, SeqNo,
+    VersionedData,
 };
-use mz_persist::metrics::{PostgresConsensusMetrics, S3BlobMetrics};
+use mz_persist::metrics::{ColumnarMetrics, S3BlobMetrics};
 use mz_persist::retry::RetryStream;
 use mz_persist_types::Codec64;
-use prometheus::core::{AtomicI64, AtomicU64};
+use mz_postgres_client::metrics::PostgresClientMetrics;
+use prometheus::core::{AtomicI64, AtomicU64, Collector, Desc, GenericGauge};
+use prometheus::proto::MetricFamily;
 use prometheus::{CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, IntCounterVec};
 use timely::progress::Antichain;
+use tokio_metrics::TaskMonitor;
+use tracing::error;
 
+use crate::internal::paths::BlobKey;
 use crate::{PersistConfig, ShardId};
 
 /// Prometheus monitoring metrics.
 ///
 /// Intentionally not Clone because we expect this to be passed around in an
 /// Arc.
-#[derive(Debug)]
 pub struct Metrics {
     _vecs: MetricsVecs,
     _uptime: ComputedGauge,
@@ -79,8 +88,14 @@ pub struct Metrics {
     pub pubsub_client: PubSubClientMetrics,
     /// Metrics for mfp/filter pushdown.
     pub pushdown: PushdownMetrics,
+    /// Metrics for consolidation.
+    pub consolidation: ConsolidationMetrics,
     /// Metrics for blob caching.
     pub blob_cache_mem: BlobMemCache,
+    /// Metrics for tokio tasks.
+    pub tasks: TasksMetrics,
+    /// Metrics for columnar data encoding and decoding.
+    pub columnar: ColumnarMetrics,
 
     /// Metrics for the persist sink.
     pub sink: SinkMetrics,
@@ -88,7 +103,13 @@ pub struct Metrics {
     /// Metrics for S3-backed blob implementation
     pub s3_blob: S3BlobMetrics,
     /// Metrics for Postgres-backed consensus implementation
-    pub postgres_consensus: PostgresConsensusMetrics,
+    pub postgres_consensus: PostgresClientMetrics,
+}
+
+impl std::fmt::Debug for Metrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Metrics").finish_non_exhaustive()
+    }
 }
 
 impl Metrics {
@@ -107,6 +128,9 @@ impl Metrics {
             ),
             move || start.elapsed().as_secs_f64(),
         );
+        let s3_blob = S3BlobMetrics::new(registry);
+        let columnar =
+            ColumnarMetrics::new(&s3_blob.lgbytes, cfg.configs.clone(), cfg.is_cc_active);
         Metrics {
             blob: vecs.blob_metrics(),
             consensus: vecs.consensus_metrics(),
@@ -125,10 +149,13 @@ impl Metrics {
             watch: WatchMetrics::new(registry),
             pubsub_client: PubSubClientMetrics::new(registry),
             pushdown: PushdownMetrics::new(registry),
+            consolidation: ConsolidationMetrics::new(registry),
             blob_cache_mem: BlobMemCache::new(registry),
+            tasks: TasksMetrics::new(registry),
+            columnar,
             sink: SinkMetrics::new(registry),
-            s3_blob: S3BlobMetrics::new(registry),
-            postgres_consensus: PostgresConsensusMetrics::new(registry),
+            s3_blob,
+            postgres_consensus: PostgresClientMetrics::new(registry, "mz_persist"),
             _vecs: vecs,
             _uptime: uptime,
         }
@@ -370,7 +397,6 @@ impl MetricsVecs {
             compare_and_downgrade_since: self.cmd_metrics("compare_and_downgrade_since"),
             downgrade_since: self.cmd_metrics("downgrade_since"),
             heartbeat_reader: self.cmd_metrics("heartbeat_reader"),
-            heartbeat_writer: self.cmd_metrics("heartbeat_writer"),
             expire_reader: self.cmd_metrics("expire_reader"),
             expire_writer: self.cmd_metrics("expire_writer"),
             merge_res: self.cmd_metrics("merge_res"),
@@ -453,6 +479,7 @@ impl MetricsVecs {
             get: self.external_op_metrics("blob_get", true),
             list_keys: self.external_op_metrics("blob_list_keys", false),
             delete: self.external_op_metrics("blob_delete", false),
+            restore: self.external_op_metrics("restore", false),
             delete_noop: self.external_blob_delete_noop_count.clone(),
             blob_sizes: self.external_blob_sizes.clone(),
             rtt_latency: self.external_rtt_latency.with_label_values(&["blob"]),
@@ -461,6 +488,7 @@ impl MetricsVecs {
 
     fn consensus_metrics(&self) -> ConsensusMetrics {
         ConsensusMetrics {
+            list_keys: self.external_op_metrics("consensus_list_keys", false),
             head: self.external_op_metrics("consensus_head", false),
             compare_and_set: self.external_op_metrics("consensus_cas", true),
             scan: self.external_op_metrics("consensus_scan", false),
@@ -570,7 +598,6 @@ pub struct CmdsMetrics {
     pub(crate) compare_and_append_noop: IntCounter,
     pub(crate) compare_and_downgrade_since: CmdMetrics,
     pub(crate) downgrade_since: CmdMetrics,
-    pub(crate) heartbeat_writer: CmdMetrics,
     pub(crate) heartbeat_reader: CmdMetrics,
     pub(crate) expire_reader: CmdMetrics,
     pub(crate) expire_writer: CmdMetrics,
@@ -636,7 +663,7 @@ pub struct BatchPartReadMetrics {
     pub(crate) compaction: ReadMetrics,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReadMetrics {
     pub(crate) part_bytes: IntCounter,
     pub(crate) part_goodbytes: IntCounter,
@@ -1044,10 +1071,22 @@ pub struct StateMetrics {
     pub(crate) rollup_at_seqno_migration: IntCounter,
     pub(crate) fetch_recent_live_diffs_fast_path: IntCounter,
     pub(crate) fetch_recent_live_diffs_slow_path: IntCounter,
+    pub(crate) writer_added: IntCounter,
+    pub(crate) writer_removed: IntCounter,
+    pub(crate) force_apply_hostname: IntCounter,
+    pub(crate) rollup_write_success: IntCounter,
+    pub(crate) rollup_write_noop_latest: IntCounter,
+    pub(crate) rollup_write_noop_truncated: IntCounter,
 }
 
 impl StateMetrics {
     pub(crate) fn new(registry: &MetricsRegistry) -> Self {
+        let rollup_write_noop: IntCounterVec = registry.register(metric!(
+                name: "mz_persist_state_rollup_write_noop",
+                help: "count of no-op rollup writes",
+                var_labels: ["reason"],
+        ));
+
         StateMetrics {
             apply_spine_fast_path: registry.register(metric!(
                 name: "mz_persist_state_apply_spine_fast_path",
@@ -1097,6 +1136,24 @@ impl StateMetrics {
                 name: "mz_persist_state_fetch_recent_live_diffs_slow_path",
                 help: "count of fetch_recent_live_diffs that hit the slow path",
             )),
+            writer_added: registry.register(metric!(
+                name: "mz_persist_state_writer_added",
+                help: "count of writers added to the state",
+            )),
+            writer_removed: registry.register(metric!(
+                name: "mz_persist_state_writer_removed",
+                help: "count of writers removed from the state",
+            )),
+            force_apply_hostname: registry.register(metric!(
+                name: "mz_persist_state_force_applied_hostname",
+                help: "count of when hostname diffs needed to be force applied",
+            )),
+            rollup_write_success: registry.register(metric!(
+                name: "mz_persist_state_rollup_write_success",
+                help: "count of rollups written successful (may not be linked in to state)",
+            )),
+            rollup_write_noop_latest: rollup_write_noop.with_label_values(&["latest"]),
+            rollup_write_noop_truncated: rollup_write_noop.with_label_values(&["truncated"]),
         }
     }
 }
@@ -1134,6 +1191,11 @@ pub struct ShardsMetrics {
     pubsub_push_diff_not_applied_out_of_order: mz_ore::metrics::IntCounterVec,
     blob_gets: mz_ore::metrics::IntCounterVec,
     blob_sets: mz_ore::metrics::IntCounterVec,
+    live_writers: mz_ore::metrics::UIntGaugeVec,
+    unconsolidated_snapshot: mz_ore::metrics::IntCounterVec,
+    backpressure_emitted_bytes: IntCounterVec,
+    backpressure_last_backpressured_bytes: UIntGaugeVec,
+    backpressure_retired_bytes: IntCounterVec,
     // We hand out `Arc<ShardMetrics>` to read and write handles, but store it
     // here as `Weak`. This allows us to discover if it's no longer in use and
     // so we can remove it from the map.
@@ -1159,143 +1221,170 @@ impl ShardsMetrics {
             since: registry.register(metric!(
                 name: "mz_persist_shard_since",
                 help: "since by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             upper: registry.register(metric!(
                 name: "mz_persist_shard_upper",
                 help: "upper by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             encoded_rollup_size: registry.register(metric!(
                 name: "mz_persist_shard_rollup_size_bytes",
                 help: "total encoded rollup size by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             encoded_diff_size: registry.register(metric!(
                 name: "mz_persist_shard_diff_size_bytes",
                 help: "total encoded diff size by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             hollow_batch_count: registry.register(metric!(
                 name: "mz_persist_shard_hollow_batch_count",
                 help: "count of hollow batches by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             spine_batch_count: registry.register(metric!(
                 name: "mz_persist_shard_spine_batch_count",
                 help: "count of spine batches by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             batch_part_count: registry.register(metric!(
                 name: "mz_persist_shard_batch_part_count",
                 help: "count of batch parts by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             update_count: registry.register(metric!(
                 name: "mz_persist_shard_update_count",
                 help: "count of updates by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             rollup_count: registry.register(metric!(
                 name: "mz_persist_shard_rollup_count",
                 help: "count of rollups by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             largest_batch_size: registry.register(metric!(
                 name: "mz_persist_shard_largest_batch_size",
                 help: "largest encoded batch size by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             seqnos_held: registry.register(metric!(
                 name: "mz_persist_shard_seqnos_held",
                 help: "maximum count of gc-ineligible states by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             seqnos_since_last_rollup: registry.register(metric!(
                 name: "mz_persist_shard_seqnos_since_last_rollup",
                 help: "count of seqnos since last rollup",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             gc_seqno_held_parts: registry.register(metric!(
                 name: "mz_persist_shard_gc_seqno_held_parts",
                 help: "count of parts referenced by some live state but not the current state (ie. parts kept only to satisfy seqno holds) at GC time",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             gc_live_diffs: registry.register(metric!(
                 name: "mz_persist_shard_gc_live_diffs",
                 help: "the number of diffs (or, alternatively, the number of seqnos) present in consensus state at GC time",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             gc_finished: registry.register(metric!(
                 name: "mz_persist_shard_gc_finished",
                 help: "count of garbage collections finished by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             compaction_applied: registry.register(metric!(
                 name: "mz_persist_shard_compaction_applied",
                 help: "count of compactions applied to state by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             cmd_succeeded: registry.register(metric!(
                 name: "mz_persist_shard_cmd_succeeded",
                 help: "count of commands succeeded by shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             usage_current_state_batches_bytes: registry.register(metric!(
                 name: "mz_persist_shard_usage_current_state_batches_bytes",
                 help: "data in batches/parts referenced by current version of state",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             usage_current_state_rollups_bytes: registry.register(metric!(
                 name: "mz_persist_shard_usage_current_state_rollups_bytes",
                 help: "data in rollups referenced by current version of state",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             usage_referenced_not_current_state_bytes: registry.register(metric!(
                 name: "mz_persist_shard_usage_referenced_not_current_state_bytes",
                 help: "data referenced only by a previous version of state",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             usage_not_leaked_not_referenced_bytes: registry.register(metric!(
                 name: "mz_persist_shard_usage_not_leaked_not_referenced_bytes",
                 help: "data written by an active writer but not referenced by any version of state",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             usage_leaked_bytes: registry.register(metric!(
                 name: "mz_persist_shard_usage_leaked_bytes",
                 help: "data reclaimable by a leaked blob detector",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             pubsub_push_diff_applied: registry.register(metric!(
                 name: "mz_persist_shard_pubsub_diff_applied",
                 help: "number of diffs received via pubsub that applied",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             pubsub_push_diff_not_applied_stale: registry.register(metric!(
                 name: "mz_persist_shard_pubsub_diff_not_applied_stale",
                 help: "number of diffs received via pubsub that did not apply due to staleness",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             pubsub_push_diff_not_applied_out_of_order: registry.register(metric!(
                 name: "mz_persist_shard_pubsub_diff_not_applied_out_of_order",
                 help: "number of diffs received via pubsub that did not apply due to out-of-order delivery",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             blob_gets: registry.register(metric!(
                 name: "mz_persist_shard_blob_gets",
                 help: "number of Blob::get calls for this shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
             )),
             blob_sets: registry.register(metric!(
                 name: "mz_persist_shard_blob_sets",
                 help: "number of Blob::set calls for this shard",
-                var_labels: ["shard"],
+                var_labels: ["shard", "name"],
+            )),
+            live_writers: registry.register(metric!(
+                name: "mz_persist_shard_live_writers",
+                help: "number of writers that have recently appended updates to this shard",
+                var_labels: ["shard", "name"],
+            )),
+            unconsolidated_snapshot: registry.register(metric!(
+                name: "mz_persist_shard_unconsolidated_snapshot",
+                help: "in snapshot_and_read, the number of times consolidating the raw data wasn't enough to produce consolidated output",
+                var_labels: ["shard", "name"],
+            )),
+            backpressure_emitted_bytes: registry.register(metric!(
+                name: "mz_persist_backpressure_emitted_bytes",
+                help: "A counter with the number of emitted bytes.",
+                var_labels: ["shard", "name"],
+            )),
+            backpressure_last_backpressured_bytes: registry.register(metric!(
+                name: "mz_persist_backpressure_last_backpressured_bytes",
+                help: "The last count of bytes we are waiting to be retired in \
+                    the operator. This cannot be directly compared to \
+                    `retired_bytes`, but CAN indicate that backpressure is happening.",
+                var_labels: ["shard", "name"],
+            )),
+            backpressure_retired_bytes: registry.register(metric!(
+                name: "mz_persist_backpressure_retired_bytes",
+                help:"A counter with the number of bytes retired by downstream processing.",
+                var_labels: ["shard", "name"],
             )),
             shards,
         }
     }
 
-    pub fn shard(&self, shard_id: &ShardId) -> Arc<ShardMetrics> {
+    pub fn shard(&self, shard_id: &ShardId, name: &str) -> Arc<ShardMetrics> {
         let mut shards = self.shards.lock().expect("mutex poisoned");
         if let Some(shard) = shards.get(shard_id) {
             if let Some(shard) = shard.upgrade() {
@@ -1304,7 +1393,7 @@ impl ShardsMetrics {
                 assert!(shards.remove(shard_id).is_some());
             }
         }
-        let shard = Arc::new(ShardMetrics::new(shard_id, self));
+        let shard = Arc::new(ShardMetrics::new(shard_id, name, self));
         assert!(shards
             .insert(shard_id.clone(), Arc::downgrade(&shard))
             .is_none());
@@ -1362,94 +1451,121 @@ pub struct ShardMetrics {
         DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
     pub blob_gets: DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
     pub blob_sets: DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
+    pub live_writers: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+    pub unconsolidated_snapshot: DeleteOnDropCounter<'static, AtomicU64, Vec<String>>,
+    pub backpressure_emitted_bytes: Arc<DeleteOnDropCounter<'static, AtomicU64, Vec<String>>>,
+    pub backpressure_last_backpressured_bytes:
+        Arc<DeleteOnDropGauge<'static, AtomicU64, Vec<String>>>,
+    pub backpressure_retired_bytes: Arc<DeleteOnDropCounter<'static, AtomicU64, Vec<String>>>,
 }
 
 impl ShardMetrics {
-    pub fn new(shard_id: &ShardId, shards_metrics: &ShardsMetrics) -> Self {
+    pub fn new(shard_id: &ShardId, name: &str, shards_metrics: &ShardsMetrics) -> Self {
         let shard = shard_id.to_string();
         ShardMetrics {
             shard_id: *shard_id,
             since: shards_metrics
                 .since
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             upper: shards_metrics
                 .upper
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             latest_rollup_size: shards_metrics
                 .encoded_rollup_size
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             encoded_diff_size: shards_metrics
                 .encoded_diff_size
-                .get_delete_on_drop_counter(vec![shard.clone()]),
+                .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
             hollow_batch_count: shards_metrics
                 .hollow_batch_count
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             spine_batch_count: shards_metrics
                 .spine_batch_count
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             batch_part_count: shards_metrics
                 .batch_part_count
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             update_count: shards_metrics
                 .update_count
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             rollup_count: shards_metrics
                 .rollup_count
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             largest_batch_size: shards_metrics
                 .largest_batch_size
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             seqnos_held: shards_metrics
                 .seqnos_held
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             seqnos_since_last_rollup: shards_metrics
                 .seqnos_since_last_rollup
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             gc_seqno_held_parts: shards_metrics
                 .gc_seqno_held_parts
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             gc_live_diffs: shards_metrics
                 .gc_live_diffs
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             gc_finished: shards_metrics
                 .gc_finished
-                .get_delete_on_drop_counter(vec![shard.clone()]),
+                .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
             compaction_applied: shards_metrics
                 .compaction_applied
-                .get_delete_on_drop_counter(vec![shard.clone()]),
+                .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
             cmd_succeeded: shards_metrics
                 .cmd_succeeded
-                .get_delete_on_drop_counter(vec![shard.clone()]),
+                .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
             usage_current_state_batches_bytes: shards_metrics
                 .usage_current_state_batches_bytes
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             usage_current_state_rollups_bytes: shards_metrics
                 .usage_current_state_rollups_bytes
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             usage_referenced_not_current_state_bytes: shards_metrics
                 .usage_referenced_not_current_state_bytes
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             usage_not_leaked_not_referenced_bytes: shards_metrics
                 .usage_not_leaked_not_referenced_bytes
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             usage_leaked_bytes: shards_metrics
                 .usage_leaked_bytes
-                .get_delete_on_drop_gauge(vec![shard.clone()]),
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
             pubsub_push_diff_applied: shards_metrics
                 .pubsub_push_diff_applied
-                .get_delete_on_drop_counter(vec![shard.clone()]),
+                .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
             pubsub_push_diff_not_applied_stale: shards_metrics
                 .pubsub_push_diff_not_applied_stale
-                .get_delete_on_drop_counter(vec![shard.clone()]),
+                .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
             pubsub_push_diff_not_applied_out_of_order: shards_metrics
                 .pubsub_push_diff_not_applied_out_of_order
-                .get_delete_on_drop_counter(vec![shard.clone()]),
+                .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
             blob_gets: shards_metrics
                 .blob_gets
-                .get_delete_on_drop_counter(vec![shard.clone()]),
+                .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
             blob_sets: shards_metrics
                 .blob_sets
-                .get_delete_on_drop_counter(vec![shard]),
+                .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
+            live_writers: shards_metrics
+                .live_writers
+                .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
+            unconsolidated_snapshot: shards_metrics
+                .unconsolidated_snapshot
+                .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
+            backpressure_emitted_bytes: Arc::new(
+                shards_metrics
+                    .backpressure_emitted_bytes
+                    .get_delete_on_drop_counter(vec![shard.clone(), name.to_string()]),
+            ),
+            backpressure_last_backpressured_bytes: Arc::new(
+                shards_metrics
+                    .backpressure_last_backpressured_bytes
+                    .get_delete_on_drop_gauge(vec![shard.clone(), name.to_string()]),
+            ),
+            backpressure_retired_bytes: Arc::new(
+                shards_metrics
+                    .backpressure_retired_bytes
+                    .get_delete_on_drop_counter(vec![shard, name.to_string()]),
+            ),
         }
     }
 
@@ -1524,6 +1640,28 @@ impl UsageAuditMetrics {
     }
 }
 
+/// Represents a change in a number of updates kept in a data structure
+/// (e.g., a buffer length or capacity change).
+#[derive(Debug)]
+pub enum UpdateDelta {
+    /// A negative delta in the number of updates.
+    Negative(u64),
+    /// A non-negative delta in the number of updates.
+    NonNegative(u64),
+}
+
+impl UpdateDelta {
+    /// Creates a new `UpdateDelta` from the difference between a new value
+    /// for a number of updates and the corresponding old value.
+    pub fn new(new: usize, old: usize) -> Self {
+        if new < old {
+            UpdateDelta::Negative(CastFrom::cast_from(old - new))
+        } else {
+            UpdateDelta::NonNegative(CastFrom::cast_from(new - old))
+        }
+    }
+}
+
 /// Metrics for the persist sink. (While this lies slightly outside the usual
 /// abstraction boundary of the client, it's convenient to manage them together.
 #[derive(Debug)]
@@ -1532,6 +1670,22 @@ pub struct SinkMetrics {
     pub forwarded_batches: Counter,
     /// Number of updates that were forwarded to the centralized append operator
     pub forwarded_updates: Counter,
+    /// Cumulative record insertions made to the correction buffer across workers
+    correction_insertions_total: IntCounter,
+    /// Cumulative record deletions made to the correction buffer across workers
+    correction_deletions_total: IntCounter,
+    /// Cumulative capacity increases made to the correction buffer across workers
+    correction_capacity_increases_total: IntCounter,
+    /// Cumulative capacity decreases made to the correction buffer across workers
+    correction_capacity_decreases_total: IntCounter,
+    /// Peak length observed for the correction buffer across workers
+    correction_peak_len_updates: UIntGauge,
+    /// Peak capacity observed for the correction buffer across workers
+    correction_peak_capacity_updates: UIntGauge,
+    /// Maximum length observed for any one correction buffer per worker
+    correction_max_per_sink_worker_len_updates: raw::UIntGaugeVec,
+    /// Maximum capacity observed for any one correction buffer per worker
+    correction_max_per_sink_worker_capacity_updates: raw::UIntGaugeVec,
 }
 
 impl SinkMetrics {
@@ -1545,6 +1699,167 @@ impl SinkMetrics {
                 name: "mz_persist_sink_forwarded_updates",
                 help: "number of updates forwarded to the central append operator",
             )),
+            correction_insertions_total: registry.register(metric!(
+                name: "mz_persist_sink_correction_insertions_total",
+                help: "The cumulative insertions observed on the correction buffer across workers and persist sinks.",
+            )),
+            correction_deletions_total: registry.register(metric!(
+                name: "mz_persist_sink_correction_deletions_total",
+                help: "The cumulative deletions observed on the correction buffer across workers and persist sinks.",
+            )),
+            correction_capacity_increases_total: registry.register(metric!(
+                name: "mz_persist_sink_correction_capacity_increases_total",
+                help: "The cumulative capacity increases observed on the correction buffer across workers and persist sinks.",
+            )),
+            correction_capacity_decreases_total: registry.register(metric!(
+                name: "mz_persist_sink_correction_capacity_decreases_total",
+                help: "The cumulative capacity decreases observed on the correction buffer across workers and persist sinks.",
+            )),
+            correction_peak_len_updates: registry.register(metric!(
+                name: "mz_persist_sink_correction_peak_len_updates",
+                help: "The peak length observed for the correction buffer across workers and persist sinks.",
+            )),
+            correction_peak_capacity_updates: registry.register(metric!(
+                name: "mz_persist_sink_correction_peak_capacity_updates",
+                help: "The peak capacity observed for the correction buffer across workers and persist sinks.",
+            )),
+            correction_max_per_sink_worker_len_updates: registry.register(metric!(
+                name: "mz_persist_sink_correction_max_per_sink_worker_len_updates",
+                help: "The maximum length observed for the correction buffer of any single persist sink per worker.",
+                var_labels: ["worker_id"],
+            )),
+            correction_max_per_sink_worker_capacity_updates: registry.register(metric!(
+                name: "mz_persist_sink_correction_max_per_sink_worker_capacity_updates",
+                help: "The maximum capacity observed for the correction buffer of any single persist sink per worker.",
+                var_labels: ["worker_id"],
+            )),
+        }
+    }
+
+    /// Obtains a `SinkWorkerMetrics` instance, which allows for metric reporting
+    /// from a specific `persist_sink` instance for a given worker. The reports will
+    /// update metrics shared across workers, but provide per-worker contributions
+    /// to them.
+    pub fn for_worker(&self, worker_id: usize) -> SinkWorkerMetrics {
+        let worker = worker_id.to_string();
+        let correction_max_per_sink_worker_len_updates = self
+            .correction_max_per_sink_worker_len_updates
+            .with_label_values(&[&worker]);
+        let correction_max_per_sink_worker_capacity_updates = self
+            .correction_max_per_sink_worker_capacity_updates
+            .with_label_values(&[&worker]);
+        SinkWorkerMetrics {
+            correction_max_per_sink_worker_len_updates,
+            correction_max_per_sink_worker_capacity_updates,
+        }
+    }
+
+    /// Reports updates to the length and capacity of the correction buffer in the
+    /// `write_batches` operator of a `persist_sink`.
+    ///
+    /// This method updates monotonic metrics based on the deltas and thus can be
+    /// called across workers and instances of `persist_sink`.
+    pub fn report_correction_update_deltas(
+        &self,
+        correction_len_delta: UpdateDelta,
+        correction_cap_delta: UpdateDelta,
+    ) {
+        // Report insertions or deletions.
+        match correction_len_delta {
+            UpdateDelta::NonNegative(delta) => {
+                if delta > 0 {
+                    self.correction_insertions_total.inc_by(delta)
+                }
+            }
+            UpdateDelta::Negative(delta) => self.correction_deletions_total.inc_by(delta),
+        }
+        // Report capacity increases or decreases.
+        match correction_cap_delta {
+            UpdateDelta::NonNegative(delta) => {
+                if delta > 0 {
+                    self.correction_capacity_increases_total.inc_by(delta)
+                }
+            }
+            UpdateDelta::Negative(delta) => self.correction_capacity_decreases_total.inc_by(delta),
+        }
+    }
+
+    /// Updates our estimate of the aggregate peak for the correction buffer
+    /// length and capacity across workers and persist sink.
+    ///
+    /// This method assumes temporary quiescence on the correction buffer metrics,
+    /// i.e., there are no updates to these metrics taking place when the method
+    /// is called. This occurs, e.g., after a `step_or_park` call.
+    pub fn update_sink_correction_peak_metrics(&self) {
+        // Correctness argument:
+        // 1. We always update insertions/increases prior to updating deletions/decreases
+        // in each worker. So upon quiescence, the net effect of these must result in a
+        // non-negative quantity.
+        // 2. Every worker will execute the instructions below and compute the same peak.
+        // This is because during quiescence, no changes happen to the previous peak nor
+        // other metrics, and the ones we look at are all shared across workers. So at least
+        // one worker will update the peak with its new value, if there is an increase, at
+        // the quiescence granularity.
+        // Note that we may miss the overall peak if between quiescence moments there are
+        // lots of insertions followed by lots of deletions to the correction buffer. We
+        // find this trade-off more attractive than adding explicity multi-metric synchronization
+        // among workers.
+        let aggregate_correction_len = self
+            .correction_insertions_total
+            .get()
+            .checked_sub(self.correction_deletions_total.get());
+        let Some(aggregate_correction_len) = aggregate_correction_len else {
+            error!(
+                aggregate_correction_len,
+                "Negative aggregate length for persist sink correction"
+            );
+            return;
+        };
+        if aggregate_correction_len > self.correction_peak_len_updates.get() {
+            self.correction_peak_len_updates
+                .set(aggregate_correction_len);
+        }
+        let aggregate_correction_cap = self
+            .correction_capacity_increases_total
+            .get()
+            .checked_sub(self.correction_capacity_decreases_total.get());
+        let Some(aggregate_correction_cap) = aggregate_correction_cap else {
+            error!(
+                aggregate_correction_cap,
+                "Negative aggregate capacity for persist sink correction"
+            );
+            return;
+        };
+        if aggregate_correction_cap > self.correction_peak_capacity_updates.get() {
+            self.correction_peak_capacity_updates
+                .set(aggregate_correction_cap);
+        }
+    }
+}
+
+/// Metrics for the persist sink that are labeled per-worker.
+#[derive(Clone, Debug)]
+pub struct SinkWorkerMetrics {
+    correction_max_per_sink_worker_len_updates: UIntGauge,
+    correction_max_per_sink_worker_capacity_updates: UIntGauge,
+}
+
+impl SinkWorkerMetrics {
+    /// Reports the length and capacity of the correction buffer in the `write_batches`
+    /// operator of `persist_sink`.
+    ///
+    /// This method is used to update metrics that are kept per worker.
+    pub fn report_correction_update_totals(&self, correction_len: usize, correction_cap: usize) {
+        // Maintain per-worker peaks.
+        let correction_len = CastFrom::cast_from(correction_len);
+        if correction_len > self.correction_max_per_sink_worker_len_updates.get() {
+            self.correction_max_per_sink_worker_len_updates
+                .set(correction_len);
+        }
+        let correction_cap = CastFrom::cast_from(correction_cap);
+        if correction_cap > self.correction_max_per_sink_worker_capacity_updates.get() {
+            self.correction_max_per_sink_worker_capacity_updates
+                .set(correction_cap);
         }
     }
 }
@@ -1878,6 +2193,9 @@ pub struct PushdownMetrics {
     pub(crate) parts_fetched_bytes: IntCounter,
     pub(crate) parts_audited_count: IntCounter,
     pub(crate) parts_audited_bytes: IntCounter,
+    pub(crate) parts_stats_trimmed_count: IntCounter,
+    pub(crate) parts_stats_trimmed_bytes: IntCounter,
+    pub parts_mismatched_stats_count: IntCounter,
 }
 
 impl PushdownMetrics {
@@ -1907,12 +2225,49 @@ impl PushdownMetrics {
                 name: "mz_persist_pushdown_parts_audited_bytes",
                 help: "total size of parts fetched only for pushdown audit",
             )),
+            parts_stats_trimmed_count: registry.register(metric!(
+                name: "mz_persist_pushdown_parts_stats_trimmed_count",
+                help: "count of trimmed part stats",
+            )),
+            parts_stats_trimmed_bytes: registry.register(metric!(
+                name: "mz_persist_pushdown_parts_stats_trimmed_bytes",
+                help: "total bytes trimmed from part stats",
+            )),
+            parts_mismatched_stats_count: registry.register(metric!(
+                name: "mz_persist_pushdown_parts_mismatched_stats_count",
+                help: "number of parts read with unexpectedly the incorrect type of stats",
+            )),
         }
     }
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // TODO: Remove this when we reintroduce the cache.
+pub struct ConsolidationMetrics {
+    pub(crate) parts_fetched: IntCounter,
+    pub(crate) parts_skipped: IntCounter,
+    pub(crate) parts_wasted: IntCounter,
+}
+
+impl ConsolidationMetrics {
+    fn new(registry: &MetricsRegistry) -> Self {
+        ConsolidationMetrics {
+            parts_fetched: registry.register(metric!(
+                name: "mz_persist_consolidation_parts_fetched_count",
+                help: "count of parts that were fetched and used during consolidation",
+            )),
+            parts_skipped: registry.register(metric!(
+                name: "mz_persist_consolidation_parts_skipped_count",
+                help: "count of parts that were never needed during consolidation",
+            )),
+            parts_wasted: registry.register(metric!(
+                name: "mz_persist_consolidation_parts_wasted_count",
+                help: "count of parts that were fetched but not needed during consolidation",
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct BlobMemCache {
     pub(crate) size_blobs: UIntGauge,
     pub(crate) size_bytes: UIntGauge,
@@ -1992,6 +2347,41 @@ impl ExternalOpMetrics {
         };
         res
     }
+
+    fn run_stream<'a, R: 'a, S, OpFn, ErrFn>(
+        &'a self,
+        op_fn: OpFn,
+        mut on_err_fn: ErrFn,
+    ) -> impl futures::Stream<Item = Result<R, ExternalError>> + 'a
+    where
+        S: futures::Stream<Item = Result<R, ExternalError>> + Unpin + 'a,
+        OpFn: FnOnce() -> S,
+        ErrFn: FnMut(&AlertsMetrics, &ExternalError) + 'a,
+    {
+        self.started.inc();
+        let start = Instant::now();
+        let mut stream = op_fn();
+        stream! {
+            let mut succeeded = true;
+            while let Some(res) = stream.next().await {
+                if let Err(err) = res.as_ref() {
+                    on_err_fn(&self.alerts_metrics, err);
+                    succeeded = false;
+                }
+                yield res;
+            }
+            if succeeded {
+                self.succeeded.inc()
+            } else {
+                self.failed.inc()
+            }
+            let elapsed_seconds = start.elapsed().as_secs_f64();
+            self.seconds.inc_by(elapsed_seconds);
+            if let Some(h) = &self.seconds_histogram {
+                h.observe(elapsed_seconds);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2000,6 +2390,7 @@ pub struct BlobMetrics {
     get: ExternalOpMetrics,
     list_keys: ExternalOpMetrics,
     delete: ExternalOpMetrics,
+    restore: ExternalOpMetrics,
     delete_noop: IntCounter,
     blob_sizes: Histogram,
     pub rtt_latency: Gauge,
@@ -2023,6 +2414,7 @@ impl MetricsBlob {
 
 #[async_trait]
 impl Blob for MetricsBlob {
+    #[instrument(name = "blob::get", fields(shard=blob_key_shard_id(key)))]
     async fn get(&self, key: &str) -> Result<Option<SegmentedBytes>, ExternalError> {
         let res = self
             .metrics
@@ -2040,6 +2432,7 @@ impl Blob for MetricsBlob {
         res
     }
 
+    #[instrument(name = "blob::list_keys_and_metadata", fields(shard=blob_key_shard_id(key_prefix)))]
     async fn list_keys_and_metadata(
         &self,
         key_prefix: &str,
@@ -2075,6 +2468,7 @@ impl Blob for MetricsBlob {
         res
     }
 
+    #[instrument(name = "blob::set", fields(shard=blob_key_shard_id(key)))]
     async fn set(&self, key: &str, value: Bytes, atomic: Atomicity) -> Result<(), ExternalError> {
         let bytes = value.len();
         let res = self
@@ -2090,6 +2484,7 @@ impl Blob for MetricsBlob {
         res
     }
 
+    #[instrument(name = "blob::delete", fields(shard=blob_key_shard_id(key)))]
     async fn delete(&self, key: &str) -> Result<Option<usize>, ExternalError> {
         let bytes = self
             .metrics
@@ -2104,10 +2499,19 @@ impl Blob for MetricsBlob {
         }
         Ok(bytes)
     }
+
+    async fn restore(&self, key: &str) -> Result<(), ExternalError> {
+        self.metrics
+            .blob
+            .restore
+            .run_op(|| self.blob.restore(key), Self::on_err)
+            .await
+    }
 }
 
 #[derive(Debug)]
 pub struct ConsensusMetrics {
+    list_keys: ExternalOpMetrics,
     head: ExternalOpMetrics,
     compare_and_set: ExternalOpMetrics,
     scan: ExternalOpMetrics,
@@ -2139,6 +2543,16 @@ impl MetricsConsensus {
 
 #[async_trait]
 impl Consensus for MetricsConsensus {
+    fn list_keys(&self) -> ResultStream<String> {
+        Box::pin(
+            self.metrics
+                .consensus
+                .list_keys
+                .run_stream(|| self.consensus.list_keys(), Self::on_err),
+        )
+    }
+
+    #[instrument(name = "consensus::head", fields(shard=key))]
     async fn head(&self, key: &str) -> Result<Option<VersionedData>, ExternalError> {
         let res = self
             .metrics
@@ -2156,6 +2570,7 @@ impl Consensus for MetricsConsensus {
         res
     }
 
+    #[instrument(name = "consensus::compare_and_set", fields(shard=key))]
     async fn compare_and_set(
         &self,
         key: &str,
@@ -2184,6 +2599,7 @@ impl Consensus for MetricsConsensus {
         res
     }
 
+    #[instrument(name = "consensus::scan", fields(shard=key))]
     async fn scan(
         &self,
         key: &str,
@@ -2207,6 +2623,7 @@ impl Consensus for MetricsConsensus {
         res
     }
 
+    #[instrument(name = "consensus::truncate", fields(shard=key))]
     async fn truncate(&self, key: &str, seqno: SeqNo) -> Result<usize, ExternalError> {
         let deleted = self
             .metrics
@@ -2220,6 +2637,115 @@ impl Consensus for MetricsConsensus {
             .inc_by(u64::cast_from(deleted));
         Ok(deleted)
     }
+}
+
+/// A standard set of metrics for an async task. Call [TaskMetrics::instrument_task] to instrument
+/// a future and report its metrics for this task type.
+#[derive(Debug, Clone)]
+pub struct TaskMetrics {
+    f64_gauges: Vec<(Gauge, fn(&tokio_metrics::TaskMetrics) -> f64)>,
+    u64_gauges: Vec<(
+        GenericGauge<AtomicU64>,
+        fn(&tokio_metrics::TaskMetrics) -> u64,
+    )>,
+    monitor: TaskMonitor,
+}
+
+impl TaskMetrics {
+    pub fn new(name: &str) -> Self {
+        let monitor = TaskMonitor::new();
+        Self {
+            f64_gauges: vec![
+                (
+                    Gauge::make_collector(metric!(
+                        name: "mz_persist_task_total_idle_duration",
+                        help: "Seconds of time spent idling, ie. waiting for a task to be woken up.",
+                        const_labels: {"name" => name}
+                    )),
+                    |m| m.total_idle_duration.as_secs_f64(),
+                ),
+                (
+                    Gauge::make_collector(metric!(
+                        name: "mz_persist_task_total_scheduled_duration",
+                        help: "Seconds of time spent scheduled, ie. ready to poll but not yet polled.",
+                        const_labels: {"name" => name}
+                    )),
+                    |m| m.total_scheduled_duration.as_secs_f64(),
+                ),
+            ],
+            u64_gauges: vec![
+                (
+                    MakeCollector::make_collector(metric!(
+                        name: "mz_persist_task_total_scheduled_count",
+                        help: "The total number of task schedules. Useful for computing the average scheduled time.",
+                        const_labels: {"name" => name}
+                    )),
+                    |m| m.total_scheduled_count,
+                ),
+                (
+                    MakeCollector::make_collector(metric!(
+                        name: "mz_persist_task_total_idled_count",
+                        help: "The total number of task idles. Useful for computing the average idle time.",
+                        const_labels: {"name" => name}
+                    ,
+                    )),
+                    |m| m.total_idled_count,
+                ),
+            ],
+            monitor,
+        }
+    }
+
+    /// Instrument the provided future. The expectation is that the result will be executed
+    /// as a task. (See [TaskMonitor::instrument] for more context.)
+    pub fn instrument_task<F>(&self, task: F) -> tokio_metrics::Instrumented<F> {
+        self.monitor.instrument(task)
+    }
+}
+
+impl Collector for TaskMetrics {
+    fn desc(&self) -> Vec<&Desc> {
+        let mut descs = Vec::with_capacity(self.f64_gauges.len() + self.u64_gauges.len());
+        for (g, _) in &self.f64_gauges {
+            descs.extend(g.desc());
+        }
+        for (g, _) in &self.u64_gauges {
+            descs.extend(g.desc());
+        }
+        descs
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let mut families = Vec::with_capacity(self.f64_gauges.len() + self.u64_gauges.len());
+        let metrics = self.monitor.cumulative();
+        for (g, metrics_fn) in &self.f64_gauges {
+            g.set(metrics_fn(&metrics));
+            families.extend(g.collect());
+        }
+        for (g, metrics_fn) in &self.u64_gauges {
+            g.set(metrics_fn(&metrics));
+            families.extend(g.collect());
+        }
+        families
+    }
+}
+
+#[derive(Debug)]
+pub struct TasksMetrics {
+    pub heartbeat_read: TaskMetrics,
+}
+
+impl TasksMetrics {
+    fn new(registry: &MetricsRegistry) -> Self {
+        let heartbeat_read = TaskMetrics::new("heartbeat_read");
+        registry.register_collector(heartbeat_read.clone());
+        TasksMetrics { heartbeat_read }
+    }
+}
+
+fn blob_key_shard_id(key: &str) -> Option<String> {
+    let (shard_id, _) = BlobKey::parse_ids(key).ok()?;
+    Some(shard_id.to_string())
 }
 
 /// Encode a frontier into an i64 acceptable for use in metrics.

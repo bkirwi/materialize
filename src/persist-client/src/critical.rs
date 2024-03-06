@@ -15,18 +15,18 @@ use std::time::Duration;
 
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
+use mz_ore::instrument;
 use mz_ore::now::EpochMillis;
 use mz_persist_types::{Codec, Codec64, Opaque};
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
-use tracing::instrument;
 use uuid::Uuid;
 
 use crate::internal::machine::Machine;
 use crate::internal::state::Since;
 use crate::stats::SnapshotStats;
-use crate::{parse_id, GarbageCollector};
+use crate::{parse_id, GarbageCollector, ShardId};
 
 /// An opaque identifier for a reader of a persist durable TVC (aka shard).
 #[derive(Arbitrary, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -141,6 +141,11 @@ where
         }
     }
 
+    /// This handle's shard id.
+    pub fn shard_id(&self) -> ShardId {
+        self.machine.shard_id()
+    }
+
     /// This handle's `since` capability.
     ///
     /// This will always be greater or equal to the shard-global `since`.
@@ -238,7 +243,7 @@ where
     /// };
     /// # }
     /// ```
-    #[instrument(level = "debug", skip_all, fields(shard = %self.machine.shard_id()))]
+    #[instrument(level = "debug", fields(shard = %self.machine.shard_id()))]
     pub async fn maybe_compare_and_downgrade_since(
         &mut self,
         expected: &O,
@@ -271,7 +276,7 @@ where
     /// [Self::compare_and_downgrade_since] has "compare and set" semantics over an opaque value.
     /// If the `expected` opaque value does not match state, an `Err` is returned and the caller
     /// must decide how to handle it (likely a retry or a `halt!`).
-    #[instrument(level = "debug", skip_all, fields(shard = %self.machine.shard_id()))]
+    #[instrument(level = "debug", fields(shard = %self.machine.shard_id()))]
     pub async fn compare_and_downgrade_since(
         &mut self,
         expected: &O,
@@ -302,29 +307,32 @@ where
     ///
     /// This command returns the contents of this shard as of `as_of` once they
     /// are known. This may "block" (in an async-friendly way) if `as_of` is
-    /// greater or equal to the current `upper` of the shard.
+    /// greater or equal to the current `upper` of the shard. If `None` is given
+    /// for `as_of`, then the latest stats known by this process are used.
     ///
     /// The `Since` error indicates that the requested `as_of` cannot be served
     /// (the caller has out of date information) and includes the smallest
     /// `as_of` that would have been accepted.
     pub fn snapshot_stats(
         &self,
-        as_of: Antichain<T>,
-    ) -> impl Future<Output = Result<SnapshotStats<T>, Since<T>>> + Send + 'static {
+        as_of: Option<Antichain<T>>,
+    ) -> impl Future<Output = Result<SnapshotStats, Since<T>>> + Send + 'static {
         let mut machine = self.machine.clone();
         async move {
-            let batches = machine.snapshot(&as_of).await?;
+            let batches = match as_of {
+                Some(as_of) => machine.snapshot(&as_of).await?,
+                None => machine.applier.all_batches(),
+            };
             let num_updates = batches.iter().map(|b| b.len).sum();
             Ok(SnapshotStats {
                 shard_id: machine.shard_id(),
-                as_of,
                 num_updates,
             })
         }
     }
 
     /// Politely expires this reader, releasing its since capability.
-    #[instrument(level = "debug", skip_all, fields(shard = %self.machine.shard_id()))]
+    #[instrument(level = "debug", fields(shard = %self.machine.shard_id()))]
     pub async fn expire(mut self) {
         let (_, maintenance) = self.machine.expire_critical_reader(&self.reader_id).await;
         maintenance.start_performing(&self.machine, &self.gc);
@@ -339,7 +347,7 @@ mod tests {
     use serde_json::json;
 
     use crate::tests::new_test_client;
-    use crate::{PersistClient, ShardId};
+    use crate::{Diagnostics, PersistClient, ShardId};
 
     use super::*;
 
@@ -377,14 +385,18 @@ mod tests {
     }
 
     #[mz_ore::test(tokio::test)]
-    #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `epoll_wait` on OS `linux`
+    #[cfg_attr(miri, ignore)] // unsupported operation: returning ready events from epoll_wait is not yet implemented
     async fn rate_limit() {
         let client = crate::tests::new_test_client().await;
 
         let shard_id = crate::ShardId::new();
 
         let mut since = client
-            .open_critical_since::<(), (), u64, i64, i64>(shard_id, CriticalReaderId::new(), "")
+            .open_critical_since::<(), (), u64, i64, i64>(
+                shard_id,
+                CriticalReaderId::new(),
+                Diagnostics::for_tests(),
+            )
             .await
             .expect("codec mismatch");
 
@@ -405,7 +417,7 @@ mod tests {
 
     // Verifies that the handle updates its view of the opaque token correctly
     #[mz_ore::test(tokio::test)]
-    #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `epoll_wait` on OS `linux`
+    #[cfg_attr(miri, ignore)] // unsupported operation: returning ready events from epoll_wait is not yet implemented
     async fn handle_opaque_token() {
         let client = new_test_client().await;
         let shard_id = ShardId::new();
@@ -414,7 +426,7 @@ mod tests {
             .open_critical_since::<(), (), u64, i64, i64>(
                 shard_id,
                 PersistClient::CONTROLLER_CRITICAL_SINCE,
-                "",
+                Diagnostics::for_tests(),
             )
             .await
             .expect("codec mismatch");
@@ -434,7 +446,7 @@ mod tests {
             .open_critical_since::<(), (), u64, i64, i64>(
                 shard_id,
                 PersistClient::CONTROLLER_CRITICAL_SINCE,
-                "",
+                Diagnostics::for_tests(),
             )
             .await
             .expect("codec mismatch");

@@ -18,27 +18,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `EnumKind` unconditionally introduces a lifetime. TODO: remove this once
-// https://github.com/rust-lang/rust-clippy/pull/9037 makes it into stable
-#![allow(clippy::extra_unused_lifetimes)]
-
 use std::fmt;
 
 use enum_kinds::EnumKind;
+use serde::{Deserialize, Serialize};
 
 use crate::ast::display::{self, AstDisplay, AstFormatter};
 use crate::ast::{
-    AstInfo, ColumnDef, CreateConnection, CreateSinkConnection, CreateSourceConnection,
-    CreateSourceFormat, CreateSourceOption, CreateSourceOptionName, DeferredItemName, Envelope,
-    Expr, Format, Ident, KeyConstraint, Query, SelectItem, SourceIncludeMetadata, SubscribeOutput,
-    TableAlias, TableConstraint, TableWithJoins, UnresolvedDatabaseName, UnresolvedItemName,
-    UnresolvedObjectName, UnresolvedSchemaName, Value,
+    AstInfo, ColumnDef, ConnectionOption, ConnectionOptionName, CreateConnectionOption,
+    CreateConnectionType, CreateSinkConnection, CreateSourceConnection, CreateSourceFormat,
+    CreateSourceOption, CreateSourceOptionName, DeferredItemName, Expr, Format, Ident,
+    IntervalValue, KeyConstraint, MaterializedViewOption, Query, SelectItem, SinkEnvelope,
+    SourceEnvelope, SourceIncludeMetadata, SubscribeOutput, TableAlias, TableConstraint,
+    TableWithJoins, UnresolvedDatabaseName, UnresolvedItemName, UnresolvedObjectName,
+    UnresolvedSchemaName, Value,
 };
 
 /// A top-level statement (SELECT, INSERT, CREATE, etc.)
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EnumKind)]
-#[enum_kind(StatementKind)]
+#[enum_kind(StatementKind, derive(Serialize, Deserialize))]
 pub enum Statement<T: AstInfo> {
     Select(SelectStatement<T>),
     Insert(InsertStatement<T>),
@@ -48,6 +47,7 @@ pub enum Statement<T: AstInfo> {
     CreateConnection(CreateConnectionStatement<T>),
     CreateDatabase(CreateDatabaseStatement),
     CreateSchema(CreateSchemaStatement),
+    CreateWebhookSource(CreateWebhookSourceStatement<T>),
     CreateSource(CreateSourceStatement<T>),
     CreateSubsource(CreateSubsourceStatement<T>),
     CreateSink(CreateSinkStatement<T>),
@@ -63,14 +63,16 @@ pub enum Statement<T: AstInfo> {
     AlterCluster(AlterClusterStatement<T>),
     AlterOwner(AlterOwnerStatement<T>),
     AlterObjectRename(AlterObjectRenameStatement),
+    AlterObjectSwap(AlterObjectSwapStatement),
     AlterIndex(AlterIndexStatement<T>),
     AlterSecret(AlterSecretStatement<T>),
+    AlterSetCluster(AlterSetClusterStatement<T>),
     AlterSink(AlterSinkStatement<T>),
     AlterSource(AlterSourceStatement<T>),
     AlterSystemSet(AlterSystemSetStatement),
     AlterSystemReset(AlterSystemResetStatement),
     AlterSystemResetAll(AlterSystemResetAllStatement),
-    AlterConnection(AlterConnectionStatement),
+    AlterConnection(AlterConnectionStatement<T>),
     AlterRole(AlterRoleStatement<T>),
     Discard(DiscardStatement),
     DropObjects(DropObjectsStatement),
@@ -83,7 +85,10 @@ pub enum Statement<T: AstInfo> {
     Commit(CommitStatement),
     Rollback(RollbackStatement),
     Subscribe(SubscribeStatement<T>),
-    Explain(ExplainStatement<T>),
+    ExplainPlan(ExplainPlanStatement<T>),
+    ExplainPushdown(ExplainPushdownStatement<T>),
+    ExplainTimestamp(ExplainTimestampStatement<T>),
+    ExplainSinkSchema(ExplainSinkSchemaStatement<T>),
     Declare(DeclareStatement<T>),
     Fetch(FetchStatement<T>),
     Close(CloseStatement),
@@ -97,6 +102,8 @@ pub enum Statement<T: AstInfo> {
     RevokePrivileges(RevokePrivilegesStatement<T>),
     AlterDefaultPrivileges(AlterDefaultPrivilegesStatement<T>),
     ReassignOwned(ReassignOwnedStatement<T>),
+    ValidateConnection(ValidateConnectionStatement<T>),
+    Comment(CommentStatement<T>),
 }
 
 impl<T: AstInfo> AstDisplay for Statement<T> {
@@ -110,6 +117,7 @@ impl<T: AstInfo> AstDisplay for Statement<T> {
             Statement::CreateConnection(stmt) => f.write_node(stmt),
             Statement::CreateDatabase(stmt) => f.write_node(stmt),
             Statement::CreateSchema(stmt) => f.write_node(stmt),
+            Statement::CreateWebhookSource(stmt) => f.write_node(stmt),
             Statement::CreateSource(stmt) => f.write_node(stmt),
             Statement::CreateSubsource(stmt) => f.write_node(stmt),
             Statement::CreateSink(stmt) => f.write_node(stmt),
@@ -125,7 +133,9 @@ impl<T: AstInfo> AstDisplay for Statement<T> {
             Statement::AlterCluster(stmt) => f.write_node(stmt),
             Statement::AlterOwner(stmt) => f.write_node(stmt),
             Statement::AlterObjectRename(stmt) => f.write_node(stmt),
+            Statement::AlterObjectSwap(stmt) => f.write_node(stmt),
             Statement::AlterIndex(stmt) => f.write_node(stmt),
+            Statement::AlterSetCluster(stmt) => f.write_node(stmt),
             Statement::AlterSecret(stmt) => f.write_node(stmt),
             Statement::AlterSink(stmt) => f.write_node(stmt),
             Statement::AlterSource(stmt) => f.write_node(stmt),
@@ -145,7 +155,10 @@ impl<T: AstInfo> AstDisplay for Statement<T> {
             Statement::Commit(stmt) => f.write_node(stmt),
             Statement::Rollback(stmt) => f.write_node(stmt),
             Statement::Subscribe(stmt) => f.write_node(stmt),
-            Statement::Explain(stmt) => f.write_node(stmt),
+            Statement::ExplainPlan(stmt) => f.write_node(stmt),
+            Statement::ExplainPushdown(stmt) => f.write_node(stmt),
+            Statement::ExplainTimestamp(stmt) => f.write_node(stmt),
+            Statement::ExplainSinkSchema(stmt) => f.write_node(stmt),
             Statement::Declare(stmt) => f.write_node(stmt),
             Statement::Close(stmt) => f.write_node(stmt),
             Statement::Fetch(stmt) => f.write_node(stmt),
@@ -159,10 +172,83 @@ impl<T: AstInfo> AstDisplay for Statement<T> {
             Statement::RevokePrivileges(stmt) => f.write_node(stmt),
             Statement::AlterDefaultPrivileges(stmt) => f.write_node(stmt),
             Statement::ReassignOwned(stmt) => f.write_node(stmt),
+            Statement::ValidateConnection(stmt) => f.write_node(stmt),
+            Statement::Comment(stmt) => f.write_node(stmt),
         }
     }
 }
 impl_display_t!(Statement);
+
+/// A static str for each statement kind
+pub fn statement_kind_label_value(kind: StatementKind) -> &'static str {
+    match kind {
+        StatementKind::Select => "select",
+        StatementKind::Insert => "insert",
+        StatementKind::Copy => "copy",
+        StatementKind::Update => "update",
+        StatementKind::Delete => "delete",
+        StatementKind::CreateConnection => "create_connection",
+        StatementKind::CreateDatabase => "create_database",
+        StatementKind::CreateSchema => "create_schema",
+        StatementKind::CreateWebhookSource => "create_webhook",
+        StatementKind::CreateSource => "create_source",
+        StatementKind::CreateSubsource => "create_subsource",
+        StatementKind::CreateSink => "create_sink",
+        StatementKind::CreateView => "create_view",
+        StatementKind::CreateMaterializedView => "create_materialized_view",
+        StatementKind::CreateTable => "create_table",
+        StatementKind::CreateIndex => "create_index",
+        StatementKind::CreateType => "create_type",
+        StatementKind::CreateRole => "create_role",
+        StatementKind::CreateCluster => "create_cluster",
+        StatementKind::CreateClusterReplica => "create_cluster_replica",
+        StatementKind::CreateSecret => "create_secret",
+        StatementKind::AlterCluster => "alter_cluster",
+        StatementKind::AlterObjectRename => "alter_object_rename",
+        StatementKind::AlterObjectSwap => "alter_object_swap",
+        StatementKind::AlterIndex => "alter_index",
+        StatementKind::AlterRole => "alter_role",
+        StatementKind::AlterSecret => "alter_secret",
+        StatementKind::AlterSetCluster => "alter_set_cluster",
+        StatementKind::AlterSink => "alter_sink",
+        StatementKind::AlterSource => "alter_source",
+        StatementKind::AlterSystemSet => "alter_system_set",
+        StatementKind::AlterSystemReset => "alter_system_reset",
+        StatementKind::AlterSystemResetAll => "alter_system_reset_all",
+        StatementKind::AlterOwner => "alter_owner",
+        StatementKind::AlterConnection => "alter_connection",
+        StatementKind::Discard => "discard",
+        StatementKind::DropObjects => "drop_objects",
+        StatementKind::DropOwned => "drop_owned",
+        StatementKind::SetVariable => "set_variable",
+        StatementKind::ResetVariable => "reset_variable",
+        StatementKind::Show => "show",
+        StatementKind::StartTransaction => "start_transaction",
+        StatementKind::SetTransaction => "set_transaction",
+        StatementKind::Commit => "commit",
+        StatementKind::Rollback => "rollback",
+        StatementKind::Subscribe => "subscribe",
+        StatementKind::ExplainPlan => "explain_plan",
+        StatementKind::ExplainPushdown => "explain_pushdown",
+        StatementKind::ExplainTimestamp => "explain_timestamp",
+        StatementKind::ExplainSinkSchema => "explain_sink_schema",
+        StatementKind::Declare => "declare",
+        StatementKind::Fetch => "fetch",
+        StatementKind::Close => "close",
+        StatementKind::Prepare => "prepare",
+        StatementKind::Execute => "execute",
+        StatementKind::Deallocate => "deallocate",
+        StatementKind::Raise => "raise",
+        StatementKind::GrantRole => "grant_role",
+        StatementKind::RevokeRole => "revoke_role",
+        StatementKind::GrantPrivileges => "grant_privileges",
+        StatementKind::RevokePrivileges => "revoke_privileges",
+        StatementKind::AlterDefaultPrivileges => "alter_default_privileges",
+        StatementKind::ReassignOwned => "reassign_owned",
+        StatementKind::ValidateConnection => "validate_connection",
+        StatementKind::Comment => "comment",
+    }
+}
 
 /// `SELECT`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -241,20 +327,22 @@ impl AstDisplay for CopyDirection {
 impl_display!(CopyDirection);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CopyTarget {
+pub enum CopyTarget<T: AstInfo> {
     Stdin,
     Stdout,
+    Expr(Expr<T>),
 }
 
-impl AstDisplay for CopyTarget {
+impl<T: AstInfo> AstDisplay for CopyTarget<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_str(match self {
-            CopyTarget::Stdin => "STDIN",
-            CopyTarget::Stdout => "STDOUT",
-        })
+        match self {
+            CopyTarget::Stdin => f.write_str("STDIN"),
+            CopyTarget::Stdout => f.write_str("STDOUT"),
+            CopyTarget::Expr(expr) => f.write_node(expr),
+        }
     }
 }
-impl_display!(CopyTarget);
+impl_display_t!(CopyTarget);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CopyOptionName {
@@ -264,6 +352,8 @@ pub enum CopyOptionName {
     Escape,
     Quote,
     Header,
+    AwsConnection,
+    MaxFileSize,
 }
 
 impl AstDisplay for CopyOptionName {
@@ -275,6 +365,8 @@ impl AstDisplay for CopyOptionName {
             CopyOptionName::Escape => "ESCAPE",
             CopyOptionName::Quote => "QUOTE",
             CopyOptionName::Header => "HEADER",
+            CopyOptionName::AwsConnection => "AWS CONNECTION",
+            CopyOptionName::MaxFileSize => "MAX FILE SIZE",
         })
     }
 }
@@ -303,7 +395,7 @@ pub struct CopyStatement<T: AstInfo> {
     /// DIRECTION
     pub direction: CopyDirection,
     // TARGET
-    pub target: CopyTarget,
+    pub target: CopyTarget<T>,
     // OPTIONS
     pub options: Vec<CopyOption<T>>,
 }
@@ -446,6 +538,25 @@ impl AstDisplay for CreateSchemaStatement {
 impl_display!(CreateSchemaStatement);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConnectionDefaultAwsPrivatelink<T: AstInfo> {
+    pub connection: T::ItemName,
+    // TODO port should be switched to a vec of options similar to KafkaBrokerAwsPrivatelink if ever support more than port
+    pub port: Option<u16>,
+}
+
+impl<T: AstInfo> AstDisplay for ConnectionDefaultAwsPrivatelink<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_node(&self.connection);
+        if let Some(port) = self.port {
+            f.write_str(" (PORT ");
+            f.write_node(&display::escape_single_quote_string(&port.to_string()));
+            f.write_str(")");
+        }
+    }
+}
+impl_display_t!(ConnectionDefaultAwsPrivatelink);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KafkaBroker<T: AstInfo> {
     pub address: String,
     pub tunnel: KafkaBrokerTunnel<T>,
@@ -540,12 +651,14 @@ impl<T: AstInfo> AstDisplay for KafkaBrokerAwsPrivatelink<T> {
 }
 impl_display_t!(KafkaBrokerAwsPrivatelink);
 
-/// `CREATE CONNECTION`
+/// `CREATE CONNECTION` refactor WIP
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CreateConnectionStatement<T: AstInfo> {
     pub name: UnresolvedItemName,
-    pub connection: CreateConnection<T>,
+    pub connection_type: CreateConnectionType,
     pub if_not_exists: bool,
+    pub values: Vec<ConnectionOption<T>>,
+    pub with_options: Vec<CreateConnectionOption<T>>,
 }
 
 impl<T: AstInfo> AstDisplay for CreateConnectionStatement<T> {
@@ -556,10 +669,277 @@ impl<T: AstInfo> AstDisplay for CreateConnectionStatement<T> {
         }
         f.write_node(&self.name);
         f.write_str(" TO ");
-        self.connection.fmt(f)
+        self.connection_type.fmt(f);
+        f.write_str(" (");
+        f.write_node(&display::comma_separated(&self.values));
+        f.write_str(")");
+
+        if !self.with_options.is_empty() {
+            f.write_str(" WITH (");
+            f.write_node(&display::comma_separated(&self.with_options));
+            f.write_str(")");
+        }
     }
 }
 impl_display_t!(CreateConnectionStatement);
+
+/// `VALIDATE CONNECTION`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ValidateConnectionStatement<T: AstInfo> {
+    /// The connection to validate
+    pub name: T::ItemName,
+}
+
+impl<T: AstInfo> AstDisplay for ValidateConnectionStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("VALIDATE CONNECTION ");
+        f.write_node(&self.name);
+    }
+}
+impl_display_t!(ValidateConnectionStatement);
+
+/// `CREATE SOURCE <name> FROM WEBHOOK`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateWebhookSourceStatement<T: AstInfo> {
+    pub name: UnresolvedItemName,
+    pub if_not_exists: bool,
+    pub body_format: Format<T>,
+    pub include_headers: CreateWebhookSourceIncludeHeaders,
+    pub validate_using: Option<CreateWebhookSourceCheck<T>>,
+    pub in_cluster: Option<T::ClusterName>,
+}
+
+impl<T: AstInfo> AstDisplay for CreateWebhookSourceStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("CREATE SOURCE ");
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ");
+        }
+        f.write_node(&self.name);
+
+        if let Some(cluster_name) = &self.in_cluster {
+            f.write_str(" IN CLUSTER ");
+            f.write_node(cluster_name);
+        }
+
+        f.write_str(" FROM WEBHOOK ");
+
+        f.write_str("BODY FORMAT ");
+        f.write_node(&self.body_format);
+
+        f.write_node(&self.include_headers);
+
+        if let Some(validate) = &self.validate_using {
+            f.write_str(" ");
+            f.write_node(validate);
+        }
+    }
+}
+
+impl_display_t!(CreateWebhookSourceStatement);
+
+/// `CHECK ( ... )`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateWebhookSourceCheck<T: AstInfo> {
+    pub options: Option<CreateWebhookSourceCheckOptions<T>>,
+    pub using: Expr<T>,
+}
+
+impl<T: AstInfo> AstDisplay for CreateWebhookSourceCheck<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("CHECK (");
+
+        if let Some(options) = &self.options {
+            f.write_node(options);
+            f.write_str(" ");
+        }
+
+        f.write_node(&self.using);
+        f.write_str(")");
+    }
+}
+
+impl_display_t!(CreateWebhookSourceCheck);
+
+/// `CHECK ( WITH ( ... ) )`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateWebhookSourceCheckOptions<T: AstInfo> {
+    pub secrets: Vec<CreateWebhookSourceSecret<T>>,
+    pub headers: Vec<CreateWebhookSourceHeader>,
+    pub bodies: Vec<CreateWebhookSourceBody>,
+}
+
+impl<T: AstInfo> AstDisplay for CreateWebhookSourceCheckOptions<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("WITH (");
+
+        let mut delim = "";
+        if !self.headers.is_empty() {
+            f.write_node(&display::comma_separated(&self.headers[..]));
+            delim = ", ";
+        }
+        if !self.bodies.is_empty() {
+            f.write_str(delim);
+            f.write_node(&display::comma_separated(&self.bodies[..]));
+            delim = ", ";
+        }
+        if !self.secrets.is_empty() {
+            f.write_str(delim);
+            f.write_node(&display::comma_separated(&self.secrets[..]));
+        }
+
+        f.write_str(")");
+    }
+}
+
+impl_display_t!(CreateWebhookSourceCheckOptions);
+
+/// `SECRET ... [AS ...] [BYTES]`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateWebhookSourceSecret<T: AstInfo> {
+    pub secret: T::ItemName,
+    pub alias: Option<Ident>,
+    pub use_bytes: bool,
+}
+
+impl<T: AstInfo> AstDisplay for CreateWebhookSourceSecret<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("SECRET ");
+        f.write_node(&self.secret);
+
+        if let Some(alias) = &self.alias {
+            f.write_str(" AS ");
+            f.write_node(alias);
+        }
+
+        if self.use_bytes {
+            f.write_str(" BYTES");
+        }
+    }
+}
+
+impl_display_t!(CreateWebhookSourceSecret);
+
+/// `HEADER [AS ...] [BYTES]`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateWebhookSourceHeader {
+    pub alias: Option<Ident>,
+    pub use_bytes: bool,
+}
+
+impl AstDisplay for CreateWebhookSourceHeader {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("HEADERS");
+
+        if let Some(alias) = &self.alias {
+            f.write_str(" AS ");
+            f.write_node(alias);
+        }
+
+        if self.use_bytes {
+            f.write_str(" BYTES");
+        }
+    }
+}
+
+impl_display!(CreateWebhookSourceHeader);
+
+/// `BODY [AS ...] [BYTES]`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateWebhookSourceBody {
+    pub alias: Option<Ident>,
+    pub use_bytes: bool,
+}
+
+impl AstDisplay for CreateWebhookSourceBody {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("BODY");
+
+        if let Some(alias) = &self.alias {
+            f.write_str(" AS ");
+            f.write_node(alias);
+        }
+
+        if self.use_bytes {
+            f.write_str(" BYTES");
+        }
+    }
+}
+
+impl_display!(CreateWebhookSourceBody);
+
+/// `INCLUDE [HEADER | HEADERS]`
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateWebhookSourceIncludeHeaders {
+    /// Mapping individual header names to columns in the source.
+    pub mappings: Vec<CreateWebhookSourceMapHeader>,
+    /// Whether or not to include the `headers` column, and any filtering we might want to do.
+    pub column: Option<Vec<CreateWebhookSourceFilterHeader>>,
+}
+
+impl AstDisplay for CreateWebhookSourceIncludeHeaders {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        if !self.mappings.is_empty() {
+            f.write_str(" ");
+        }
+        f.write_node(&display::separated(&self.mappings[..], " "));
+
+        if let Some(column) = &self.column {
+            f.write_str(" INCLUDE HEADERS");
+
+            if !column.is_empty() {
+                f.write_str(" ");
+                f.write_str("(");
+                f.write_node(&display::comma_separated(&column[..]));
+                f.write_str(")");
+            }
+        }
+    }
+}
+
+impl_display!(CreateWebhookSourceIncludeHeaders);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateWebhookSourceFilterHeader {
+    pub block: bool,
+    pub header_name: String,
+}
+
+impl AstDisplay for CreateWebhookSourceFilterHeader {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        if self.block {
+            f.write_str("NOT ");
+        }
+        f.write_node(&display::escaped_string_literal(&self.header_name));
+    }
+}
+
+impl_display!(CreateWebhookSourceFilterHeader);
+
+/// `INCLUDE HEADER <name> [AS <alias>] [BYTES]`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateWebhookSourceMapHeader {
+    pub header_name: String,
+    pub column_name: Ident,
+    pub use_bytes: bool,
+}
+
+impl AstDisplay for CreateWebhookSourceMapHeader {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("INCLUDE HEADER ");
+
+        f.write_node(&display::escaped_string_literal(&self.header_name));
+
+        f.write_str(" AS ");
+        f.write_node(&self.column_name);
+
+        if self.use_bytes {
+            f.write_str(" BYTES");
+        }
+    }
+}
+
+impl_display!(CreateWebhookSourceMapHeader);
 
 /// `CREATE SOURCE`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -569,8 +949,8 @@ pub struct CreateSourceStatement<T: AstInfo> {
     pub col_names: Vec<Ident>,
     pub connection: CreateSourceConnection<T>,
     pub include_metadata: Vec<SourceIncludeMetadata>,
-    pub format: CreateSourceFormat<T>,
-    pub envelope: Option<Envelope>,
+    pub format: Option<CreateSourceFormat<T>>,
+    pub envelope: Option<SourceEnvelope>,
     pub if_not_exists: bool,
     pub key_constraint: Option<KeyConstraint>,
     pub with_options: Vec<CreateSourceOption<T>>,
@@ -604,7 +984,9 @@ impl<T: AstInfo> AstDisplay for CreateSourceStatement<T> {
         }
         f.write_str(" FROM ");
         f.write_node(&self.connection);
-        f.write_node(&self.format);
+        if let Some(format) = &self.format {
+            f.write_node(format);
+        }
         if !self.include_metadata.is_empty() {
             f.write_str(" INCLUDE ");
             f.write_node(&display::comma_separated(&self.include_metadata));
@@ -635,7 +1017,7 @@ impl<T: AstInfo> AstDisplay for CreateSourceStatement<T> {
 impl_display_t!(CreateSourceStatement);
 
 /// A selected subsource in a FOR TABLES (..) statement
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CreateSourceSubsource<T: AstInfo> {
     pub reference: UnresolvedItemName,
     pub subsource: Option<DeferredItemName<T>>,
@@ -754,16 +1136,12 @@ impl_display_t!(CreateSubsourceStatement);
 /// An option in a `CREATE SINK` statement.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CreateSinkOptionName {
-    Size,
     Snapshot,
 }
 
 impl AstDisplay for CreateSinkOptionName {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            CreateSinkOptionName::Size => {
-                f.write_str("SIZE");
-            }
             CreateSinkOptionName::Snapshot => {
                 f.write_str("SNAPSHOT");
             }
@@ -790,13 +1168,13 @@ impl<T: AstInfo> AstDisplay for CreateSinkOption<T> {
 /// `CREATE SINK`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CreateSinkStatement<T: AstInfo> {
-    pub name: UnresolvedItemName,
+    pub name: Option<UnresolvedItemName>,
     pub in_cluster: Option<T::ClusterName>,
     pub if_not_exists: bool,
     pub from: T::ItemName,
     pub connection: CreateSinkConnection<T>,
     pub format: Option<Format<T>>,
-    pub envelope: Option<Envelope>,
+    pub envelope: Option<SinkEnvelope>,
     pub with_options: Vec<CreateSinkOption<T>>,
 }
 
@@ -806,12 +1184,16 @@ impl<T: AstInfo> AstDisplay for CreateSinkStatement<T> {
         if self.if_not_exists {
             f.write_str("IF NOT EXISTS ");
         }
-        f.write_node(&self.name);
-        if let Some(cluster) = &self.in_cluster {
-            f.write_str(" IN CLUSTER ");
-            f.write_node(cluster);
+        if let Some(name) = &self.name {
+            f.write_node(&name);
+            f.write_str(" ");
         }
-        f.write_str(" FROM ");
+        if let Some(cluster) = &self.in_cluster {
+            f.write_str("IN CLUSTER ");
+            f.write_node(cluster);
+            f.write_str(" ");
+        }
+        f.write_str("FROM ");
         f.write_node(&self.from);
         f.write_str(" INTO ");
         f.write_node(&self.connection);
@@ -895,6 +1277,8 @@ pub struct CreateMaterializedViewStatement<T: AstInfo> {
     pub columns: Vec<Ident>,
     pub in_cluster: Option<T::ClusterName>,
     pub query: Query<T>,
+    pub as_of: Option<u64>,
+    pub with_options: Vec<MaterializedViewOption<T>>,
 }
 
 impl<T: AstInfo> AstDisplay for CreateMaterializedViewStatement<T> {
@@ -924,11 +1308,49 @@ impl<T: AstInfo> AstDisplay for CreateMaterializedViewStatement<T> {
             f.write_node(cluster);
         }
 
+        if !self.with_options.is_empty() {
+            f.write_str(" WITH (");
+            f.write_node(&display::comma_separated(&self.with_options));
+            f.write_str(")");
+        }
+
         f.write_str(" AS ");
         f.write_node(&self.query);
+
+        if let Some(time) = &self.as_of {
+            f.write_str(" AS OF ");
+            f.write_str(time);
+        }
     }
 }
 impl_display_t!(CreateMaterializedViewStatement);
+
+/// `ALTER SET CLUSTER`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AlterSetClusterStatement<T: AstInfo> {
+    pub if_exists: bool,
+    pub name: UnresolvedItemName,
+    pub object_type: ObjectType,
+    pub set_cluster: T::ClusterName,
+}
+
+impl<T: AstInfo> AstDisplay for AlterSetClusterStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("ALTER ");
+        f.write_node(&self.object_type);
+
+        if self.if_exists {
+            f.write_str(" IF EXISTS");
+        }
+
+        f.write_str(" ");
+        f.write_node(&self.name);
+
+        f.write_str(" SET CLUSTER ");
+        f.write_node(&self.set_cluster);
+    }
+}
+impl_display_t!(AlterSetClusterStatement);
 
 /// `CREATE TABLE`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -940,29 +1362,75 @@ pub struct CreateTableStatement<T: AstInfo> {
     pub constraints: Vec<TableConstraint<T>>,
     pub if_not_exists: bool,
     pub temporary: bool,
+    pub with_options: Vec<TableOption<T>>,
 }
 
 impl<T: AstInfo> AstDisplay for CreateTableStatement<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        let Self {
+            name,
+            columns,
+            constraints,
+            if_not_exists,
+            temporary,
+            with_options,
+        } = self;
         f.write_str("CREATE ");
-        if self.temporary {
+        if *temporary {
             f.write_str("TEMPORARY ");
         }
         f.write_str("TABLE ");
-        if self.if_not_exists {
+        if *if_not_exists {
             f.write_str("IF NOT EXISTS ");
         }
-        f.write_node(&self.name);
+        f.write_node(name);
         f.write_str(" (");
-        f.write_node(&display::comma_separated(&self.columns));
+        f.write_node(&display::comma_separated(columns));
         if !self.constraints.is_empty() {
             f.write_str(", ");
-            f.write_node(&display::comma_separated(&self.constraints));
+            f.write_node(&display::comma_separated(constraints));
         }
         f.write_str(")");
+        if !with_options.is_empty() {
+            f.write_str(" WITH (");
+            f.write_node(&display::comma_separated(&self.with_options));
+            f.write_str(")");
+        }
     }
 }
 impl_display_t!(CreateTableStatement);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TableOptionName {
+    // The `RETAIN HISTORY` option
+    RetainHistory,
+}
+
+impl AstDisplay for TableOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            TableOptionName::RetainHistory => {
+                f.write_str("RETAIN HISTORY");
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableOption<T: AstInfo> {
+    pub name: TableOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for TableOption<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_node(&self.name);
+        if let Some(v) = &self.value {
+            f.write_str(" = ");
+            f.write_node(v);
+        }
+    }
+}
 
 /// `CREATE INDEX`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1017,15 +1485,15 @@ impl_display_t!(CreateIndexStatement);
 /// An option in a `CREATE CLUSTER` statement.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IndexOptionName {
-    // The `LOGICAL COMPACTION WINDOW` option
-    LogicalCompactionWindow,
+    // The `RETAIN HISTORY` option
+    RetainHistory,
 }
 
 impl AstDisplay for IndexOptionName {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            IndexOptionName::LogicalCompactionWindow => {
-                f.write_str("LOGICAL COMPACTION WINDOW");
+            IndexOptionName::RetainHistory => {
+                f.write_str("RETAIN HISTORY");
             }
         }
     }
@@ -1076,23 +1544,17 @@ pub enum RoleAttribute {
     Inherit,
     /// The `NOINHERIT` option.
     NoInherit,
-    /// The `CREATECLUSTER` option.
-    CreateCluster,
-    /// The `NOCREATECLUSTER` option.
-    NoCreateCluster,
-    /// The `CREATEDB` option.
-    CreateDB,
-    /// The `NOCREATEDB` option.
-    NoCreateDB,
-    /// The `CREATEROLE` option.
-    CreateRole,
-    /// The `NOCREATEROLE` option.
-    NoCreateRole,
     // The following are not supported, but included to give helpful error messages.
     Login,
     NoLogin,
     SuperUser,
     NoSuperUser,
+    CreateCluster,
+    NoCreateCluster,
+    CreateDB,
+    NoCreateDB,
+    CreateRole,
+    NoCreateRole,
 }
 
 impl AstDisplay for RoleAttribute {
@@ -1114,6 +1576,33 @@ impl AstDisplay for RoleAttribute {
     }
 }
 impl_display!(RoleAttribute);
+
+/// `ALTER ROLE role_name [SET | RESET] ...`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SetRoleVar {
+    /// `SET name TO value`
+    Set { name: Ident, value: SetVariableTo },
+    /// `RESET name`
+    Reset { name: Ident },
+}
+
+impl AstDisplay for SetRoleVar {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            SetRoleVar::Set { name, value } => {
+                f.write_str("SET ");
+                f.write_node(name);
+                f.write_str(" = ");
+                f.write_node(value);
+            }
+            SetRoleVar::Reset { name } => {
+                f.write_str("RESET ");
+                f.write_node(name);
+            }
+        }
+    }
+}
+impl_display!(SetRoleVar);
 
 /// A `CREATE SECRET` statement.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1153,26 +1642,26 @@ impl<T: AstInfo> AstDisplay for CreateTypeStatement<T> {
         match &self.as_type {
             CreateTypeAs::List { options } => {
                 f.write_str(&self.as_type);
-                f.write_str("( ");
+                f.write_str("(");
                 if !options.is_empty() {
                     f.write_node(&display::comma_separated(options));
                 }
-                f.write_str(" )");
+                f.write_str(")");
             }
             CreateTypeAs::Map { options } => {
                 f.write_str(&self.as_type);
-                f.write_str("( ");
+                f.write_str("(");
                 if !options.is_empty() {
                     f.write_node(&display::comma_separated(options));
                 }
-                f.write_str(" )");
+                f.write_str(")");
             }
             CreateTypeAs::Record { column_defs } => {
-                f.write_str("( ");
+                f.write_str("(");
                 if !column_defs.is_empty() {
                     f.write_node(&display::comma_separated(column_defs));
                 }
-                f.write_str(" )");
+                f.write_str(")");
             }
         };
     }
@@ -1183,6 +1672,8 @@ impl_display_t!(CreateTypeStatement);
 pub enum ClusterOptionName {
     /// The `AVAILABILITY ZONES [[=] '[' <values> ']' ]` option.
     AvailabilityZones,
+    /// The `DISK` option.
+    Disk,
     /// The `INTROSPECTION INTERVAL [[=] <interval>]` option.
     IntrospectionInterval,
     /// The `INTROSPECTION DEBUGGING [[=] <enabled>]` option.
@@ -1203,6 +1694,7 @@ impl AstDisplay for ClusterOptionName {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             ClusterOptionName::AvailabilityZones => f.write_str("AVAILABILITY ZONES"),
+            ClusterOptionName::Disk => f.write_str("DISK"),
             ClusterOptionName::IdleArrangementMergeEffort => {
                 f.write_str("IDLE ARRANGEMENT MERGE EFFORT")
             }
@@ -1217,7 +1709,7 @@ impl AstDisplay for ClusterOptionName {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-/// An option in a `CREATE CLUSTER` ostatement.
+/// An option in a `CREATE CLUSTER` statement.
 pub struct ClusterOption<T: AstInfo> {
     pub name: ClusterOptionName,
     pub value: Option<WithOptionValue<T>>,
@@ -1233,6 +1725,31 @@ impl<T: AstInfo> AstDisplay for ClusterOption<T> {
     }
 }
 
+// Note: the `AstDisplay` implementation and `Parser::parse_` method for this
+// enum are generated automatically by this crate's `build.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ClusterFeatureName {
+    ReoptimizeImportedViews,
+    EnableNewOuterJoinLowering,
+    EnableEagerDeltaJoins,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClusterFeature<T: AstInfo> {
+    pub name: ClusterFeatureName,
+    pub value: Option<WithOptionValue<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for ClusterFeature<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_node(&self.name);
+        if let Some(v) = &self.value {
+            f.write_str(" = ");
+            f.write_node(v);
+        }
+    }
+}
+
 /// `CREATE CLUSTER ..`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CreateClusterStatement<T: AstInfo> {
@@ -1240,6 +1757,8 @@ pub struct CreateClusterStatement<T: AstInfo> {
     pub name: Ident,
     /// The comma-separated options.
     pub options: Vec<ClusterOption<T>>,
+    /// The comma-separated features enabled on the cluster.
+    pub features: Vec<ClusterFeature<T>>,
 }
 
 impl<T: AstInfo> AstDisplay for CreateClusterStatement<T> {
@@ -1247,8 +1766,14 @@ impl<T: AstInfo> AstDisplay for CreateClusterStatement<T> {
         f.write_str("CREATE CLUSTER ");
         f.write_node(&self.name);
         if !self.options.is_empty() {
-            f.write_str(" ");
+            f.write_str(" (");
             f.write_node(&display::comma_separated(&self.options));
+            f.write_str(")");
+        }
+        if !self.features.is_empty() {
+            f.write_str(" FEATURES (");
+            f.write_node(&display::comma_separated(&self.features));
+            f.write_str(")");
         }
     }
 }
@@ -1330,14 +1855,17 @@ impl<T: AstInfo> AstDisplay for CreateClusterReplicaStatement<T> {
         f.write_node(&self.of_cluster);
         f.write_str(".");
         f.write_node(&self.definition.name);
-        f.write_str(" ");
+        f.write_str(" (");
         f.write_node(&display::comma_separated(&self.definition.options));
+        f.write_str(")");
     }
 }
 impl_display_t!(CreateClusterReplicaStatement);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ReplicaOptionName {
+    /// The `BILLED AS [=] <value>` option.
+    BilledAs,
     /// The `SIZE [[=] <size>]` option.
     Size,
     /// The `AVAILABILITY ZONE [[=] <id>]` option.
@@ -1350,19 +1878,24 @@ pub enum ReplicaOptionName {
     ComputectlAddresses,
     /// The `COMPUTE ADDRESSES` option.
     ComputeAddresses,
-    /// The `WORKERS` option
+    /// The `WORKERS` option.
     Workers,
+    /// The `INTERNAL` option.
+    Internal,
     /// The `INTROSPECTION INTERVAL [[=] <interval>]` option.
     IntrospectionInterval,
     /// The `INTROSPECTION DEBUGGING [[=] <enabled>]` option.
     IntrospectionDebugging,
     /// The `IDLE ARRANGEMENT MERGE EFFORT [=] <value>` option.
     IdleArrangementMergeEffort,
+    /// The `DISK [[=] <enabled>]` option.
+    Disk,
 }
 
 impl AstDisplay for ReplicaOptionName {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
+            ReplicaOptionName::BilledAs => f.write_str("BILLED AS"),
             ReplicaOptionName::Size => f.write_str("SIZE"),
             ReplicaOptionName::AvailabilityZone => f.write_str("AVAILABILITY ZONE"),
             ReplicaOptionName::StorageAddresses => f.write_str("STORAGE ADDRESSES"),
@@ -1370,11 +1903,13 @@ impl AstDisplay for ReplicaOptionName {
             ReplicaOptionName::ComputectlAddresses => f.write_str("COMPUTECTL ADDRESSES"),
             ReplicaOptionName::ComputeAddresses => f.write_str("COMPUTE ADDRESSES"),
             ReplicaOptionName::Workers => f.write_str("WORKERS"),
+            ReplicaOptionName::Internal => f.write_str("INTERNAL"),
             ReplicaOptionName::IntrospectionInterval => f.write_str("INTROSPECTION INTERVAL"),
             ReplicaOptionName::IntrospectionDebugging => f.write_str("INTROSPECTION DEBUGGING"),
             ReplicaOptionName::IdleArrangementMergeEffort => {
                 f.write_str("IDLE ARRANGEMENT MERGE EFFORT")
             }
+            ReplicaOptionName::Disk => f.write_str("DISK"),
         }
     }
 }
@@ -1529,6 +2064,28 @@ impl AstDisplay for AlterObjectRenameStatement {
 }
 impl_display!(AlterObjectRenameStatement);
 
+/// `ALTER <OBJECT> SWAP ...`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AlterObjectSwapStatement {
+    pub object_type: ObjectType,
+    pub name_a: UnresolvedObjectName,
+    pub name_b: Ident,
+}
+
+impl AstDisplay for AlterObjectSwapStatement {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("ALTER ");
+
+        f.write_node(&self.object_type);
+        f.write_str(" ");
+        f.write_node(&self.name_a);
+
+        f.write_str(" SWAP WITH ");
+        f.write_node(&self.name_b);
+    }
+}
+impl_display!(AlterObjectSwapStatement);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AlterIndexAction<T: AstInfo> {
     SetOptions(Vec<IndexOption<T>>),
@@ -1606,10 +2163,53 @@ impl<T: AstInfo> AstDisplay for AlterSinkStatement<T> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AlterSourceAddSubsourceOptionName {
+    /// Columns whose types you want to unconditionally format as text
+    TextColumns,
+}
+
+impl AstDisplay for AlterSourceAddSubsourceOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            AlterSourceAddSubsourceOptionName::TextColumns => "TEXT COLUMNS",
+        })
+    }
+}
+impl_display!(AlterSourceAddSubsourceOptionName);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// An option in an `ALTER SOURCE...ADD SUBSOURCE` statement.
+pub struct AlterSourceAddSubsourceOption<T: AstInfo> {
+    pub name: AlterSourceAddSubsourceOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for AlterSourceAddSubsourceOption<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_node(&self.name);
+        if let Some(v) = &self.value {
+            f.write_str(" = ");
+            f.write_node(v);
+        }
+    }
+}
+impl_display_t!(AlterSourceAddSubsourceOption);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AlterSourceAction<T: AstInfo> {
     SetOptions(Vec<CreateSourceOption<T>>),
     ResetOptions(Vec<CreateSourceOptionName>),
+    AddSubsources {
+        subsources: Vec<CreateSourceSubsource<T>>,
+        details: Option<WithOptionValue<T>>,
+        options: Vec<AlterSourceAddSubsourceOption<T>>,
+    },
+    DropSubsources {
+        if_exists: bool,
+        cascade: bool,
+        names: Vec<UnresolvedItemName>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1639,6 +2239,37 @@ impl<T: AstInfo> AstDisplay for AlterSourceStatement<T> {
                 f.write_node(&display::comma_separated(options));
                 f.write_str(")");
             }
+            AlterSourceAction::DropSubsources {
+                if_exists,
+                cascade,
+                names,
+            } => {
+                f.write_str("DROP SUBSOURCE ");
+                if *if_exists {
+                    f.write_str("IF EXISTS ");
+                }
+
+                f.write_node(&display::comma_separated(names));
+
+                if *cascade {
+                    f.write_str(" CASCADE");
+                }
+            }
+            AlterSourceAction::AddSubsources {
+                subsources,
+                details: _,
+                options,
+            } => {
+                f.write_str("ADD SUBSOURCE ");
+
+                f.write_node(&display::comma_separated(subsources));
+
+                if !options.is_empty() {
+                    f.write_str(" WITH (");
+                    f.write_node(&display::comma_separated(options));
+                    f.write_str(")");
+                }
+            }
         }
     }
 }
@@ -1667,46 +2298,137 @@ impl<T: AstInfo> AstDisplay for AlterSecretStatement<T> {
 
 impl_display_t!(AlterSecretStatement);
 
-/// `ALTER CONNECTION ... ROTATE KEYS`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AlterConnectionStatement {
-    pub name: UnresolvedItemName,
-    pub if_exists: bool,
+pub enum AlterConnectionAction<T: AstInfo> {
+    RotateKeys,
+    SetOption(ConnectionOption<T>),
+    DropOption(ConnectionOptionName),
 }
 
-impl AstDisplay for AlterConnectionStatement {
+impl<T: AstInfo> AstDisplay for AlterConnectionAction<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            AlterConnectionAction::RotateKeys => f.write_str("ROTATE KEYS"),
+            AlterConnectionAction::SetOption(option) => {
+                f.write_str("SET (");
+                f.write_node(option);
+                f.write_str(")");
+            }
+            AlterConnectionAction::DropOption(option) => {
+                f.write_str("DROP (");
+                f.write_node(option);
+                f.write_str(")");
+            }
+        }
+    }
+}
+impl_display_t!(AlterConnectionAction);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AlterConnectionOptionName {
+    Validate,
+}
+
+impl AstDisplay for AlterConnectionOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            AlterConnectionOptionName::Validate => "VALIDATE",
+        })
+    }
+}
+impl_display!(AlterConnectionOptionName);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// An option in an `ALTER CONNECTION...` statement.
+pub struct AlterConnectionOption<T: AstInfo> {
+    pub name: AlterConnectionOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for AlterConnectionOption<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_node(&self.name);
+        if let Some(v) = &self.value {
+            f.write_str(" = ");
+            f.write_node(v);
+        }
+    }
+}
+impl_display_t!(AlterConnectionOption);
+
+/// `ALTER CONNECTION`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AlterConnectionStatement<T: AstInfo> {
+    pub name: UnresolvedItemName,
+    pub if_exists: bool,
+    pub actions: Vec<AlterConnectionAction<T>>,
+    pub with_options: Vec<AlterConnectionOption<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for AlterConnectionStatement<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("ALTER CONNECTION ");
         if self.if_exists {
             f.write_str("IF EXISTS ");
         }
         f.write_node(&self.name);
-        f.write_str(" ROTATE KEYS");
+        f.write_str(" ");
+        f.write_node(&display::comma_separated(&self.actions));
+
+        if !self.with_options.is_empty() {
+            f.write_str(" WITH (");
+            f.write_node(&display::comma_separated(&self.with_options));
+            f.write_str(")");
+        }
     }
 }
 
-impl_display!(AlterConnectionStatement);
+impl_display_t!(AlterConnectionStatement);
 
 /// `ALTER ROLE`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AlterRoleStatement<T: AstInfo> {
     /// The specified role.
     pub name: T::RoleName,
-    /// Any options that were attached, in the order they were presented.
-    pub options: Vec<RoleAttribute>,
+    /// Alterations we're making to the role.
+    pub option: AlterRoleOption,
 }
 
 impl<T: AstInfo> AstDisplay for AlterRoleStatement<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("ALTER ROLE ");
         f.write_node(&self.name);
-        for option in &self.options {
-            f.write_str(" ");
-            option.fmt(f)
-        }
+        f.write_node(&self.option);
     }
 }
 impl_display_t!(AlterRoleStatement);
+
+/// `ALTER ROLE ... [ WITH | SET ] ...`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AlterRoleOption {
+    /// Any options that were attached, in the order they were presented.
+    Attributes(Vec<RoleAttribute>),
+    /// A variable that we want to provide a default value for this role.
+    Variable(SetRoleVar),
+}
+
+impl AstDisplay for AlterRoleOption {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            AlterRoleOption::Attributes(attrs) => {
+                for attr in attrs {
+                    f.write_str(" ");
+                    attr.fmt(f)
+                }
+            }
+            AlterRoleOption::Variable(var) => {
+                f.write_str(" ");
+                f.write_node(var);
+            }
+        }
+    }
+}
+impl_display!(AlterRoleOption);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DiscardStatement {
@@ -1865,6 +2587,22 @@ impl AstDisplay for ShowVariableStatement {
 }
 impl_display!(ShowVariableStatement);
 
+/// `INSPECT SHARD <id>`
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InspectShardStatement {
+    pub id: String,
+}
+
+impl AstDisplay for InspectShardStatement {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("INSPECT SHARD ");
+        f.write_str("'");
+        f.write_node(&display::escape_single_quote_string(&self.id));
+        f.write_str("'");
+    }
+}
+impl_display!(InspectShardStatement);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ShowObjectType<T: AstInfo> {
     MaterializedView {
@@ -1876,8 +2614,12 @@ pub enum ShowObjectType<T: AstInfo> {
     },
     Table,
     View,
-    Source,
-    Sink,
+    Source {
+        in_cluster: Option<T::ClusterName>,
+    },
+    Sink {
+        in_cluster: Option<T::ClusterName>,
+    },
     Type,
     Role,
     Cluster,
@@ -1890,7 +2632,18 @@ pub enum ShowObjectType<T: AstInfo> {
         from: Option<T::DatabaseName>,
     },
     Subsource {
-        on_source: T::ItemName,
+        on_source: Option<T::ItemName>,
+    },
+    Privileges {
+        object_type: Option<SystemObjectType>,
+        role: Option<T::RoleName>,
+    },
+    DefaultPrivileges {
+        object_type: Option<ObjectType>,
+        role: Option<T::RoleName>,
+    },
+    RoleMembership {
+        role: Option<T::RoleName>,
     },
 }
 /// `SHOW <object>S`
@@ -1912,11 +2665,12 @@ impl<T: AstInfo> AstDisplay for ShowObjectsStatement<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW");
         f.write_str(" ");
+
         f.write_str(match &self.object_type {
             ShowObjectType::Table => "TABLES",
             ShowObjectType::View => "VIEWS",
-            ShowObjectType::Source => "SOURCES",
-            ShowObjectType::Sink => "SINKS",
+            ShowObjectType::Source { .. } => "SOURCES",
+            ShowObjectType::Sink { .. } => "SINKS",
             ShowObjectType::Type => "TYPES",
             ShowObjectType::Role => "ROLES",
             ShowObjectType::Cluster => "CLUSTERS",
@@ -1929,6 +2683,9 @@ impl<T: AstInfo> AstDisplay for ShowObjectsStatement<T> {
             ShowObjectType::Database => "DATABASES",
             ShowObjectType::Schema { .. } => "SCHEMAS",
             ShowObjectType::Subsource { .. } => "SUBSOURCES",
+            ShowObjectType::Privileges { .. } => "PRIVILEGES",
+            ShowObjectType::DefaultPrivileges { .. } => "DEFAULT PRIVILEGES",
+            ShowObjectType::RoleMembership { .. } => "ROLE MEMBERSHIP",
         });
 
         if let ShowObjectType::Index { on_object, .. } = &self.object_type {
@@ -1951,7 +2708,9 @@ impl<T: AstInfo> AstDisplay for ShowObjectsStatement<T> {
         // append IN CLUSTER clause
         match &self.object_type {
             ShowObjectType::MaterializedView { in_cluster }
-            | ShowObjectType::Index { in_cluster, .. } => {
+            | ShowObjectType::Index { in_cluster, .. }
+            | ShowObjectType::Sink { in_cluster }
+            | ShowObjectType::Source { in_cluster } => {
                 if let Some(cluster) = in_cluster {
                     f.write_str(" IN CLUSTER ");
                     f.write_node(cluster);
@@ -1961,8 +2720,44 @@ impl<T: AstInfo> AstDisplay for ShowObjectsStatement<T> {
         }
 
         if let ShowObjectType::Subsource { on_source } = &self.object_type {
-            f.write_str(" ON ");
-            f.write_node(on_source);
+            if let Some(on_source) = on_source {
+                f.write_str(" ON ");
+                f.write_node(on_source);
+            }
+        }
+
+        if let ShowObjectType::Privileges { object_type, role } = &self.object_type {
+            if let Some(object_type) = object_type {
+                f.write_str(" ON ");
+                f.write_node(object_type);
+                if let SystemObjectType::Object(_) = object_type {
+                    f.write_str("S");
+                }
+            }
+            if let Some(role) = role {
+                f.write_str(" FOR ");
+                f.write_node(role);
+            }
+        }
+
+        if let ShowObjectType::DefaultPrivileges { object_type, role } = &self.object_type {
+            if let Some(object_type) = object_type {
+                f.write_str(" ON ");
+                f.write_node(object_type);
+                f.write_str("S");
+            }
+            if let Some(role) = role {
+                f.write_str(" FOR ");
+                f.write_node(role);
+            }
+        }
+
+        if let ShowObjectType::RoleMembership {
+            role: Some(role), ..
+        } = &self.object_type
+        {
+            f.write_str(" FOR ");
+            f.write_node(role);
         }
 
         if let Some(filter) = &self.filter {
@@ -2248,33 +3043,126 @@ impl<T: AstInfo> AstDisplay for SubscribeRelation<T> {
 impl_display_t!(SubscribeRelation);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExplainStatement<T: AstInfo> {
+pub struct ExplainPlanStatement<T: AstInfo> {
     pub stage: ExplainStage,
-    pub config_flags: Vec<Ident>,
+    pub with_options: Vec<ExplainPlanOption<T>>,
     pub format: ExplainFormat,
-    pub no_errors: bool,
     pub explainee: Explainee<T>,
 }
 
-impl<T: AstInfo> AstDisplay for ExplainStatement<T> {
+impl<T: AstInfo> AstDisplay for ExplainPlanStatement<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("EXPLAIN ");
         f.write_node(&self.stage);
-        if !self.config_flags.is_empty() {
-            f.write_str(" WITH(");
-            f.write_node(&display::comma_separated(&self.config_flags));
+        if !self.with_options.is_empty() {
+            f.write_str(" WITH (");
+            f.write_node(&display::comma_separated(&self.with_options));
             f.write_str(")");
         }
         f.write_str(" AS ");
         f.write_node(&self.format);
         f.write_str(" FOR ");
-        if self.no_errors {
-            f.write_str("BROKEN ");
-        }
         f.write_node(&self.explainee);
     }
 }
-impl_display_t!(ExplainStatement);
+impl_display_t!(ExplainPlanStatement);
+
+// Note: the `AstDisplay` implementation and `Parser::parse_` method for this
+// enum are generated automatically by this crate's `build.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ExplainPlanOptionName {
+    Arity,
+    Cardinality,
+    ColumnNames,
+    FilterPushdown,
+    HumanizedExpressions,
+    JoinImplementations,
+    Keys,
+    LinearChains,
+    NonNegative,
+    NoFastPath,
+    NoNotices,
+    NodeIdentifiers,
+    RawPlans,
+    RawSyntax,
+    Raw, // Listed after the `Raw~` variants to keep the parser happy!
+    Redacted,
+    SubtreeSize,
+    Timing,
+    Types,
+    ReoptimizeImportedViews,
+    EnableNewOuterJoinLowering,
+    EnableEagerDeltaJoins,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExplainPlanOption<T: AstInfo> {
+    pub name: ExplainPlanOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for ExplainPlanOption<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_node(&self.name);
+        if let Some(v) = &self.value {
+            f.write_str(" = ");
+            f.write_node(v);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExplainSinkSchemaFor {
+    Key,
+    Value,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExplainSinkSchemaStatement<T: AstInfo> {
+    pub schema_for: ExplainSinkSchemaFor,
+    pub statement: CreateSinkStatement<T>,
+}
+
+impl<T: AstInfo> AstDisplay for ExplainSinkSchemaStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("EXPLAIN ");
+        match &self.schema_for {
+            ExplainSinkSchemaFor::Key => f.write_str("KEY"),
+            ExplainSinkSchemaFor::Value => f.write_str("VALUE"),
+        }
+        f.write_str(" SCHEMA AS JSON FOR ");
+        f.write_node(&self.statement);
+    }
+}
+impl_display_t!(ExplainSinkSchemaStatement);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExplainPushdownStatement<T: AstInfo> {
+    pub explainee: Explainee<T>,
+}
+
+impl<T: AstInfo> AstDisplay for ExplainPushdownStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("EXPLAIN FILTER PUSHDOWN FOR ");
+        f.write_node(&self.explainee);
+    }
+}
+impl_display_t!(ExplainPushdownStatement);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExplainTimestampStatement<T: AstInfo> {
+    pub format: ExplainFormat,
+    pub select: SelectStatement<T>,
+}
+
+impl<T: AstInfo> AstDisplay for ExplainTimestampStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("EXPLAIN TIMESTAMP AS ");
+        f.write_node(&self.format);
+        f.write_str(" FOR ");
+        f.write_node(&self.select);
+    }
+}
+impl_display_t!(ExplainTimestampStatement);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InsertSource<T: AstInfo> {
@@ -2292,7 +3180,7 @@ impl<T: AstInfo> AstDisplay for InsertSource<T> {
 }
 impl_display_t!(InsertSource);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Copy)]
 pub enum ObjectType {
     Table,
     View,
@@ -2359,6 +3247,22 @@ impl AstDisplay for ObjectType {
 }
 impl_display!(ObjectType);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Copy)]
+pub enum SystemObjectType {
+    System,
+    Object(ObjectType),
+}
+
+impl AstDisplay for SystemObjectType {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            SystemObjectType::System => f.write_str("SYSTEM"),
+            SystemObjectType::Object(object) => f.write_node(object),
+        }
+    }
+}
+impl_display!(SystemObjectType);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ShowStatementFilter<T: AstInfo> {
     Like(String),
@@ -2395,10 +3299,39 @@ pub enum WithOptionValue<T: AstInfo> {
     // Special cases.
     ClusterReplicas(Vec<ReplicaDefinition<T>>),
     ConnectionKafkaBroker(KafkaBroker<T>),
+    ConnectionAwsPrivatelink(ConnectionDefaultAwsPrivatelink<T>),
+    RetainHistoryFor(Value),
+    Refresh(RefreshOptionValue<T>),
 }
 
 impl<T: AstInfo> AstDisplay for WithOptionValue<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        if f.redacted() {
+            // When adding branches to this match statement, think about whether it is OK for us to collect
+            // the value as part of our telemetry. Check the data management policy to be sure!
+            match self {
+                WithOptionValue::Value(_)
+                | WithOptionValue::Sequence(_)
+                | WithOptionValue::RetainHistoryFor(_)
+                | WithOptionValue::Refresh(_) => {
+                    // These are redact-aware.
+                }
+                WithOptionValue::DataType(_)
+                | WithOptionValue::Item(_)
+                | WithOptionValue::UnresolvedItemName(_)
+                | WithOptionValue::ConnectionAwsPrivatelink(_)
+                | WithOptionValue::ClusterReplicas(_) => {
+
+                    // These do not need redaction.
+                }
+                WithOptionValue::Secret(_)
+                | WithOptionValue::ConnectionKafkaBroker(_)
+                | WithOptionValue::Ident(_) => {
+                    f.write_str("'<REDACTED>'");
+                    return;
+                }
+            }
+        }
         match self {
             WithOptionValue::Sequence(values) => {
                 f.write_str("(");
@@ -2406,7 +3339,9 @@ impl<T: AstInfo> AstDisplay for WithOptionValue<T> {
                 f.write_str(")");
             }
             WithOptionValue::Value(value) => f.write_node(value),
-            WithOptionValue::Ident(id) => f.write_node(id),
+            WithOptionValue::Ident(id) => {
+                f.write_node(id);
+            }
             WithOptionValue::DataType(typ) => f.write_node(typ),
             WithOptionValue::Secret(name) => {
                 f.write_str("SECRET ");
@@ -2419,13 +3354,71 @@ impl<T: AstInfo> AstDisplay for WithOptionValue<T> {
                 f.write_node(&display::comma_separated(replicas));
                 f.write_str(")");
             }
+            WithOptionValue::ConnectionAwsPrivatelink(aws_privatelink) => {
+                f.write_node(aws_privatelink);
+            }
             WithOptionValue::ConnectionKafkaBroker(broker) => {
                 f.write_node(broker);
             }
+            WithOptionValue::RetainHistoryFor(value) => {
+                f.write_str("FOR ");
+                f.write_node(value);
+            }
+            WithOptionValue::Refresh(opt) => f.write_node(opt),
         }
     }
 }
 impl_display_t!(WithOptionValue);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RefreshOptionValue<T: AstInfo> {
+    OnCommit,
+    AtCreation,
+    At(RefreshAtOptionValue<T>),
+    Every(RefreshEveryOptionValue<T>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RefreshAtOptionValue<T: AstInfo> {
+    // We need an Expr because we want to support `mz_now()`.
+    pub time: Expr<T>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RefreshEveryOptionValue<T: AstInfo> {
+    // The refresh interval.
+    pub interval: IntervalValue,
+    // We need an Expr because we want to support `mz_now()`.
+    pub aligned_to: Option<Expr<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for RefreshOptionValue<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            RefreshOptionValue::OnCommit => {
+                f.write_str("ON COMMIT");
+            }
+            RefreshOptionValue::AtCreation => {
+                f.write_str("AT CREATION");
+            }
+            RefreshOptionValue::At(RefreshAtOptionValue { time }) => {
+                f.write_str("AT ");
+                f.write_node(time);
+            }
+            RefreshOptionValue::Every(RefreshEveryOptionValue {
+                interval,
+                aligned_to,
+            }) => {
+                f.write_str("EVERY '");
+                f.write_node(interval);
+                if let Some(aligned_to) = aligned_to {
+                    f.write_str(" ALIGNED TO ");
+                    f.write_node(aligned_to)
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TransactionMode {
@@ -2470,6 +3463,7 @@ pub enum TransactionIsolationLevel {
     ReadCommitted,
     RepeatableRead,
     Serializable,
+    StrongSessionSerializable,
     StrictSerializable,
 }
 
@@ -2481,6 +3475,7 @@ impl AstDisplay for TransactionIsolationLevel {
             ReadCommitted => "READ COMMITTED",
             RepeatableRead => "REPEATABLE READ",
             Serializable => "SERIALIZABLE",
+            StrongSessionSerializable => "STRONG SESSION SERIALIZABLE",
             StrictSerializable => "STRICT SERIALIZABLE",
         })
     }
@@ -2550,34 +3545,47 @@ impl<T: AstInfo> AstDisplay for Assignment<T> {
 }
 impl_display_t!(Assignment);
 
-/// Specifies what [Statement::Explain] is actually explaining
-/// The new API
+/// Specifies what [Statement::ExplainPlan] is actually explained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExplainStage {
     /// The mz_sql::HirRelationExpr after parsing
     RawPlan,
     /// The mz_expr::MirRelationExpr after decorrelation
     DecorrelatedPlan,
-    /// The mz_expr::MirRelationExpr after optimization
-    OptimizedPlan,
-    /// The mz_compute_client::plan::Plan
+    /// The mz_expr::MirRelationExpr after local optimization
+    LocalPlan,
+    /// The mz_expr::MirRelationExpr after global optimization
+    GlobalPlan,
+    /// The mz_compute_types::plan::Plan
     PhysicalPlan,
     /// The complete trace of the plan through the optimizer
     Trace,
-    /// The dependent and selected timestamps
-    Timestamp,
 }
 
 impl ExplainStage {
     /// Return the tracing path that corresponds to a given stage.
-    pub fn path(&self) -> &'static str {
+    pub fn path(&self) -> Option<&'static str> {
+        use NamedPlan::*;
         match self {
-            ExplainStage::RawPlan => "optimize/raw",
-            ExplainStage::DecorrelatedPlan => "optimize/hir_to_mir",
-            ExplainStage::OptimizedPlan => "optimize/global",
-            ExplainStage::PhysicalPlan => "optimize/finalize_dataflow",
-            ExplainStage::Trace => unreachable!(),
-            ExplainStage::Timestamp => unreachable!(),
+            Self::RawPlan => Some(Raw.path()),
+            Self::DecorrelatedPlan => Some(Decorrelated.path()),
+            Self::LocalPlan => Some(Local.path()),
+            Self::GlobalPlan => Some(Global.path()),
+            Self::PhysicalPlan => Some(Physical.path()),
+            Self::Trace => None,
+        }
+    }
+
+    // Whether instead of the plan associated with this [`ExplainStage`] we
+    // should show the [`NamedPlan::FastPath`] plan if available.
+    pub fn show_fast_path(&self) -> bool {
+        match self {
+            Self::RawPlan => false,
+            Self::DecorrelatedPlan => false,
+            Self::LocalPlan => false,
+            Self::GlobalPlan => true,
+            Self::PhysicalPlan => true,
+            Self::Trace => false,
         }
     }
 }
@@ -2585,28 +3593,77 @@ impl ExplainStage {
 impl AstDisplay for ExplainStage {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
-            ExplainStage::RawPlan => f.write_str("RAW PLAN"),
-            ExplainStage::DecorrelatedPlan => f.write_str("DECORRELATED PLAN"),
-            ExplainStage::OptimizedPlan => f.write_str("OPTIMIZED PLAN"),
-            ExplainStage::PhysicalPlan => f.write_str("PHYSICAL PLAN"),
-            ExplainStage::Trace => f.write_str("OPTIMIZER TRACE"),
-            ExplainStage::Timestamp => f.write_str("TIMESTAMP"),
+            Self::RawPlan => f.write_str("RAW PLAN"),
+            Self::DecorrelatedPlan => f.write_str("DECORRELATED PLAN"),
+            Self::LocalPlan => f.write_str("LOCALLY OPTIMIZED PLAN"),
+            Self::GlobalPlan => f.write_str("OPTIMIZED PLAN"),
+            Self::PhysicalPlan => f.write_str("PHYSICAL PLAN"),
+            Self::Trace => f.write_str("OPTIMIZER TRACE"),
         }
     }
 }
 impl_display!(ExplainStage);
 
+/// An enum of named plans that identifies specific stages in an optimizer trace
+/// where these plans can be found.
+pub enum NamedPlan {
+    Raw,
+    Decorrelated,
+    Local,
+    Global,
+    Physical,
+    FastPath,
+}
+
+impl NamedPlan {
+    /// Return the [`NamedPlan`] for a given `path` if it exists.
+    pub fn of_path(value: &str) -> Option<Self> {
+        match value {
+            "optimize/raw" => Some(Self::Raw),
+            "optimize/hir_to_mir" => Some(Self::Decorrelated),
+            "optimize/local" => Some(Self::Local),
+            "optimize/global" => Some(Self::Global),
+            "optimize/finalize_dataflow" => Some(Self::Physical),
+            "optimize/fast_path" => Some(Self::FastPath),
+            _ => None,
+        }
+    }
+
+    /// Return the tracing path under which the plan can be found in an
+    /// optimizer trace.
+    pub fn path(&self) -> &'static str {
+        match self {
+            Self::Raw => "optimize/raw",
+            Self::Decorrelated => "optimize/hir_to_mir",
+            Self::Local => "optimize/local",
+            Self::Global => "optimize/global",
+            Self::Physical => "optimize/finalize_dataflow",
+            Self::FastPath => "optimize/fast_path",
+        }
+    }
+}
+
+/// What is being explained.
+/// The bools mean whether this is an EXPLAIN BROKEN.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Explainee<T: AstInfo> {
     View(T::ItemName),
     MaterializedView(T::ItemName),
-    Query(Query<T>),
+    Index(T::ItemName),
+    ReplanView(T::ItemName),
+    ReplanMaterializedView(T::ItemName),
+    ReplanIndex(T::ItemName),
+    Select(Box<SelectStatement<T>>, bool),
+    CreateView(Box<CreateViewStatement<T>>, bool),
+    CreateMaterializedView(Box<CreateMaterializedViewStatement<T>>, bool),
+    CreateIndex(Box<CreateIndexStatement<T>>, bool),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExplainOptions {
-    pub typed: bool,
-    pub timing: bool,
+impl<T: AstInfo> Explainee<T> {
+    pub fn is_view(&self) -> bool {
+        use Explainee::*;
+        matches!(self, View(_) | ReplanView(_) | CreateView(_, _))
+    }
 }
 
 impl<T: AstInfo> AstDisplay for Explainee<T> {
@@ -2620,7 +3677,46 @@ impl<T: AstInfo> AstDisplay for Explainee<T> {
                 f.write_str("MATERIALIZED VIEW ");
                 f.write_node(name);
             }
-            Self::Query(query) => f.write_node(query),
+            Self::Index(name) => {
+                f.write_str("INDEX ");
+                f.write_node(name);
+            }
+            Self::ReplanView(name) => {
+                f.write_str("REPLAN VIEW ");
+                f.write_node(name);
+            }
+            Self::ReplanMaterializedView(name) => {
+                f.write_str("REPLAN MATERIALIZED VIEW ");
+                f.write_node(name);
+            }
+            Self::ReplanIndex(name) => {
+                f.write_str("REPLAN INDEX ");
+                f.write_node(name);
+            }
+            Self::Select(select, broken) => {
+                if *broken {
+                    f.write_str("BROKEN ");
+                }
+                f.write_node(select);
+            }
+            Self::CreateView(statement, broken) => {
+                if *broken {
+                    f.write_str("BROKEN ");
+                }
+                f.write_node(statement);
+            }
+            Self::CreateMaterializedView(statement, broken) => {
+                if *broken {
+                    f.write_str("BROKEN ");
+                }
+                f.write_node(statement);
+            }
+            Self::CreateIndex(statement, broken) => {
+                if *broken {
+                    f.write_str("BROKEN ");
+                }
+                f.write_node(statement);
+            }
         }
     }
 }
@@ -2657,6 +3753,7 @@ pub enum IfExistsBehavior {
 pub struct DeclareStatement<T: AstInfo> {
     pub name: Ident,
     pub stmt: Box<T::NestedStatement>,
+    pub sql: String,
 }
 
 impl<T: AstInfo> AstDisplay for DeclareStatement<T> {
@@ -2757,6 +3854,7 @@ impl_display!(FetchDirection);
 pub struct PrepareStatement<T: AstInfo> {
     pub name: Ident,
     pub stmt: Box<T::NestedStatement>,
+    pub sql: String,
 }
 
 impl<T: AstInfo> AstDisplay for PrepareStatement<T> {
@@ -2916,6 +4014,7 @@ pub enum ShowStatement<T: AstInfo> {
     ShowCreateIndex(ShowCreateIndexStatement<T>),
     ShowCreateConnection(ShowCreateConnectionStatement<T>),
     ShowVariable(ShowVariableStatement),
+    InspectShard(InspectShardStatement),
 }
 
 impl<T: AstInfo> AstDisplay for ShowStatement<T> {
@@ -2931,6 +4030,7 @@ impl<T: AstInfo> AstDisplay for ShowStatement<T> {
             ShowStatement::ShowCreateIndex(stmt) => f.write_node(stmt),
             ShowStatement::ShowCreateConnection(stmt) => f.write_node(stmt),
             ShowStatement::ShowVariable(stmt) => f.write_node(stmt),
+            ShowStatement::InspectShard(stmt) => f.write_node(stmt),
         }
     }
 }
@@ -2982,6 +4082,9 @@ pub enum Privilege {
     DELETE,
     USAGE,
     CREATE,
+    CREATEROLE,
+    CREATEDB,
+    CREATECLUSTER,
 }
 
 impl AstDisplay for Privilege {
@@ -2993,6 +4096,9 @@ impl AstDisplay for Privilege {
             Privilege::DELETE => "DELETE",
             Privilege::CREATE => "CREATE",
             Privilege::USAGE => "USAGE",
+            Privilege::CREATEROLE => "CREATEROLE",
+            Privilege::CREATEDB => "CREATEDB",
+            Privilege::CREATECLUSTER => "CREATECLUSTER",
         });
     }
 }
@@ -3017,13 +4123,16 @@ impl AstDisplay for PrivilegeSpecification {
 impl_display!(PrivilegeSpecification);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct GrantTargetSpecification<T: AstInfo> {
-    /// The type of object.
-    ///
-    /// Note: For views, materialized views, and sources this will be [`ObjectType::Table`].
-    pub object_type: ObjectType,
-    /// Specification of each object affected.
-    pub object_spec_inner: GrantTargetSpecificationInner<T>,
+pub enum GrantTargetSpecification<T: AstInfo> {
+    Object {
+        /// The type of object.
+        ///
+        /// Note: For views, materialized views, and sources this will be [`ObjectType::Table`].
+        object_type: ObjectType,
+        /// Specification of each object affected.
+        object_spec_inner: GrantTargetSpecificationInner<T>,
+    },
+    System,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3051,31 +4160,37 @@ impl<T: AstInfo> GrantTargetAllSpecification<T> {
 
 impl<T: AstInfo> AstDisplay for GrantTargetSpecification<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        match &self.object_spec_inner {
-            GrantTargetSpecificationInner::All(all_spec) => match all_spec {
-                GrantTargetAllSpecification::All => {
-                    f.write_str("ALL ");
-                    f.write_node(&self.object_type);
-                    f.write_str("S");
-                }
-                GrantTargetAllSpecification::AllDatabases { databases } => {
-                    f.write_str("ALL ");
-                    f.write_node(&self.object_type);
-                    f.write_str("S IN DATABASE ");
-                    f.write_node(&display::comma_separated(databases));
-                }
-                GrantTargetAllSpecification::AllSchemas { schemas } => {
-                    f.write_str("ALL ");
-                    f.write_node(&self.object_type);
-                    f.write_str("S IN SCHEMA ");
-                    f.write_node(&display::comma_separated(schemas));
+        match self {
+            GrantTargetSpecification::Object {
+                object_type,
+                object_spec_inner,
+            } => match object_spec_inner {
+                GrantTargetSpecificationInner::All(all_spec) => match all_spec {
+                    GrantTargetAllSpecification::All => {
+                        f.write_str("ALL ");
+                        f.write_node(object_type);
+                        f.write_str("S");
+                    }
+                    GrantTargetAllSpecification::AllDatabases { databases } => {
+                        f.write_str("ALL ");
+                        f.write_node(object_type);
+                        f.write_str("S IN DATABASE ");
+                        f.write_node(&display::comma_separated(databases));
+                    }
+                    GrantTargetAllSpecification::AllSchemas { schemas } => {
+                        f.write_str("ALL ");
+                        f.write_node(object_type);
+                        f.write_str("S IN SCHEMA ");
+                        f.write_node(&display::comma_separated(schemas));
+                    }
+                },
+                GrantTargetSpecificationInner::Objects { names } => {
+                    f.write_node(object_type);
+                    f.write_str(" ");
+                    f.write_node(&display::comma_separated(names));
                 }
             },
-            GrantTargetSpecificationInner::Objects { names } => {
-                f.write_node(&self.object_type);
-                f.write_str(" ");
-                f.write_node(&display::comma_separated(names));
-            }
+            GrantTargetSpecification::System => f.write_str("SYSTEM"),
         }
     }
 }
@@ -3131,8 +4246,6 @@ impl_display_t!(RevokePrivilegesStatement);
 pub enum TargetRoleSpecification<T: AstInfo> {
     /// Specific list of roles.
     Roles(Vec<T::RoleName>),
-    /// The current role executing the statement.
-    CurrentRole,
     /// All current and future roles.
     AllRoles,
 }
@@ -3141,7 +4254,6 @@ impl<T: AstInfo> AstDisplay for TargetRoleSpecification<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             TargetRoleSpecification::Roles(roles) => f.write_node(&display::comma_separated(roles)),
-            TargetRoleSpecification::CurrentRole => {}
             TargetRoleSpecification::AllRoles => f.write_str("ALL ROLES"),
         }
     }
@@ -3254,7 +4366,6 @@ impl<T: AstInfo> AstDisplay for AlterDefaultPrivilegesStatement<T> {
                 f.write_str(" FOR ROLE ");
                 f.write_node(&self.target_roles);
             }
-            TargetRoleSpecification::CurrentRole => {}
             TargetRoleSpecification::AllRoles => {
                 f.write_str(" FOR ");
                 f.write_node(&self.target_roles);
@@ -3295,3 +4406,127 @@ impl<T: AstInfo> AstDisplay for ReassignOwnedStatement<T> {
     }
 }
 impl_display_t!(ReassignOwnedStatement);
+
+/// `COMMENT ON ...`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CommentStatement<T: AstInfo> {
+    pub object: CommentObjectType<T>,
+    pub comment: Option<String>,
+}
+
+impl<T: AstInfo> AstDisplay for CommentStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("COMMENT ON ");
+        f.write_node(&self.object);
+
+        f.write_str(" IS ");
+        match &self.comment {
+            Some(s) => {
+                f.write_str("'");
+                f.write_node(&display::escape_single_quote_string(s));
+                f.write_str("'");
+            }
+            None => f.write_str("NULL"),
+        }
+    }
+}
+impl_display_t!(CommentStatement);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CommentObjectType<T: AstInfo> {
+    Table { name: T::ItemName },
+    View { name: T::ItemName },
+    Column { name: T::ColumnName },
+    MaterializedView { name: T::ItemName },
+    Source { name: T::ItemName },
+    Sink { name: T::ItemName },
+    Index { name: T::ItemName },
+    Func { name: T::ItemName },
+    Connection { name: T::ItemName },
+    Type { ty: T::DataType },
+    Secret { name: T::ItemName },
+    Role { name: T::RoleName },
+    Database { name: T::DatabaseName },
+    Schema { name: T::SchemaName },
+    Cluster { name: T::ClusterName },
+    ClusterReplica { name: QualifiedReplica },
+}
+
+impl<T: AstInfo> AstDisplay for CommentObjectType<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        use CommentObjectType::*;
+
+        match self {
+            Table { name } => {
+                f.write_str("TABLE ");
+                f.write_node(name);
+            }
+            View { name } => {
+                f.write_str("VIEW ");
+                f.write_node(name);
+            }
+            Column { name } => {
+                f.write_str("COLUMN ");
+                f.write_node(name);
+            }
+            MaterializedView { name } => {
+                f.write_str("MATERIALIZED VIEW ");
+                f.write_node(name);
+            }
+            Source { name } => {
+                f.write_str("SOURCE ");
+                f.write_node(name);
+            }
+            Sink { name } => {
+                f.write_str("SINK ");
+                f.write_node(name);
+            }
+            Index { name } => {
+                f.write_str("INDEX ");
+                f.write_node(name);
+            }
+            Func { name } => {
+                f.write_str("FUNCTION ");
+                f.write_node(name);
+            }
+            Connection { name } => {
+                f.write_str("CONNECTION ");
+                f.write_node(name);
+            }
+            Type { ty } => {
+                f.write_str("TYPE ");
+                f.write_node(ty);
+            }
+            Secret { name } => {
+                f.write_str("SECRET ");
+                f.write_node(name);
+            }
+            Role { name } => {
+                f.write_str("ROLE ");
+                f.write_node(name);
+            }
+            Database { name } => {
+                f.write_str("DATABASE ");
+                f.write_node(name);
+            }
+            Schema { name } => {
+                f.write_str("SCHEMA ");
+                f.write_node(name);
+            }
+            Cluster { name } => {
+                f.write_str("CLUSTER ");
+                f.write_node(name);
+            }
+            ClusterReplica { name } => {
+                f.write_str("CLUSTER REPLICA ");
+                f.write_node(name);
+            }
+        }
+    }
+}
+
+impl_display_t!(CommentObjectType);
+
+// Include the `AstDisplay` implementations for simple options derived by the
+// crate's build.rs script.
+include!(concat!(env!("OUT_DIR"), "/display.simple_options.rs"));

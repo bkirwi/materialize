@@ -11,11 +11,6 @@
 
 mode cockroach
 
-simple conn=mz_system,user=mz_system
-ALTER SYSTEM SET enable_with_mutually_recursive = true
-----
-COMPLETE 0
-
 statement ok
 CREATE TABLE x (a int not null, u int, b bool)
 
@@ -23,12 +18,12 @@ statement ok
 CREATE TABLE y (a int not null)
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT b FROM (SELECT b, not(b) as neg FROM x) WHERE NOT(neg)
+EXPLAIN WITH(arity, join implementations) SELECT b FROM (SELECT b, not(b) as neg FROM x) WHERE NOT(neg)
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
     Filter #2 // { arity: 3 }
-      Get materialize.public.x // { arity: 3 }
+      ReadStorage materialize.public.x // { arity: 3 }
 
 Source materialize.public.x
   filter=(#2)
@@ -36,12 +31,12 @@ Source materialize.public.x
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT b FROM (SELECT b, b = false as neg FROM x) WHERE NOT(neg)
+EXPLAIN WITH(arity, join implementations) SELECT b FROM (SELECT b, b = false as neg FROM x) WHERE NOT(neg)
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
     Filter (#2 != false) // { arity: 3 }
-      Get materialize.public.x // { arity: 3 }
+      ReadStorage materialize.public.x // { arity: 3 }
 
 Source materialize.public.x
   filter=((#2 != false))
@@ -51,37 +46,42 @@ EOF
 # Inline binary expressions.
 
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
   SELECT a FROM (SELECT a, a = 3 AS cond, u != 2 as cond2 FROM x) WHERE NOT(cond) AND NOT(cond2)
 ----
 Explained Query:
   Project (#0) // { arity: 1 }
     Filter (#1 = 2) AND (#0 != 3) // { arity: 3 }
-      Get materialize.public.x // { arity: 3 }
+      ReadStorage materialize.public.x // { arity: 3 }
 
 Source materialize.public.x
   filter=((#0 != 3) AND (#1 = 2))
 
 EOF
 
-# Don't inline binary expressions not having a leaf argument.
+# This test was testing our earlier heuristics for when can push_filters_through_map inline a Map expression.
+# (Which was to not inline binary expressions not having a leaf argument.) This has changed with
+# https://github.com/MaterializeInc/materialize/pull/22098, so now we inline in this test.
 
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
   SELECT a FROM (SELECT a, (a + 1) = (u + 3) AS cond FROM x) WHERE NOT(cond)
 ----
 Explained Query:
   Project (#0) // { arity: 1 }
     Filter ((#0 + 1) != (#1 + 3)) // { arity: 3 }
-      Get materialize.public.x // { arity: 3 }
+      ReadStorage materialize.public.x // { arity: 3 }
+
+Source materialize.public.x
+  filter=(((#0 + 1) != (#1 + 3)))
 
 EOF
 
-# We can push down b = 3, since it only refers to input columns. We can't push
-# down c = 3 since the computation of c refers to mapped columns.
+# Similar to the above: we push everything here since
+# https://github.com/MaterializeInc/materialize/pull/22098
 
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
   SELECT * FROM
     (SELECT a, b, b+1 as c FROM
       (SELECT a, a+1 as b FROM y))
@@ -90,10 +90,11 @@ WHERE b = 3 AND c = 3
 Explained Query:
   Filter (#1 = 3) AND (#2 = 3) // { arity: 3 }
     Map ((#0 + 1), (#1 + 1)) // { arity: 3 }
-      Get materialize.public.y // { arity: 1 }
+      ReadStorage materialize.public.y // { arity: 1 }
 
 Source materialize.public.y
-  filter=((3 = (#0 + 1)))
+  filter=((3 = #1) AND (3 = (#1 + 1)))
+  map=((#0 + 1))
 
 EOF
 
@@ -105,7 +106,7 @@ SELECT a FROM (SELECT DISTINCT a FROM x UNION ALL SELECT a FROM y) WHERE a = 3
 ----
 Filter (#0 = 3) // { arity: 1 }
   Union // { arity: 1 }
-    Distinct group_by=[#0] // { arity: 1 }
+    Distinct project=[#0] // { arity: 1 }
       Project (#0) // { arity: 1 }
         CrossJoin // { arity: 3 }
           Constant // { arity: 0 }
@@ -119,18 +120,18 @@ Filter (#0 = 3) // { arity: 1 }
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 SELECT a FROM (SELECT DISTINCT a FROM x UNION ALL SELECT a FROM y) WHERE a = 3
 ----
 Explained Query:
   Union // { arity: 1 }
     Map (3) // { arity: 1 }
-      Distinct // { arity: 0 }
+      Distinct project=[] // { arity: 0 }
         Project () // { arity: 0 }
           Filter (#0 = 3) // { arity: 3 }
-            Get materialize.public.x // { arity: 3 }
+            ReadStorage materialize.public.x // { arity: 3 }
     Filter (#0 = 3) // { arity: 1 }
-      Get materialize.public.y // { arity: 1 }
+      ReadStorage materialize.public.y // { arity: 1 }
 
 Source materialize.public.x
   filter=((#0 = 3))
@@ -147,7 +148,7 @@ CREATE TABLE t2 (f1 integer, f2 integer)
 
 # redundant equivalence is pushed down to all join branches and removed
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 SELECT * FROM t1, t2 WHERE t1.f1 = t2.f1 AND t1.f2 = t2.f2 AND t1.f1 + t2.f2 = t2.f1 + t1.f2;
 ----
 Explained Query:
@@ -157,10 +158,10 @@ Explained Query:
         %0:t1[#0, #1]KK » %1:t2[#0, #1]KK
       ArrangeBy keys=[[#0, #1]] // { arity: 2 }
         Filter (#0) IS NOT NULL AND (#1) IS NOT NULL // { arity: 2 }
-          Get materialize.public.t1 // { arity: 2 }
+          ReadStorage materialize.public.t1 // { arity: 2 }
       ArrangeBy keys=[[#0, #1]] // { arity: 2 }
         Filter (#0) IS NOT NULL AND (#1) IS NOT NULL // { arity: 2 }
-          Get materialize.public.t2 // { arity: 2 }
+          ReadStorage materialize.public.t2 // { arity: 2 }
 
 Source materialize.public.t1
   filter=((#0) IS NOT NULL AND (#1) IS NOT NULL)
@@ -171,7 +172,7 @@ EOF
 
 # #7684 avoidable cross joins
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 select * from t1, t2 where t1.f1 = t2.f1 + 1 or (t1.f1 is null and t2.f1 is null);
 ----
 Explained Query:
@@ -179,14 +180,14 @@ Explained Query:
     implementation
       %0:t1[#0]K » %1:t2[(#0 + 1)]K
     ArrangeBy keys=[[#0]] // { arity: 2 }
-      Get materialize.public.t1 // { arity: 2 }
+      ReadStorage materialize.public.t1 // { arity: 2 }
     ArrangeBy keys=[[(#0 + 1)]] // { arity: 2 }
-      Get materialize.public.t2 // { arity: 2 }
+      ReadStorage materialize.public.t2 // { arity: 2 }
 
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 select * from t1, t2 where t1.f1 = t2.f1 + 1 or (t1.f1 is null and (t2.f1 + 1) is null);
 ----
 Explained Query:
@@ -194,14 +195,14 @@ Explained Query:
     implementation
       %0:t1[#0]K » %1:t2[(#0 + 1)]K
     ArrangeBy keys=[[#0]] // { arity: 2 }
-      Get materialize.public.t1 // { arity: 2 }
+      ReadStorage materialize.public.t1 // { arity: 2 }
     ArrangeBy keys=[[(#0 + 1)]] // { arity: 2 }
-      Get materialize.public.t2 // { arity: 2 }
+      ReadStorage materialize.public.t2 // { arity: 2 }
 
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 select * from t1, t2 where t2.f1 = t1.f1 + 1 or (t1.f1 is null and (t2.f1 + 1) is null);
 ----
 Explained Query:
@@ -209,14 +210,14 @@ Explained Query:
     implementation
       %0:t1[(#0 + 1)]K » %1:t2[#0]K
     ArrangeBy keys=[[(#0 + 1)]] // { arity: 2 }
-      Get materialize.public.t1 // { arity: 2 }
+      ReadStorage materialize.public.t1 // { arity: 2 }
     ArrangeBy keys=[[#0]] // { arity: 2 }
-      Get materialize.public.t2 // { arity: 2 }
+      ReadStorage materialize.public.t2 // { arity: 2 }
 
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 select * from t1, t2 where t2.f1 = t1.f1 + 1 or (t1.f1 is null and ((t2.f1 + 1) is null and t1.f1 is null));
 ----
 Explained Query:
@@ -224,16 +225,16 @@ Explained Query:
     implementation
       %0:t1[(#0 + 1)]K » %1:t2[#0]K
     ArrangeBy keys=[[(#0 + 1)]] // { arity: 2 }
-      Get materialize.public.t1 // { arity: 2 }
+      ReadStorage materialize.public.t1 // { arity: 2 }
     ArrangeBy keys=[[#0]] // { arity: 2 }
-      Get materialize.public.t2 // { arity: 2 }
+      ReadStorage materialize.public.t2 // { arity: 2 }
 
 EOF
 
 # Join-Dependent Predicate Duplication (JoinInputMapper::consequence_for_input)
 
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 SELECT * FROM t1, t2 WHERE t1.f1 = t2.f1 AND ((t1.f2 = 3 AND t2.f2 = 4) OR (t1.f2 = 5 AND t2.f2 = 6));
 ----
 Explained Query:
@@ -244,10 +245,10 @@ Explained Query:
           %0:t1[#0]Kef » %1:t2[#0]Kef
         ArrangeBy keys=[[#0]] // { arity: 2 }
           Filter (#0) IS NOT NULL AND ((#1 = 3) OR (#1 = 5)) // { arity: 2 }
-            Get materialize.public.t1 // { arity: 2 }
+            ReadStorage materialize.public.t1 // { arity: 2 }
         ArrangeBy keys=[[#0]] // { arity: 2 }
           Filter (#0) IS NOT NULL AND ((#1 = 4) OR (#1 = 6)) // { arity: 2 }
-            Get materialize.public.t2 // { arity: 2 }
+            ReadStorage materialize.public.t2 // { arity: 2 }
 
 Source materialize.public.t1
   filter=((#0) IS NOT NULL AND ((#1 = 3) OR (#1 = 5)))
@@ -257,7 +258,7 @@ Source materialize.public.t2
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 SELECT * FROM t1, t2 WHERE t1.f1 = t2.f1 AND ((t1.f2 = 3 AND t2.f2 = 4) OR t1.f2 = 5);
 ----
 Explained Query:
@@ -268,10 +269,10 @@ Explained Query:
           %0:t1[#0]Kef » %1:t2[#0]Kef
         ArrangeBy keys=[[#0]] // { arity: 2 }
           Filter (#0) IS NOT NULL AND ((#1 = 3) OR (#1 = 5)) // { arity: 2 }
-            Get materialize.public.t1 // { arity: 2 }
+            ReadStorage materialize.public.t1 // { arity: 2 }
         ArrangeBy keys=[[#0]] // { arity: 2 }
           Filter (#0) IS NOT NULL // { arity: 2 }
-            Get materialize.public.t2 // { arity: 2 }
+            ReadStorage materialize.public.t2 // { arity: 2 }
 
 Source materialize.public.t1
   filter=((#0) IS NOT NULL AND ((#1 = 3) OR (#1 = 5)))
@@ -281,7 +282,7 @@ Source materialize.public.t2
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls)
+EXPLAIN WITH(arity, join implementations)
 SELECT * FROM t1, t2
 WHERE t1.f2 = 27 OR (t1.f2 <= 1995 AND t1.f1 = t2.f1);
 ----
@@ -292,9 +293,9 @@ Explained Query:
         %0:t1[×]eiif » %1:t2[×]eiif
       ArrangeBy keys=[[]] // { arity: 2 }
         Filter ((#1 = 27) OR (#1 <= 1995)) // { arity: 2 }
-          Get materialize.public.t1 // { arity: 2 }
+          ReadStorage materialize.public.t1 // { arity: 2 }
       ArrangeBy keys=[[]] // { arity: 2 }
-        Get materialize.public.t2 // { arity: 2 }
+        ReadStorage materialize.public.t2 // { arity: 2 }
 
 Source materialize.public.t1
   filter=(((#1 = 27) OR (#1 <= 1995)))
@@ -329,13 +330,15 @@ Explained Query:
     Get::PassArrangements materialize.public.t1
       raw=false
       arrangements[0]={ key=[#0], permutation=id, thinning=(#1) }
+      types=[integer?, integer?]
     Get::PassArrangements materialize.public.t2
       raw=false
       arrangements[0]={ key=[#0], permutation=id, thinning=(#1) }
+      types=[integer?, integer?]
 
 Used Indexes:
-  - materialize.public.t1_f1_ind
-  - materialize.public.t2_f1_ind
+  - materialize.public.t1_f1_ind (differential join)
+  - materialize.public.t2_f1_ind (differential join)
 
 EOF
 
@@ -348,7 +351,7 @@ statement ok
 CREATE TABLE tt2 (f1 DOUBLE PRECISION, f2 DOUBLE PRECISION NOT NULL);
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT *
+EXPLAIN WITH(arity, join implementations) SELECT *
 FROM tt2 ,
 (
     SELECT AVG(1) AS f1 , COUNT (1) AS f2
@@ -365,7 +368,7 @@ Explained Query (fast path):
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT
+EXPLAIN WITH(arity, join implementations) SELECT
         s.name, r.name
 FROM
         mz_schemas s,
@@ -381,20 +384,20 @@ Explained Query:
           %1[#0]Kef » %0:mz_schemas[#0]Kef
         ArrangeBy keys=[[#0]] // { arity: 2 }
           Project (#0, #3) // { arity: 2 }
-            Get mz_catalog.mz_schemas // { arity: 6 }
+            ReadIndex on=mz_schemas mz_show_schemas_ind=[*** full scan ***] // { arity: 6 }
         ArrangeBy keys=[[#0]] // { arity: 3 }
           Union // { arity: 3 }
-            Project (#2, #3, #7) // { arity: 3 }
-              Map ("view") // { arity: 8 }
-                Get mz_catalog.mz_views // { arity: 7 }
-            Project (#2, #3, #8) // { arity: 3 }
-              Map ("materialized-view") // { arity: 9 }
-                Get mz_catalog.mz_materialized_views // { arity: 8 }
+            Project (#2, #3, #9) // { arity: 3 }
+              Map ("view") // { arity: 10 }
+                ReadIndex on=mz_views mz_show_views_ind=[*** full scan ***] // { arity: 9 }
+            Project (#2, #3, #10) // { arity: 3 }
+              Map ("materialized-view") // { arity: 11 }
+                ReadIndex on=mz_materialized_views mz_materialized_views_ind=[*** full scan ***] // { arity: 10 }
 
-Source mz_catalog.mz_views
-  filter=(true)
-Source mz_catalog.mz_materialized_views
-  filter=(true)
+Used Indexes:
+  - mz_internal.mz_show_schemas_ind (*** full scan ***)
+  - mz_internal.mz_show_views_ind (*** full scan ***)
+  - mz_internal.mz_materialized_views_ind (*** full scan ***)
 
 EOF
 
@@ -414,10 +417,10 @@ Explained Query:
         Union
           Project (#0)
             Filter (#0 = 5)
-              Get materialize.public.x
+              ReadStorage materialize.public.x
           Negate
             Filter (#0 = 5)
-              Get materialize.public.y
+              ReadStorage materialize.public.y
 
 Source materialize.public.x
   filter=((#0 = 5))
@@ -442,16 +445,16 @@ Explained Query:
             Project (#0)
               Join on=(#0 = #1) type=differential
                 ArrangeBy keys=[[#0]]
-                  Distinct group_by=[#0]
+                  Distinct project=[#0]
                     Get l0
                 ArrangeBy keys=[[#0]]
                   Project (#0)
                     Filter ((#0 = 41) OR (#0 = 42))
-                      Get materialize.public.x
+                      ReadStorage materialize.public.x
   With
     cte l0 =
       Filter ((#0 = 41) OR (#0 = 42))
-        Get materialize.public.y
+        ReadStorage materialize.public.y
 
 Source materialize.public.x
   filter=(((#0 = 41) OR (#0 = 42)))
@@ -463,8 +466,18 @@ EOF
 # One more for https://github.com/MaterializeInc/materialize/issues/16128
 # https://github.com/MaterializeInc/materialize/pull/16147#issuecomment-1322042176
 
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET enable_rbac_checks TO false;
+----
+COMPLETE 0
+
 statement ok
 DROP SCHEMA public CASCADE ;
+
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM RESET enable_rbac_checks;
+----
+COMPLETE 0
 
 statement ok
 CREATE SCHEMA public ;
@@ -546,7 +559,7 @@ Explained Query:
       Union
         Project (#0)
           Filter (#0 < 5)
-            Get materialize.public.init
+            ReadStorage materialize.public.init
         Filter (#0 < 5)
           Get l2
 
@@ -594,7 +607,7 @@ Explained Query:
     cte l0 =
       Union
         Project (#0)
-          Get materialize.public.init
+          ReadStorage materialize.public.init
         Get l2
 
 EOF
@@ -637,7 +650,7 @@ Explained Query:
     cte l0 =
       Union
         Project (#0)
-          Get materialize.public.init
+          ReadStorage materialize.public.init
         Get l2
 
 EOF
@@ -668,7 +681,7 @@ SELECT * FROM ((SELECT * FROM c2) UNION (SELECT * FROM c0));
 ----
 Explained Query:
   Return
-    Distinct group_by=[#0]
+    Distinct project=[#0]
       Union
         Get l2
         Get l0
@@ -687,7 +700,7 @@ Explained Query:
     cte l0 =
       Union
         Project (#0)
-          Get materialize.public.init
+          ReadStorage materialize.public.init
         Get l2
 
 EOF
@@ -732,7 +745,7 @@ Explained Query:
     cte l0 =
       Union
         Project (#0)
-          Get materialize.public.init
+          ReadStorage materialize.public.init
         Filter (#0 > 7)
           Get l2
 
@@ -781,7 +794,7 @@ Explained Query:
     cte l0 =
       Union
         Project (#0)
-          Get materialize.public.init
+          ReadStorage materialize.public.init
         Get l2
 
 EOF
@@ -827,7 +840,7 @@ Explained Query:
     cte l0 =
       Union
         Project (#0)
-          Get materialize.public.init
+          ReadStorage materialize.public.init
         Filter (#0 < 3)
           Get l2
 
@@ -849,7 +862,7 @@ with
                     object_type = 'cluster-replica' AND event_type = 'create'
             )
         SELECT
-            mz_internal.mz_error_if_null(
+            mz_unsafe.mz_error_if_null(
                     mz_cluster_replica_sizes.credits_per_hour, 'Replica of unknown size'
                 )
                 AS credits_per_hour
@@ -861,3 +874,131 @@ with
   )
 select * from v1
 WHERE credits_per_hour > credits_per_hour;
+
+# Regression test for https://github.com/MaterializeInc/materialize/issues/20199
+
+statement ok
+CREATE ROLE r2;
+
+statement ok
+SELECT
+    member.name AS grantee,
+    role.name AS role_name
+FROM mz_role_members membership
+JOIN mz_roles role ON membership.role_id = role.id
+JOIN mz_roles member ON membership.member = member.id
+WHERE pg_has_role('r2', member.oid, 'USAGE');
+
+query error db error: ERROR: role "r555" does not exist
+SELECT
+    member.name AS grantee,
+    role.name AS role_name
+FROM mz_role_members membership
+JOIN mz_roles role ON membership.role_id = role.id
+JOIN mz_roles member ON membership.member = member.id
+WHERE pg_has_role('r555', member.oid, 'USAGE');
+
+query error db error: ERROR: role "aaa" does not exist
+select * from (select 'aaa' as aaa) where pg_has_role('r2', aaa, 'USAGE');
+
+# Test when `push_filters_through_map` needs to do several inlining steps on top of each other
+
+statement ok
+CREATE TABLE t(x int, y int);
+
+query T multiline
+EXPLAIN
+SELECT *
+FROM (
+  SELECT x, y, x*y as z1, x*y + 1 AS z2
+  FROM t
+)
+WHERE z2 > 5;
+----
+Explained Query:
+  Filter (#3 > 5)
+    Map ((#0 * #1), (#2 + 1))
+      ReadStorage materialize.public.t
+
+Source materialize.public.t
+  filter=((((#0 * #1) + 1) > 5))
+
+EOF
+
+# Regression test for https://github.com/MaterializeInc/materialize/issues/22257
+# The transitive closure computation in `inline_if_not_too_big` has to do more than one step here. For this, later map
+# expressions should mention only the previous map expression, but not earlier ones. Also, there has to be at least
+# 3 map expressions, so that adding the support of the last one doesn't immediately cover all of the map expressions.
+query T multiline
+EXPLAIN
+SELECT * FROM (
+  SELECT z2 * 4 AS z3
+  FROM (
+    SELECT z1 + 1 AS z2
+    FROM (
+      SELECT x, y, x*y AS z1
+      FROM t
+    )
+  )
+)
+WHERE z3 > 5;
+----
+Explained Query:
+  Project (#2)
+    Filter (#2 > 5)
+      Map ((((#0 * #1) + 1) * 4))
+        ReadStorage materialize.public.t
+
+Source materialize.public.t
+  filter=(((((#0 * #1) + 1) * 4) > 5))
+
+EOF
+
+# Test when `push_filters_through_map` runs into the inlining limit: The source shouldn't have the filter pushed down
+# into it.
+query T multiline
+EXPLAIN
+SELECT * FROM (
+  SELECT * FROM (
+    SELECT *, x + y + z1 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 AS r1
+    FROM (
+      SELECT x, y, x*y as z1, x*y + 1 AS z2
+      FROM t
+    )
+  )
+)
+WHERE r1 * r1 * r1 * r1 * r1 * r1 * r1 * r1 * r1 * r1 * r1 * r1 * r1 > 5;
+----
+Explained Query:
+  Filter (((((((((((((#4 * #4) * #4) * #4) * #4) * #4) * #4) * #4) * #4) * #4) * #4) * #4) * #4) > 5)
+    Map ((#0 * #1), (#2 + 1), ((((((((((((((((((((((((((#0 + #1) + #2) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3))
+      ReadStorage materialize.public.t
+
+EOF
+
+# Similar test as above, but a bit smaller, so we are below the inlining limit. The source should get the pushdown.
+# Also adds more predicates to test a bit more scenarios.
+# Also tests that MFP CSE happens for the MFP that is in the source.
+query T multiline
+EXPLAIN
+SELECT * FROM (
+  SELECT * FROM (
+    SELECT *, x + y + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z2 + z1 AS r1
+    FROM (
+      SELECT x, y, x*y as z1, x*y + 1 AS z2
+      FROM t
+    )
+  )
+)
+WHERE r1 * r1 * r1 * r1 > 5 AND r1 * x * z2 * r1 < z2 * z1 + y AND x < y AND z2 > z1 AND z1 > z2 + r1 + r1;
+----
+Explained Query:
+  Filter (#0 < #1) AND (#3 > #2) AND (#2 > ((#3 + #4) + #4)) AND ((((#4 * #4) * #4) * #4) > 5) AND ((((#4 * #0) * #3) * #4) < ((#3 * #2) + #1))
+    Map ((#0 * #1), (#2 + 1), ((((((((((((((((((((((((((#0 + #1) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #2))
+      ReadStorage materialize.public.t
+
+Source materialize.public.t
+  filter=((#0 < #1) AND (#3 > #2) AND ((((#4 * #0) * #3) * #4) < ((#3 * #2) + #1)) AND (#2 > ((#3 + #4) + #4)) AND ((((#4 * #4) * #4) * #4) > 5))
+  map=((#0 * #1), (#2 + 1), ((((((((((((((((((((((((((#0 + #1) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #3) + #2))
+
+EOF

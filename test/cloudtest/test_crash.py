@@ -10,14 +10,13 @@
 
 import subprocess
 from textwrap import dedent
-from typing import Tuple
 
 from kubernetes.client import V1Pod, V1StatefulSet
 from pg8000.exceptions import InterfaceError
 
 from materialize.cloudtest.app.materialize_application import MaterializeApplication
-from materialize.cloudtest.k8s import cluster_pod_name
-from materialize.cloudtest.wait import wait
+from materialize.cloudtest.util.cluster import cluster_pod_name
+from materialize.cloudtest.util.wait import wait
 
 
 def populate(mz: MaterializeApplication, seed: int) -> None:
@@ -32,15 +31,15 @@ def populate(mz: MaterializeApplication, seed: int) -> None:
 
             > INSERT INTO t1 VALUES (234);
 
-            > CREATE CONNECTION kafka TO KAFKA (BROKER '${testdrive.kafka-addr}')
+            > CREATE CONNECTION kafka TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT)
+
+            $ kafka-create-topic topic=crash
 
             > CREATE SOURCE s1
               FROM KAFKA CONNECTION kafka
               (TOPIC 'testdrive-crash-${testdrive.seed}')
               FORMAT BYTES
               ENVELOPE NONE;
-
-            $ kafka-create-topic topic=crash
 
             $ kafka-ingest format=bytes topic=crash
             CDE
@@ -111,10 +110,10 @@ def test_crash_environmentd(mz: MaterializeApplication) -> None:
         assert p.status.container_statuses is not None
         return p.status.container_statuses[0].restart_count
 
-    def get_replica() -> Tuple[V1Pod, V1StatefulSet]:
+    def get_replica() -> tuple[V1Pod, V1StatefulSet]:
         """Find the stateful set for the replica of the default cluster"""
-        compute_pod_name = "cluster-u1-replica-1-0"
-        ss_name = "cluster-u1-replica-1"
+        compute_pod_name = "cluster-u1-replica-u1-0"
+        ss_name = "cluster-u1-replica-u1"
         compute_pod = mz.environmentd.api().read_namespaced_pod(
             compute_pod_name, mz.environmentd.namespace()
         )
@@ -131,7 +130,7 @@ def test_crash_environmentd(mz: MaterializeApplication) -> None:
     before = get_replica()
 
     try:
-        mz.environmentd.sql("SELECT mz_internal.mz_panic('forced panic')")
+        mz.environmentd.sql("SELECT mz_unsafe.mz_panic('forced panic')")
     except InterfaceError:
         pass
     validate(mz, 2)
@@ -155,7 +154,7 @@ def test_crash_clusterd(mz: MaterializeApplication) -> None:
     )
     mz.environmentd.sql("CREATE TABLE crash_table (f1 TEXT)")
     mz.environmentd.sql(
-        "CREATE MATERIALIZED VIEW crash_view AS SELECT mz_internal.mz_panic(f1) FROM crash_table"
+        "CREATE MATERIALIZED VIEW crash_view AS SELECT mz_unsafe.mz_panic(f1) FROM crash_table"
     )
     mz.environmentd.sql("INSERT INTO crash_table VALUES ('forced panic')")
 

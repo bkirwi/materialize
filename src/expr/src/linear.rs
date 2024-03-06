@@ -34,7 +34,7 @@ include!(concat!(env!("OUT_DIR"), "/mz_expr.linear.rs"));
 /// expressions in `self.expressions`, even though this is not something
 /// we can directly evaluate. The plan creation methods will defensively
 /// ensure that the right thing happens.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, Ord, PartialOrd)]
 pub struct MapFilterProject {
     /// A sequence of expressions that should be appended to the row.
     ///
@@ -135,7 +135,7 @@ impl Display for MapFilterProject {
         writeln!(f, "  predicates:")?;
         self.predicates
             .iter()
-            .try_for_each(|(before, p)| write!(f, "    <before: {}> {},", before, p))?;
+            .try_for_each(|(before, p)| writeln!(f, "    <before: {}> {},", before, p))?;
         writeln!(f, "  projection: {:?}", self.projection)?;
         writeln!(f, "  input_arity: {}", self.input_arity)?;
         writeln!(f, ")")
@@ -889,23 +889,66 @@ impl MapFilterProject {
     /// );
     /// ```
     pub fn optimize(&mut self) {
-        // Optimization memoizes individual `ScalarExpr` expressions that
-        // are sure to be evaluated, canonicalizes references to the first
-        // occurrence of each, inlines expressions that have a reference
-        // count of one, and then removes any expressions that are not
-        // referenced.
-        self.memoize_expressions();
-        self.predicates.sort();
-        self.predicates.dedup();
-        self.inline_expressions();
-        self.remove_undemanded();
+        // Track sizes and iterate as long as they decrease.
+        let mut prev_size = None;
+        let mut self_size = usize::max_value();
+        // Continue as long as strict improvements occur.
+        while prev_size.map(|p| self_size < p).unwrap_or(true) {
+            // Lock in current size.
+            prev_size = Some(self_size);
 
-        // Re-build `self` from parts to restore evaluation order invariants.
-        let (map, filter, project) = self.as_map_filter_project();
-        *self = Self::new(self.input_arity)
-            .map(map)
-            .filter(filter)
-            .project(project);
+            // We have an annoying pattern of mapping literals that already exist as columns (by filters).
+            // Try to identify this pattern, of a map that introduces an expression equated to a prior column,
+            // and then replace the mapped expression by a column reference.
+            for (index, expr) in self.expressions.iter_mut().enumerate() {
+                // If `expr` matches a filter equating it to a column < index + input_arity, rewrite it
+                for (_, predicate) in self.predicates.iter() {
+                    if let MirScalarExpr::CallBinary {
+                        func: crate::BinaryFunc::Eq,
+                        expr1,
+                        expr2,
+                    } = predicate
+                    {
+                        if let MirScalarExpr::Column(c) = &**expr1 {
+                            if *c < index + self.input_arity && &**expr2 == expr {
+                                *expr = MirScalarExpr::Column(*c);
+                            }
+                        }
+                        if let MirScalarExpr::Column(c) = &**expr2 {
+                            if *c < index + self.input_arity && &**expr1 == expr {
+                                *expr = MirScalarExpr::Column(*c);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Optimization memoizes individual `ScalarExpr` expressions that
+            // are sure to be evaluated, canonicalizes references to the first
+            // occurrence of each, inlines expressions that have a reference
+            // count of one, and then removes any expressions that are not
+            // referenced.
+            self.memoize_expressions();
+            self.predicates.sort();
+            self.predicates.dedup();
+            self.inline_expressions();
+            self.remove_undemanded();
+
+            // Re-build `self` from parts to restore evaluation order invariants.
+            let (map, filter, project) = self.as_map_filter_project();
+            *self = Self::new(self.input_arity)
+                .map(map)
+                .filter(filter)
+                .project(project);
+
+            self_size = self.size();
+        }
+    }
+
+    /// Total expression sizes across all expressions.
+    pub fn size(&self) -> usize {
+        self.expressions.iter().map(|e| e.size()).sum::<usize>()
+            + self.predicates.iter().map(|(_, e)| e.size()).sum::<usize>()
     }
 
     /// Place each certainly evaluated expression in its own column.
@@ -1054,6 +1097,11 @@ impl MapFilterProject {
         for proj in self.projection.iter_mut() {
             *proj = remaps[proj];
         }
+
+        // Restore predicate order invariants.
+        for (pos, pred) in self.predicates.iter_mut() {
+            *pos = pred.support().into_iter().max().map(|x| x + 1).unwrap_or(0);
+        }
     }
 
     /// This method inlines expressions with a single use.
@@ -1119,14 +1167,18 @@ impl MapFilterProject {
         let mut reference_count = vec![0; input_arity + self.expressions.len()];
         // Increment reference counts for each use
         for expr in self.expressions.iter() {
-            for col in expr.support().into_iter() {
-                reference_count[col] += 1;
-            }
+            expr.visit_pre(|e| {
+                if let MirScalarExpr::Column(i) = e {
+                    reference_count[*i] += 1;
+                }
+            });
         }
         for (_, pred) in self.predicates.iter() {
-            for col in pred.support().into_iter() {
-                reference_count[col] += 1;
-            }
+            pred.visit_pre(|e| {
+                if let MirScalarExpr::Column(i) = e {
+                    reference_count[*i] += 1;
+                }
+            });
         }
         for proj in self.projection.iter() {
             reference_count[*proj] += 1;
@@ -1313,8 +1365,17 @@ pub fn memoize_expr(
         },
         &mut |e| {
             match e {
-                MirScalarExpr::Column(_) | MirScalarExpr::Literal(_, _) => {
+                MirScalarExpr::Literal(_, _) => {
                     // Literals do not need to be memoized.
+                }
+                MirScalarExpr::Column(col) => {
+                    // Column references do not need to be memoized, but may need to be
+                    // updated if they reference a column reference themselves.
+                    if *col > input_arity {
+                        if let MirScalarExpr::Column(col2) = memoized_parts[*col - input_arity] {
+                            *col = col2;
+                        }
+                    }
                 }
                 _ => {
                     if let Some(position) = memoized_parts.iter().position(|e2| e2 == e) {
@@ -1437,7 +1498,7 @@ pub mod plan {
     };
 
     /// A wrapper type which indicates it is safe to simply evaluate all expressions.
-    #[derive(Arbitrary, Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+    #[derive(Arbitrary, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
     pub struct SafeMfpPlan {
         pub(crate) mfp: MapFilterProject,
     }
@@ -1476,11 +1537,11 @@ pub mod plan {
         /// The `row` is not cleared first, but emptied if the function
         /// returns `Ok(Some(row)).
         #[inline(always)]
-        pub fn evaluate_into<'a>(
+        pub fn evaluate_into<'a, 'row>(
             &'a self,
             datums: &mut Vec<Datum<'a>>,
             arena: &'a RowArena,
-            row_buf: &'a mut Row,
+            row_buf: &'row mut Row,
         ) -> Result<Option<Row>, EvalError> {
             let passed_predicates = self.evaluate_inner(datums, arena)?;
             if !passed_predicates {
@@ -1541,6 +1602,11 @@ pub mod plan {
         pub fn could_error(&self) -> bool {
             self.mfp.predicates.iter().any(|(_pos, e)| e.could_error())
                 || self.mfp.expressions.iter().any(|e| e.could_error())
+        }
+
+        /// Returns true when `Self` is the identity.
+        pub fn is_identity(&self) -> bool {
+            self.mfp.is_identity()
         }
     }
 
@@ -1771,13 +1837,11 @@ pub mod plan {
         {
             match self.mfp.evaluate_inner(datums, arena) {
                 Err(e) => {
-                    return Some(Err((e.into(), time, diff)))
-                        .into_iter()
-                        .chain(None.into_iter());
+                    return Some(Err((e.into(), time, diff))).into_iter().chain(None);
                 }
                 Ok(true) => {}
                 Ok(false) => {
-                    return None.into_iter().chain(None.into_iter());
+                    return None.into_iter().chain(None);
                 }
             }
 
@@ -1812,7 +1876,7 @@ pub mod plan {
 
             // If the lower bound exceeds our `until` frontier, it should not appear in the output.
             if !valid_time(&lower_bound) {
-                return None.into_iter().chain(None.into_iter());
+                return None.into_iter().chain(None);
             }
 
             // If there are any upper bounds, determine the minimum upper bound.
@@ -1866,9 +1930,9 @@ pub mod plan {
                 let upper_opt =
                     upper_bound.map(|upper_bound| Ok((row_builder.clone(), upper_bound, -diff)));
                 let lower = Some(Ok((row_builder.clone(), lower_bound, diff)));
-                lower.into_iter().chain(upper_opt.into_iter())
+                lower.into_iter().chain(upper_opt)
             } else {
-                None.into_iter().chain(None.into_iter())
+                None.into_iter().chain(None)
             }
         }
 
@@ -1893,6 +1957,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
         #[mz_ore::test]
+        #[cfg_attr(miri, ignore)] // too slow
         fn mfp_plan_protobuf_roundtrip(expect in any::<MfpPlan>()) {
             let actual = protobuf_roundtrip::<_, ProtoMfpPlan>(&expect);
             assert!(actual.is_ok());

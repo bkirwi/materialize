@@ -23,6 +23,7 @@ use mz_persist_types::dyn_col::DynColumnRef;
 use mz_persist_types::dyn_struct::{ColumnsMut, ColumnsRef, DynStructCfg, ValidityRef};
 use mz_persist_types::stats::{AtomicBytesStats, BytesStats, DynStats, OptionStats, StatsFn};
 use mz_persist_types::Codec;
+use mz_proto::chrono::ProtoNaiveTime;
 use mz_proto::{ProtoType, RustType, TryFromProtoError};
 use prost::Message;
 use uuid::Uuid;
@@ -32,7 +33,6 @@ use crate::adt::date::{Date, ProtoDate};
 use crate::adt::jsonb::Jsonb;
 use crate::adt::numeric::Numeric;
 use crate::adt::range::{Range, RangeInner, RangeLowerBound, RangeUpperBound};
-use crate::chrono::ProtoNaiveTime;
 use crate::row::proto_datum::DatumType;
 use crate::row::{
     ProtoArray, ProtoArrayDimension, ProtoDatum, ProtoDatumOther, ProtoDict, ProtoDictElement,
@@ -42,6 +42,7 @@ use crate::stats::{jsonb_stats_nulls, proto_datum_min_max_nulls};
 use crate::{ColumnType, Datum, RelationDesc, Row, RowPacker, ScalarType, Timestamp};
 
 impl Codec for Row {
+    type Storage = ProtoRow;
     type Schema = RelationDesc;
 
     fn codec_name() -> String {
@@ -68,8 +69,29 @@ impl Codec for Row {
     /// encoded by historical versions of Materialize back to v(TODO: Figure out
     /// our policy).
     fn decode(buf: &[u8]) -> Result<Row, String> {
-        let proto_row = ProtoRow::decode(buf).map_err(|err| err.to_string())?;
-        Row::try_from(&proto_row)
+        // NB: We could easily implement this directly instead of via
+        // `decode_from`, but do this so that we get maximal coverage of the
+        // more complicated codepath.
+        //
+        // The length of the encoded ProtoRow (i.e. `buf.len()`) doesn't perfect
+        // predict the length of the resulting Row, but it's definitely
+        // correlated, so probably a decent estimate.
+        let mut row = Row::with_capacity(buf.len());
+        <Self as Codec>::decode_from(&mut row, buf, &mut None)?;
+        Ok(row)
+    }
+
+    fn decode_from<'a>(
+        &mut self,
+        buf: &'a [u8],
+        storage: &mut Option<ProtoRow>,
+    ) -> Result<(), String> {
+        let mut proto = storage.take().unwrap_or_default();
+        proto.clear();
+        proto.merge(buf).map_err(|err| err.to_string())?;
+        let ret = self.decode_from_proto(&proto);
+        storage.replace(proto);
+        ret
     }
 }
 
@@ -115,15 +137,20 @@ impl ColumnType {
             (true, PgLegacyChar) => Some(f.call::<Option<u8>>()),
             (false, Bytes) => Some(f.call::<Vec<u8>>()),
             (true, Bytes) => Some(f.call::<Option<Vec<u8>>>()),
-            (false, String | Char { .. } | VarChar { .. }) => Some(f.call::<std::string::String>()),
-            (true, String | Char { .. } | VarChar { .. }) => {
+            (false, String | Char { .. } | VarChar { .. } | PgLegacyName) => {
+                Some(f.call::<std::string::String>())
+            }
+            (true, String | Char { .. } | VarChar { .. } | PgLegacyName) => {
                 Some(f.call::<Option<std::string::String>>())
             }
             (false, Jsonb) => Some(f.call::<crate::adt::jsonb::Jsonb>()),
             (true, Jsonb) => Some(f.call::<Option<crate::adt::jsonb::Jsonb>>()),
             (false, MzTimestamp) => Some(f.call::<crate::Timestamp>()),
             (true, MzTimestamp) => Some(f.call::<Option<crate::Timestamp>>()),
-            (_, Numeric { .. } | Time | Timestamp | TimestampTz | Interval | Uuid) => {
+            (
+                _,
+                Numeric { .. } | Time | Timestamp { .. } | TimestampTz { .. } | Interval | Uuid,
+            ) => {
                 if *nullable {
                     Some(f.call::<NullableProtoDatumToPersist>())
                 } else {
@@ -138,7 +165,8 @@ impl ColumnType {
                 | Map { .. }
                 | Int2Vector
                 | Range { .. }
-                | MzAclItem,
+                | MzAclItem
+                | AclItem,
             ) => None,
         }
     }
@@ -539,6 +567,7 @@ impl DatumEncoderT<'_> for NoStats {
 /// An implementation of [PartEncoder] for [Row].
 #[derive(Debug)]
 pub struct RowEncoder<'a> {
+    len: &'a mut usize,
     col_encoders: Vec<DatumEncoder<'a>>,
 }
 
@@ -547,10 +576,15 @@ impl<'a> RowEncoder<'a> {
     pub fn col_encoders(&mut self) -> &mut [DatumEncoder<'a>] {
         &mut self.col_encoders
     }
+
+    pub fn inc_len(&mut self) {
+        *self.len += 1;
+    }
 }
 
 impl<'a> PartEncoder<'a, Row> for RowEncoder<'a> {
     fn encode(&mut self, val: &Row) {
+        *self.len += 1;
         for (encoder, datum) in self.col_encoders.iter_mut().zip(val.iter()) {
             encoder.encode(datum);
         }
@@ -708,8 +742,8 @@ impl RelationDesc {
                 .unwrap_or_else(|| DatumEncoder::NoStats(NoStats(typ.clone())));
             col_encoders.push(col_encoder);
         }
-        let validity = part.finish()?;
-        Ok((validity, RowEncoder { col_encoders }))
+        let (len, validity) = part.finish()?;
+        Ok((validity, RowEncoder { len, col_encoders }))
     }
 }
 
@@ -833,6 +867,7 @@ impl<'a> From<Datum<'a>> for ProtoDatum {
                 }),
             })),
             Datum::MzAclItem(x) => DatumType::MzAclItem(x.into_proto()),
+            Datum::AclItem(x) => DatumType::AclItem(x.into_proto()),
         };
         ProtoDatum {
             datum_type: Some(datum_type),
@@ -841,7 +876,7 @@ impl<'a> From<Datum<'a>> for ProtoDatum {
 }
 
 impl RowPacker<'_> {
-    fn try_push_proto(&mut self, x: &ProtoDatum) -> Result<(), String> {
+    pub(crate) fn try_push_proto(&mut self, x: &ProtoDatum) -> Result<(), String> {
         match &x.datum_type {
             Some(DatumType::Other(o)) => match ProtoDatumOther::from_i32(*o) {
                 Some(ProtoDatumOther::Unknown) => return Err("unknown datum type".into()),
@@ -922,7 +957,7 @@ impl RowPacker<'_> {
                     })
                     .collect::<Vec<_>>();
                 match x.elements.as_ref() {
-                    None => self.push_array(&dims, vec![].iter()),
+                    None => self.push_array(&dims, [].iter()),
                     Some(elements) => {
                         // TODO: Could we avoid this Row alloc if we made a
                         // push_array_with?
@@ -981,6 +1016,7 @@ impl RowPacker<'_> {
                 }
             }
             Some(DatumType::MzAclItem(x)) => self.push(Datum::MzAclItem(x.clone().into_rust()?)),
+            Some(DatumType::AclItem(x)) => self.push(Datum::AclItem(x.clone().into_rust()?)),
             None => return Err("unknown datum type".into()),
         };
         Ok(())
@@ -1037,9 +1073,6 @@ mod tests {
     use crate::{ColumnType, Datum, RelationDesc, Row, ScalarType};
 
     use super::*;
-
-    // TODO: datadriven golden tests for various interesting Datums and Rows to
-    // catch any changes in the encoding.
 
     #[mz_ore::test]
     #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `decNumberFromInt32` on OS `linux`
@@ -1180,7 +1213,7 @@ mod tests {
     fn columnar_roundtrip() {
         let (schema, row) = schema_and_row();
         assert_eq!(
-            mz_persist_types::columnar::validate_roundtrip(&schema, &row),
+            mz_persist_types::columnar::validate_roundtrip(&schema, &row, false),
             Ok(())
         );
     }
@@ -1195,12 +1228,9 @@ mod tests {
     }
 
     fn scalar_type_columnar_roundtrip(scalar_type: ScalarType) {
-        // Skip types that we don't keep stats for (yet).
-        if is_no_stats_type(&scalar_type) {
-            return;
-        }
+        let skip_decode = is_no_stats_type(&scalar_type);
 
-        use mz_persist_types::parquet::validate_roundtrip;
+        use mz_persist_types::columnar::validate_roundtrip;
         let mut rows = Vec::new();
         for datum in scalar_type.interesting_datums() {
             rows.push(Row::pack(std::iter::once(datum)));
@@ -1209,14 +1239,14 @@ mod tests {
         // Non-nullable version of the column.
         let schema = RelationDesc::empty().with_column("col", scalar_type.clone().nullable(false));
         for row in rows.iter() {
-            assert_eq!(validate_roundtrip(&schema, row), Ok(()));
+            assert_eq!(validate_roundtrip(&schema, row, skip_decode), Ok(()));
         }
 
         // Nullable version of the column.
         let schema = RelationDesc::empty().with_column("col", scalar_type.nullable(true));
         rows.push(Row::pack(std::iter::once(Datum::Null)));
         for row in rows.iter() {
-            assert_eq!(validate_roundtrip(&schema, row), Ok(()));
+            assert_eq!(validate_roundtrip(&schema, row, skip_decode), Ok(()));
         }
     }
 

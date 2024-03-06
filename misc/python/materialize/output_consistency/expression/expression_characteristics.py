@@ -22,6 +22,7 @@ class ExpressionCharacteristics(Enum):
     TINY_VALUE = 102
     LARGE_VALUE = 103
     MAX_VALUE = 104
+    NAN = 105
 
     OVERSIZE = 120
     NEGATIVE = 121
@@ -30,3 +31,11 @@ class ExpressionCharacteristics(Enum):
 
     INTERVAL_WITH_MONTHS = 130
     """time interval containing months or years"""
+
+    TEXT_EMPTY = 140
+    TEXT_WITH_SPECIAL_SPACE_CHARS = 141
+    """Lines with tabulators, newlines, and further whitespace types"""
+    TEXT_WITH_BACKSLASH_CHAR = 142
+
+    JSON_EMPTY = 150
+    JSON_ARRAY = 151

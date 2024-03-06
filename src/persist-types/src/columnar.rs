@@ -41,8 +41,8 @@
 //! overhead.
 //!
 //! The Data trait has associated types for the exclusive "builder" type for the
-//! column and for the shared "reader" type. These implement also implement some
-//! common traits to make relationships between types more structured.
+//! column and for the shared "reader" type. These also implement some common traits
+//! to make relationships between types more structured.
 //!
 //! Finally, the [Schema] trait maps an implementor of [Codec] to the underlying
 //! column structure. It also provides a [PartEncoder] and [PartDecoder] for
@@ -267,6 +267,7 @@ pub trait Schema<T>: Debug + Send + Sync {
 pub fn validate_roundtrip<T: Codec + Default + PartialEq + Debug>(
     schema: &T::Schema,
     val: &T,
+    skip_decode: bool,
 ) -> Result<(), String> {
     let mut part = PartBuilder::new(schema, &UnitSchema);
     {
@@ -279,6 +280,10 @@ pub fn validate_roundtrip<T: Codec + Default + PartialEq + Debug>(
 
     // Sanity check that we can compute stats.
     let _stats = part.key_stats().expect("stats should be compute-able");
+
+    if skip_decode {
+        return Ok(());
+    }
 
     let mut actual = T::default();
     assert_eq!(part.len(), 1);

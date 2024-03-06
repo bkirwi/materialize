@@ -42,6 +42,7 @@ CommandComplete {"tag":"DROP TABLE"}
 ReadyForQuery {"status":"I"}
 CommandComplete {"tag":"CREATE DATABASE"}
 ReadyForQuery {"status":"I"}
+NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"00000"},{"typ":"M","value":"drop cascades to 1 other objects"}]}
 CommandComplete {"tag":"DROP DATABASE"}
 ReadyForQuery {"status":"I"}
 NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"42704"},{"typ":"M","value":"DATABASE \"t\" does not exist, skipping"}]}
@@ -57,7 +58,6 @@ NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"42704
 NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"42704"},{"typ":"M","value":"SCHEMA \"t\" does not exist, skipping"}]}
 CommandComplete {"tag":"DROP SCHEMA"}
 ReadyForQuery {"status":"I"}
-NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"01000"},{"typ":"M","value":"RBAC is disabled so no role attributes or object ownership will be considered when executing statements"}]}
 CommandComplete {"tag":"CREATE ROLE"}
 ReadyForQuery {"status":"I"}
 NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"42704"},{"typ":"M","value":"ROLE \"s\" does not exist, skipping"}]}
@@ -94,7 +94,6 @@ ReadyForQuery
 ReadyForQuery
 ReadyForQuery
 ----
-NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"01000"},{"typ":"M","value":"RBAC is disabled so no role attributes or object ownership will be considered when executing statements"}]}
 CommandComplete {"tag":"CREATE ROLE"}
 ReadyForQuery {"status":"I"}
 NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"42704"},{"typ":"M","value":"DATABASE \"d\" does not exist, skipping"}]}
@@ -106,8 +105,7 @@ ReadyForQuery {"status":"I"}
 NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"42704"},{"typ":"M","value":"TABLE \"t\" does not exist, skipping"}]}
 CommandComplete {"tag":"ALTER TABLE"}
 ReadyForQuery {"status":"I"}
-NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"42704"},{"typ":"M","value":"CLUSTER REPLICA \"c.r\" does not exist, skipping"}]}
-CommandComplete {"tag":"ALTER CLUSTER REPLICA"}
+ErrorResponse {"fields":[{"typ":"S","value":"ERROR"},{"typ":"C","value":"XX000"},{"typ":"M","value":"altering the owner of a cluster replica is not supported"}]}
 ReadyForQuery {"status":"I"}
 NoticeResponse {"fields":[{"typ":"S","value":"NOTICE"},{"typ":"C","value":"42704"},{"typ":"M","value":"CLUSTER \"c\" does not exist, skipping"}]}
 CommandComplete {"tag":"ALTER CLUSTER"}

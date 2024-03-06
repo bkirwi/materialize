@@ -14,13 +14,13 @@ use differential_dataflow::logging::DifferentialEvent;
 use differential_dataflow::Collection;
 use mz_compute_client::logging::{LogVariant, LoggingConfig};
 use mz_repr::{Diff, Timestamp};
-use mz_storage_client::types::errors::DataflowError;
+use mz_storage_types::errors::DataflowError;
 use mz_timely_util::operator::CollectionExt;
 use timely::communication::Allocate;
 use timely::logging::{Logger, TimelyEvent};
 use timely::progress::reachability::logging::TrackerEvent;
 
-use crate::arrangement::manager::TraceBundle;
+use crate::arrangement::manager::{SpecializedTraceHandle, TraceBundle};
 use crate::extensions::arrange::{KeyCollection, MzArrange};
 use crate::logging::compute::ComputeEvent;
 use crate::logging::reachability::ReachabilityEvent;
@@ -122,10 +122,14 @@ impl<A: Allocate + 'static> LoggingContext<'_, A> {
                 collection.mz_arrange("Arrange logging err").trace
             });
 
+        // TODO(vmarcos): If we introduce introspection sources that would match
+        // type specialization for keys, we'd need to ensure that type specialized
+        // variants reach the map below (issue #22398).
         traces
             .into_iter()
             .map(|(log, (trace, token))| {
-                let bundle = TraceBundle::new(trace, errs.clone()).with_drop(token);
+                let bundle = TraceBundle::new(SpecializedTraceHandle::RowRow(trace), errs.clone())
+                    .with_drop(token);
                 (log, bundle)
             })
             .collect()

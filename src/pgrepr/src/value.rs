@@ -14,11 +14,13 @@ use std::{io, str};
 use bytes::{BufMut, BytesMut};
 use chrono::{DateTime, NaiveDateTime, NaiveTime, Utc};
 use mz_ore::cast::ReinterpretCast;
+use mz_pgwire_common::Format;
 use mz_repr::adt::array::ArrayDimension;
 use mz_repr::adt::char;
 use mz_repr::adt::date::Date;
 use mz_repr::adt::jsonb::JsonbRef;
-use mz_repr::adt::mz_acl_item::MzAclItem;
+use mz_repr::adt::mz_acl_item::{AclItem, MzAclItem};
+use mz_repr::adt::pg_legacy_name::NAME_MAX_BYTES;
 use mz_repr::adt::range::{Range, RangeInner};
 use mz_repr::adt::timestamp::CheckedTimestamp;
 use mz_repr::strconv::{self, Nestable};
@@ -27,7 +29,7 @@ use postgres_types::{FromSql, IsNull, ToSql, Type as PgType};
 use uuid::Uuid;
 
 use crate::types::{UINT2, UINT4, UINT8};
-use crate::{Format, Interval, Jsonb, Numeric, Type, UInt2, UInt4, UInt8};
+use crate::{Interval, Jsonb, Numeric, Type, UInt2, UInt4, UInt8};
 
 pub mod interval;
 pub mod jsonb;
@@ -77,6 +79,8 @@ pub enum Value {
     List(Vec<Option<Value>>),
     /// A map of string keys and homogeneous values.
     Map(BTreeMap<String, Option<Value>>),
+    /// An identifier string of no more than 64 characters in length.
+    Name(String),
     /// An arbitrary precision number.
     Numeric(Numeric),
     /// An object identifier.
@@ -106,8 +110,12 @@ pub enum Value {
     MzTimestamp(mz_repr::Timestamp),
     /// A contiguous range of values along a domain.
     Range(Range<Box<Value>>),
-    /// A list of privileges granted to a role.
+    /// A list of privileges granted to a role, that uses [`mz_repr::role_id::RoleId`]s for role
+    /// references.
     MzAclItem(MzAclItem),
+    /// A list of privileges granted to a user that uses [`mz_repr::adt::system::Oid`]s for role
+    /// references. This type is used primarily for compatibility with PostgreSQL.
+    AclItem(AclItem),
 }
 
 impl Value {
@@ -136,10 +144,13 @@ impl Value {
             (Datum::Numeric(d), ScalarType::Numeric { .. }) => Some(Value::Numeric(Numeric(d))),
             (Datum::MzTimestamp(t), ScalarType::MzTimestamp) => Some(Value::MzTimestamp(t)),
             (Datum::MzAclItem(mai), ScalarType::MzAclItem) => Some(Value::MzAclItem(mai)),
+            (Datum::AclItem(ai), ScalarType::AclItem) => Some(Value::AclItem(ai)),
             (Datum::Date(d), ScalarType::Date) => Some(Value::Date(d)),
             (Datum::Time(t), ScalarType::Time) => Some(Value::Time(t)),
-            (Datum::Timestamp(ts), ScalarType::Timestamp) => Some(Value::Timestamp(ts)),
-            (Datum::TimestampTz(ts), ScalarType::TimestampTz) => Some(Value::TimestampTz(ts)),
+            (Datum::Timestamp(ts), ScalarType::Timestamp { .. }) => Some(Value::Timestamp(ts)),
+            (Datum::TimestampTz(ts), ScalarType::TimestampTz { .. }) => {
+                Some(Value::TimestampTz(ts))
+            }
             (Datum::Interval(iv), ScalarType::Interval) => Some(Value::Interval(Interval(iv))),
             (Datum::Bytes(b), ScalarType::Bytes) => Some(Value::Bytea(b.to_vec())),
             (Datum::String(s), ScalarType::String) => Some(Value::Text(s.to_owned())),
@@ -147,6 +158,7 @@ impl Value {
             (Datum::String(s), ScalarType::Char { length }) => {
                 Some(Value::BpChar(char::format_str_pad(s, *length)))
             }
+            (Datum::String(s), ScalarType::PgLegacyName) => Some(Value::Name(s.into())),
             (_, ScalarType::Jsonb) => {
                 Some(Value::Jsonb(Jsonb(JsonbRef::from_datum(datum).to_owned())))
             }
@@ -283,9 +295,10 @@ impl Value {
             Value::Timestamp(ts) => Datum::Timestamp(ts),
             Value::TimestampTz(ts) => Datum::TimestampTz(ts),
             Value::Interval(iv) => Datum::Interval(iv.0),
-            Value::Text(s) => Datum::String(buf.push_string(s)),
+            Value::Text(s) | Value::VarChar(s) | Value::Name(s) => {
+                Datum::String(buf.push_string(s))
+            }
             Value::BpChar(s) => Datum::String(buf.push_string(s.trim_end().into())),
-            Value::VarChar(s) => Datum::String(buf.push_string(s)),
             Value::Uuid(u) => Datum::Uuid(u),
             Value::Numeric(n) => Datum::Numeric(n.0),
             Value::MzTimestamp(t) => Datum::MzTimestamp(t),
@@ -299,6 +312,7 @@ impl Value {
                 buf.make_datum(|packer| packer.push_range(range).unwrap())
             }
             Value::MzAclItem(mz_acl_item) => Datum::MzAclItem(mz_acl_item),
+            Value::AclItem(acl_item) => Datum::AclItem(acl_item),
         }
     }
 
@@ -367,7 +381,9 @@ impl Value {
                 Some(elem) => Ok(elem.encode_text(buf.nonnull_buffer())),
             })
             .expect("provided closure never fails"),
-            Value::Text(s) | Value::VarChar(s) | Value::BpChar(s) => strconv::format_string(buf, s),
+            Value::Text(s) | Value::VarChar(s) | Value::BpChar(s) | Value::Name(s) => {
+                strconv::format_string(buf, s)
+            }
             Value::Time(t) => strconv::format_time(buf, *t),
             Value::Timestamp(ts) => strconv::format_timestamp(buf, ts),
             Value::TimestampTz(ts) => strconv::format_timestamptz(buf, ts),
@@ -380,6 +396,7 @@ impl Value {
             })
             .expect("provided closure never fails"),
             Value::MzAclItem(mz_acl_item) => strconv::format_mz_acl_item(buf, *mz_acl_item),
+            Value::AclItem(acl_item) => strconv::format_acl_item(buf, *acl_item),
         }
     }
 
@@ -468,6 +485,7 @@ impl Value {
                 // value OIDs to deal with rather than an element OID.
                 Err("binary encoding of map types is not implemented".into())
             }
+            Value::Name(s) => s.to_sql(&PgType::NAME, buf),
             Value::Oid(i) => i.to_sql(&PgType::OID, buf),
             Value::Record(fields) => {
                 let nfields = pg_len("record field length", fields.len())?;
@@ -516,6 +534,7 @@ impl Value {
                 buf.extend_from_slice(&mz_acl_item.encode_binary());
                 Ok(postgres_types::IsNull::No)
             }
+            Value::AclItem(_) => Err("aclitem has no binary encoding".into()),
         }
         .expect("encode_binary should never trigger a to_sql failure");
         if let IsNull::Yes = is_null {
@@ -546,21 +565,11 @@ impl Value {
         let s = str::from_utf8(raw)?;
         Ok(match ty {
             Type::Array(elem_type) => {
-                let elements = strconv::parse_array(
+                let (elements, dims) = strconv::parse_array(
                     s,
                     || None,
                     |elem_text| Value::decode_text(elem_type, elem_text.as_bytes()).map(Some),
                 )?;
-                // At the moment, we only support one dimensional arrays. Note
-                // that empty arrays are represented as zero dimensional arrays,
-                // per PostgreSQL.
-                let mut dims = vec![];
-                if !elements.is_empty() {
-                    dims.push(ArrayDimension {
-                        lower_bound: 1,
-                        length: elements.len(),
-                    })
-                }
                 Value::Array { dims, elements }
             }
             Type::Int2Vector { .. } => {
@@ -590,8 +599,13 @@ impl Value {
             Type::Map { value_type } => Value::Map(strconv::parse_map(
                 s,
                 matches!(**value_type, Type::Map { .. }),
-                |elem_text| Value::decode_text(value_type, elem_text.as_bytes()).map(Some),
+                |elem_text| {
+                    elem_text
+                        .map(|t| Value::decode_text(value_type, t.as_bytes()))
+                        .transpose()
+                },
             )?),
+            Type::Name => Value::Name(strconv::parse_pg_legacy_name(s)),
             Type::Numeric { .. } => Value::Numeric(Numeric(strconv::parse_numeric(s)?)),
             Type::Oid | Type::RegClass | Type::RegProc | Type::RegType => {
                 Value::Oid(strconv::parse_oid(s)?)
@@ -612,6 +626,7 @@ impl Value {
                 Value::decode_text(element_type, elem_text.as_bytes()).map(Box::new)
             })?),
             Type::MzAclItem => Value::MzAclItem(strconv::parse_mz_acl_item(s)?),
+            Type::AclItem => Value::AclItem(strconv::parse_acl_item(s)?),
         })
     }
 
@@ -643,6 +658,13 @@ impl Value {
             Type::Jsonb => Jsonb::from_sql(ty.inner(), raw).map(Value::Jsonb),
             Type::List(_) => Err("binary decoding of list types is not implemented".into()),
             Type::Map { .. } => Err("binary decoding of map types is not implemented".into()),
+            Type::Name => {
+                let s = String::from_sql(ty.inner(), raw)?;
+                if s.len() > NAME_MAX_BYTES {
+                    return Err("identifier too long".into());
+                }
+                Ok(Value::Name(s))
+            }
             Type::Numeric { .. } => Numeric::from_sql(ty.inner(), raw).map(Value::Numeric),
             Type::Oid | Type::RegClass | Type::RegProc | Type::RegType => {
                 u32::from_sql(ty.inner(), raw).map(Value::Oid)
@@ -674,6 +696,7 @@ impl Value {
                 let mz_acl_item = MzAclItem::decode_binary(raw)?;
                 Ok(Value::MzAclItem(mz_acl_item))
             }
+            Type::AclItem => Err("aclitem has no binary encoding".into()),
         }
     }
 }
@@ -705,7 +728,7 @@ fn pg_len(what: &str, len: usize) -> Result<i32, io::Error> {
 ///
 /// Calling this function is equivalent to mapping [`Value::from_datum`] over
 /// every datum in `row`.
-pub fn values_from_row(row: Row, typ: &RelationType) -> Vec<Option<Value>> {
+pub fn values_from_row(row: &Row, typ: &RelationType) -> Vec<Option<Value>> {
     row.iter()
         .zip(typ.column_types.iter())
         .map(|(col, typ)| Value::from_datum(col, &typ.scalar_type))
@@ -736,7 +759,7 @@ mod tests {
 
         assert_eq!(
             decoded_int_array.map_err(|e| e.to_string()).unwrap_err(),
-            "invalid input syntax for type array: specifying array lower bounds is not supported: \"[0:0]={t}\"".to_string()
+            "invalid input syntax for type array: Specifying array lower bounds is not supported: \"[0:0]={t}\"".to_string()
         );
     }
 }

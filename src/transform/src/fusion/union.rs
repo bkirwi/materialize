@@ -17,16 +17,15 @@ use mz_expr::MirRelationExpr;
 pub struct Union;
 
 impl crate::Transform for Union {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "union")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: crate::TransformArgs,
+        _: &mut crate::TransformCtx,
     ) -> Result<(), crate::TransformError> {
         relation.visit_mut_post(&mut Self::action)?;
         mz_repr::explain::trace_plan(&*relation);

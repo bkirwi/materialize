@@ -18,11 +18,13 @@ use anyhow::anyhow;
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
+use mz_ore::bytes::SegmentedBytes;
 use mz_ore::cast::CastFrom;
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Blob, SeqNo};
 use mz_persist_types::{Codec, Codec64};
 use serde::{Deserialize, Serialize};
+use timely::progress::frontier::AntichainRef;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tracing::{debug_span, trace_span, Instrument};
@@ -31,8 +33,9 @@ use crate::error::InvalidUsage;
 use crate::internal::encoding::{LazyPartStats, Schemas};
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{Metrics, ReadMetrics, ShardMetrics};
-use crate::internal::paths::PartialBatchKey;
-use crate::read::{LeasedReaderId, ReadHandle};
+use crate::internal::paths::{BlobKey, PartialBatchKey};
+use crate::read::LeasedReaderId;
+use crate::stats::PartStats;
 use crate::ShardId;
 
 /// Capable of fetching [`LeasedBatchPart`] while not holding any capabilities.
@@ -63,19 +66,6 @@ where
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
-    pub(crate) async fn new(handle: ReadHandle<K, V, T, D>) -> Self {
-        let b = BatchFetcher {
-            blob: Arc::clone(&handle.blob),
-            metrics: Arc::clone(&handle.metrics),
-            shard_metrics: Arc::clone(&handle.machine.applier.shard_metrics),
-            shard_id: handle.machine.shard_id(),
-            schemas: handle.schemas.clone(),
-            _phantom: PhantomData,
-        };
-        handle.expire().await;
-        b
-    }
-
     /// Takes a [`SerdeLeasedBatchPart`] into a [`LeasedBatchPart`].
     pub fn leased_part_from_exchangeable(&self, x: SerdeLeasedBatchPart) -> LeasedBatchPart<T> {
         LeasedBatchPart::from(x, Arc::clone(&self.metrics))
@@ -87,38 +77,54 @@ where
     /// returned value.
     pub async fn fetch_leased_part(
         &self,
-        part: LeasedBatchPart<T>,
-    ) -> (
-        LeasedBatchPart<T>,
-        Result<FetchedPart<K, V, T, D>, InvalidUsage<T>>,
-    ) {
+        part: &LeasedBatchPart<T>,
+    ) -> Result<FetchedBlob<K, V, T, D>, InvalidUsage<T>> {
         if &part.shard_id != &self.shard_id {
             let batch_shard = part.shard_id.clone();
-            return (
-                part,
-                Err(InvalidUsage::BatchNotFromThisShard {
-                    batch_shard,
-                    handle_shard: self.shard_id.clone(),
-                }),
-            );
+            return Err(InvalidUsage::BatchNotFromThisShard {
+                batch_shard,
+                handle_shard: self.shard_id.clone(),
+            });
         }
 
-        let (part, fetched_part) = fetch_leased_part(
-            part,
+        let value = fetch_batch_part_blob(
+            &part.shard_id,
             self.blob.as_ref(),
-            Arc::clone(&self.metrics),
-            &self.metrics.read.batch_fetcher,
+            &self.metrics,
             &self.shard_metrics,
-            None,
-            self.schemas.clone(),
+            &self.metrics.read.batch_fetcher,
+            &part.key,
         )
-        .await;
-        (part, Ok(fetched_part))
+        .await
+        .unwrap_or_else(|blob_key| {
+            // Ideally, readers should never encounter a missing blob. They place a seqno
+            // hold as they consume their snapshot/listen, preventing any blobs they need
+            // from being deleted by garbage collection, and all blob implementations are
+            // linearizable so there should be no possibility of stale reads.
+            //
+            // If we do have a bug and a reader does encounter a missing blob, the state
+            // cannot be recovered, and our best option is to panic and retry the whole
+            // process.
+            panic!("batch fetcher could not fetch batch part: {}", blob_key)
+        });
+        let fetched_blob = FetchedBlob {
+            key: part.key.0.clone(),
+            metrics: Arc::clone(&self.metrics),
+            read_metrics: self.metrics.read.batch_fetcher.clone(),
+            registered_desc: part.desc.clone(),
+            part: value,
+            schemas: self.schemas.clone(),
+            metadata: part.metadata.clone(),
+            filter_pushdown_audit: part.filter_pushdown_audit,
+            stats: part.stats.clone(),
+            _phantom: PhantomData,
+        };
+        Ok(fetched_blob)
     }
 }
 
 #[derive(Debug, Clone)]
-enum FetchBatchFilter<T> {
+pub(crate) enum FetchBatchFilter<T> {
     Snapshot {
         as_of: Antichain<T>,
     },
@@ -126,10 +132,29 @@ enum FetchBatchFilter<T> {
         as_of: Antichain<T>,
         lower: Antichain<T>,
     },
+    Compaction {
+        since: Antichain<T>,
+    },
 }
 
 impl<T: Timestamp + Lattice> FetchBatchFilter<T> {
-    fn filter_ts(&self, t: &mut T) -> bool {
+    pub(crate) fn new(meta: &SerdeLeasedBatchPartMetadata) -> Self
+    where
+        T: Codec64,
+    {
+        match &meta {
+            SerdeLeasedBatchPartMetadata::Snapshot { as_of } => {
+                let as_of = Antichain::from_iter(as_of.iter().map(|x| T::decode(*x)));
+                FetchBatchFilter::Snapshot { as_of }
+            }
+            SerdeLeasedBatchPartMetadata::Listen { as_of, lower } => {
+                let as_of = Antichain::from_iter(as_of.iter().map(|x| T::decode(*x)));
+                let lower = Antichain::from_iter(lower.iter().map(|x| T::decode(*x)));
+                FetchBatchFilter::Listen { as_of, lower }
+            }
+        }
+    }
+    pub(crate) fn filter_ts(&self, t: &mut T) -> bool {
         match self {
             FetchBatchFilter::Snapshot { as_of } => {
                 // This time is covered by a listen
@@ -157,6 +182,10 @@ impl<T: Timestamp + Lattice> FetchBatchFilter<T> {
                 }
                 true
             }
+            FetchBatchFilter::Compaction { since } => {
+                t.advance_by(since.borrow());
+                true
+            }
         }
     }
 }
@@ -166,32 +195,20 @@ impl<T: Timestamp + Lattice> FetchBatchFilter<T> {
 /// Note to check the `LeasedBatchPart` documentation for how to handle the
 /// returned value.
 pub(crate) async fn fetch_leased_part<K, V, T, D>(
-    part: LeasedBatchPart<T>,
+    part: &LeasedBatchPart<T>,
     blob: &(dyn Blob + Send + Sync),
     metrics: Arc<Metrics>,
     read_metrics: &ReadMetrics,
     shard_metrics: &ShardMetrics,
-    reader_id: Option<&LeasedReaderId>,
+    reader_id: &LeasedReaderId,
     schemas: Schemas<K, V>,
-) -> (LeasedBatchPart<T>, FetchedPart<K, V, T, D>)
+) -> FetchedPart<K, V, T, D>
 where
     K: Debug + Codec,
     V: Debug + Codec,
     T: Timestamp + Lattice + Codec64,
     D: Semigroup + Codec64 + Send + Sync,
 {
-    let ts_filter = match &part.metadata {
-        SerdeLeasedBatchPartMetadata::Snapshot { as_of } => {
-            let as_of = Antichain::from(as_of.iter().map(|x| T::decode(*x)).collect::<Vec<_>>());
-            FetchBatchFilter::Snapshot { as_of }
-        }
-        SerdeLeasedBatchPartMetadata::Listen { as_of, lower } => {
-            let as_of = Antichain::from(as_of.iter().map(|x| T::decode(*x)).collect::<Vec<_>>());
-            let lower = Antichain::from(lower.iter().map(|x| T::decode(*x)).collect::<Vec<_>>());
-            FetchBatchFilter::Listen { as_of, lower }
-        }
-    };
-
     let encoded_part = fetch_batch_part(
         &part.shard_id,
         blob,
@@ -202,7 +219,7 @@ where
         &part.desc,
     )
     .await
-    .unwrap_or_else(|err| {
+    .unwrap_or_else(|blob_key| {
         // Ideally, readers should never encounter a missing blob. They place a seqno
         // hold as they consume their snapshot/listen, preventing any blobs they need
         // from being deleted by garbage collection, and all blob implementations are
@@ -211,28 +228,72 @@ where
         // If we do have a bug and a reader does encounter a missing blob, the state
         // cannot be recovered, and our best option is to panic and retry the whole
         // process.
-        panic!(
-            "{} could not fetch batch part: {}",
-            reader_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "batch fetcher".to_string()),
-            err
-        )
+        panic!("{} could not fetch batch part: {}", reader_id, blob_key)
     });
-    let fetched_part = FetchedPart {
+    FetchedPart::new(
         metrics,
-        ts_filter,
-        part: encoded_part,
+        encoded_part,
         schemas,
-        filter_pushdown_audit: if part.filter_pushdown_audit {
-            part.stats.clone()
-        } else {
-            None
-        },
-        _phantom: PhantomData,
-    };
+        &part.metadata,
+        part.filter_pushdown_audit,
+        part.stats.as_ref(),
+    )
+}
 
-    (part, fetched_part)
+pub(crate) async fn fetch_batch_part_blob(
+    shard_id: &ShardId,
+    blob: &(dyn Blob + Send + Sync),
+    metrics: &Metrics,
+    shard_metrics: &ShardMetrics,
+    read_metrics: &ReadMetrics,
+    key: &PartialBatchKey,
+) -> Result<SegmentedBytes, BlobKey> {
+    let now = Instant::now();
+    let get_span = debug_span!("fetch_batch::get");
+    let blob_key = key.complete(shard_id);
+    let value = retry_external(&metrics.retries.external.fetch_batch_get, || async {
+        shard_metrics.blob_gets.inc();
+        blob.get(&blob_key).await
+    })
+    .instrument(get_span.clone())
+    .await
+    .ok_or(blob_key)?;
+
+    drop(get_span);
+
+    read_metrics.part_count.inc();
+    read_metrics.part_bytes.inc_by(u64::cast_from(value.len()));
+    read_metrics.seconds.inc_by(now.elapsed().as_secs_f64());
+
+    Ok(value)
+}
+
+pub(crate) fn decode_batch_part_blob<T>(
+    metrics: &Metrics,
+    read_metrics: &ReadMetrics,
+    key: &str,
+    registered_desc: Description<T>,
+    value: &SegmentedBytes,
+) -> EncodedPart<T>
+where
+    T: Timestamp + Lattice + Codec64,
+{
+    trace_span!("fetch_batch::decode").in_scope(|| {
+        let part = metrics
+            .codecs
+            .batch
+            .decode(|| BlobTraceBatchPart::decode(value, &metrics.columnar))
+            .map_err(|err| anyhow!("couldn't decode batch at key {}: {}", key, err))
+            // We received a State that we couldn't decode. This could happen if
+            // persist messes up backward/forward compatibility, if the durable
+            // data was corrupted, or if operations messes up deployment. In any
+            // case, fail loudly.
+            .expect("internal error: invalid encoded state");
+        read_metrics.part_goodbytes.inc_by(u64::cast_from(
+            part.updates.iter().map(|x| x.goodbytes()).sum::<usize>(),
+        ));
+        EncodedPart::new(key, registered_desc, part)
+    })
 }
 
 pub(crate) async fn fetch_batch_part<T>(
@@ -243,57 +304,13 @@ pub(crate) async fn fetch_batch_part<T>(
     read_metrics: &ReadMetrics,
     key: &PartialBatchKey,
     registered_desc: &Description<T>,
-) -> Result<EncodedPart<T>, anyhow::Error>
+) -> Result<EncodedPart<T>, BlobKey>
 where
     T: Timestamp + Lattice + Codec64,
 {
-    let now = Instant::now();
-    let get_span = debug_span!("fetch_batch::get");
-    let value = retry_external(&metrics.retries.external.fetch_batch_get, || async {
-        shard_metrics.blob_gets.inc();
-        blob.get(&key.complete(shard_id)).await
-    })
-    .instrument(get_span.clone())
-    .await;
-
-    let value = match value {
-        Some(v) => v,
-        None => {
-            return Err(anyhow!(
-                "unexpected missing blob: {} for shard: {}",
-                key,
-                shard_id
-            ))
-        }
-    };
-    drop(get_span);
-
-    read_metrics.part_count.inc();
-    read_metrics.part_bytes.inc_by(u64::cast_from(value.len()));
-
-    let part = trace_span!("fetch_batch::decode").in_scope(|| {
-        let part = metrics
-            .codecs
-            .batch
-            .decode(|| BlobTraceBatchPart::decode(&value))
-            .map_err(|err| anyhow!("couldn't decode batch at key {}: {}", key, err))
-            // We received a State that we couldn't decode. This could happen if
-            // persist messes up backward/forward compatibility, if the durable
-            // data was corrupted, or if operations messes up deployment. In any
-            // case, fail loudly.
-            .expect("internal error: invalid encoded state");
-
-        // Drop the encoded representation as soon as we can to reclaim memory.
-        drop(value);
-        read_metrics.part_goodbytes.inc_by(u64::cast_from(
-            part.updates.iter().map(|x| x.goodbytes()).sum::<usize>(),
-        ));
-
-        EncodedPart::new(key, registered_desc.clone(), part)
-    });
-
-    read_metrics.seconds.inc_by(now.elapsed().as_secs_f64());
-
+    let value =
+        fetch_batch_part_blob(shard_id, blob, metrics, shard_metrics, read_metrics, key).await?;
+    let part = decode_batch_part_blob(metrics, read_metrics, key, registered_desc.clone(), &value);
     Ok(part)
 }
 
@@ -338,14 +355,10 @@ pub(crate) enum SerdeLeasedBatchPartMetadata {
 ///
 /// `LeasedBatchPart` may only be dropped if it:
 /// - Does not have a leased `SeqNo (i.e. `self.leased_seqno.is_none()`)
-/// - Is consumed through `self.get_droppable_part()`
 ///
 /// In any other circumstance, dropping `LeasedBatchPart` panics.
 #[derive(Debug)]
-pub struct LeasedBatchPart<T>
-where
-    T: Timestamp + Codec64,
-{
+pub struct LeasedBatchPart<T> {
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) shard_id: ShardId,
     pub(crate) reader_id: LeasedReaderId,
@@ -359,6 +372,9 @@ where
     pub(crate) leased_seqno: Option<SeqNo>,
     pub(crate) stats: Option<LazyPartStats>,
     pub(crate) filter_pushdown_audit: bool,
+    /// A lower bound on the key. If a tight lower bound is not available, the
+    /// empty vec (as the minimum vec) is a conservative choice.
+    pub(crate) key_lower: Vec<u8>,
 }
 
 impl<T> LeasedBatchPart<T>
@@ -387,6 +403,7 @@ where
             reader_id: self.reader_id.clone(),
             stats: self.stats.clone(),
             filter_pushdown_audit: self.filter_pushdown_audit,
+            key_lower: std::mem::take(&mut self.key_lower),
         };
         // If `x` has a lease, we've effectively transferred it to `r`.
         let _ = self.leased_seqno.take();
@@ -397,7 +414,7 @@ where
     /// operator to safely expire leases.
     ///
     /// The part's `reader_id` is intentionally inaccessible, and should
-    /// be obtained from the issuing [`ReadHandle`], or one of its derived
+    /// be obtained from the issuing [`crate::ReadHandle`], or one of its derived
     /// structures, e.g. [`crate::read::Subscribe`].
     ///
     /// # Panics
@@ -423,19 +440,80 @@ where
     pub fn request_filter_pushdown_audit(&mut self) {
         self.filter_pushdown_audit = true;
     }
+
+    /// Returns the pushdown stats for this part.
+    pub fn stats(&self) -> Option<PartStats> {
+        self.stats.as_ref().map(|x| x.decode())
+    }
 }
 
-impl<T> Drop for LeasedBatchPart<T>
-where
-    T: Timestamp + Codec64,
-{
+impl<T> Drop for LeasedBatchPart<T> {
     /// For details, see [`LeasedBatchPart`].
     fn drop(&mut self) {
         self.metrics.lease.dropped_part.inc()
     }
 }
 
-/// A [Blob] object that has been fetched, but not yet decoded.
+/// A [Blob] object that has been fetched, but not at all decoded.
+///
+/// In contrast to [FetchedPart], this representation hasn't yet done parquet
+/// decoding.
+#[derive(Debug)]
+pub struct FetchedBlob<K: Codec, V: Codec, T, D> {
+    key: String,
+    metrics: Arc<Metrics>,
+    read_metrics: ReadMetrics,
+    registered_desc: Description<T>,
+    part: SegmentedBytes,
+    schemas: Schemas<K, V>,
+    metadata: SerdeLeasedBatchPartMetadata,
+    filter_pushdown_audit: bool,
+    stats: Option<LazyPartStats>,
+    _phantom: PhantomData<fn() -> D>,
+}
+
+impl<K: Codec, V: Codec, T: Clone, D> Clone for FetchedBlob<K, V, T, D> {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            metrics: Arc::clone(&self.metrics),
+            read_metrics: self.read_metrics.clone(),
+            registered_desc: self.registered_desc.clone(),
+            part: self.part.clone(),
+            schemas: self.schemas.clone(),
+            metadata: self.metadata.clone(),
+            filter_pushdown_audit: self.filter_pushdown_audit.clone(),
+            stats: self.stats.clone(),
+            _phantom: self._phantom.clone(),
+        }
+    }
+}
+
+impl<K: Codec, V: Codec, T: Timestamp + Lattice + Codec64, D> FetchedBlob<K, V, T, D> {
+    /// Partially decodes this blob into a [FetchedPart].
+    pub fn parse(&self) -> FetchedPart<K, V, T, D> {
+        let part = decode_batch_part_blob(
+            &self.metrics,
+            &self.read_metrics,
+            &self.key,
+            self.registered_desc.clone(),
+            &self.part,
+        );
+        FetchedPart::new(
+            Arc::clone(&self.metrics),
+            part,
+            self.schemas.clone(),
+            &self.metadata,
+            self.filter_pushdown_audit,
+            self.stats.as_ref(),
+        )
+    }
+}
+
+/// A [Blob] object that has been fetched, but not yet fully decoded.
+///
+/// In contrast to [FetchedBlob], this representation has already done parquet
+/// decoding.
 #[derive(Debug)]
 pub struct FetchedPart<K: Codec, V: Codec, T, D> {
     metrics: Arc<Metrics>,
@@ -443,8 +521,11 @@ pub struct FetchedPart<K: Codec, V: Codec, T, D> {
     part: EncodedPart<T>,
     schemas: Schemas<K, V>,
     filter_pushdown_audit: Option<LazyPartStats>,
+    part_cursor: Cursor,
+    key_storage: Option<K::Storage>,
+    val_storage: Option<V::Storage>,
 
-    _phantom: PhantomData<fn() -> (K, V, D)>,
+    _phantom: PhantomData<fn() -> D>,
 }
 
 impl<K: Codec, V: Codec, T: Clone, D> Clone for FetchedPart<K, V, T, D> {
@@ -455,12 +536,42 @@ impl<K: Codec, V: Codec, T: Clone, D> Clone for FetchedPart<K, V, T, D> {
             part: self.part.clone(),
             schemas: self.schemas.clone(),
             filter_pushdown_audit: self.filter_pushdown_audit.clone(),
+            part_cursor: self.part_cursor.clone(),
+            key_storage: None,
+            val_storage: None,
             _phantom: self._phantom.clone(),
         }
     }
 }
 
-impl<K: Codec, V: Codec, T, D> FetchedPart<K, V, T, D> {
+impl<K: Codec, V: Codec, T: Timestamp + Lattice + Codec64, D> FetchedPart<K, V, T, D> {
+    fn new(
+        metrics: Arc<Metrics>,
+        part: EncodedPart<T>,
+        schemas: Schemas<K, V>,
+        metadata: &SerdeLeasedBatchPartMetadata,
+        filter_pushdown_audit: bool,
+        stats: Option<&LazyPartStats>,
+    ) -> Self {
+        let ts_filter = FetchBatchFilter::new(metadata);
+        let filter_pushdown_audit = if filter_pushdown_audit {
+            stats.cloned()
+        } else {
+            None
+        };
+        FetchedPart {
+            metrics,
+            ts_filter,
+            part,
+            schemas,
+            filter_pushdown_audit,
+            part_cursor: Cursor::default(),
+            key_storage: None,
+            val_storage: None,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Returns Some if this part was only fetched as part of a filter pushdown
     /// audit. See [LeasedBatchPart::request_filter_pushdown_audit].
     ///
@@ -477,10 +588,72 @@ impl<K: Codec, V: Codec, T, D> FetchedPart<K, V, T, D> {
 pub(crate) struct EncodedPart<T> {
     registered_desc: Description<T>,
     part: Arc<BlobTraceBatchPart<T>>,
-
     needs_truncation: bool,
-    part_idx: usize,
-    idx: usize,
+}
+
+impl<K, V, T, D> FetchedPart<K, V, T, D>
+where
+    K: Debug + Codec,
+    V: Debug + Codec,
+    T: Timestamp + Lattice + Codec64,
+    D: Semigroup + Codec64 + Send + Sync,
+{
+    /// [Self::next] but optionally providing a `K` and `V` for alloc reuse.
+    pub fn next_with_storage(
+        &mut self,
+        key: &mut Option<K>,
+        val: &mut Option<V>,
+    ) -> Option<((Result<K, String>, Result<V, String>), T, D)> {
+        while let Some((k, v, mut t, d)) = self.part_cursor.pop(&self.part) {
+            if !self.ts_filter.filter_ts(&mut t) {
+                continue;
+            }
+
+            let mut d = D::decode(d);
+
+            // If `filter_ts` advances our timestamp, we may end up with the same K, V, T in successive
+            // records. If so, opportunistically consolidate those out.
+            while let Some((k_next, v_next, mut t_next, d_next)) = self.part_cursor.peek(&self.part)
+            {
+                if (k, v) != (k_next, v_next) {
+                    break;
+                }
+
+                if !self.ts_filter.filter_ts(&mut t_next) {
+                    break;
+                }
+                if t != t_next {
+                    break;
+                }
+
+                // All equal... consolidate!
+                self.part_cursor.idx += 1;
+                d.plus_equals(&D::decode(d_next));
+            }
+
+            // If multiple updates consolidate out entirely, drop the record.
+            if d.is_zero() {
+                continue;
+            }
+
+            let k = self.metrics.codecs.key.decode(|| match key.take() {
+                Some(mut key) => match K::decode_from(&mut key, k, &mut self.key_storage) {
+                    Ok(()) => Ok(key),
+                    Err(err) => Err(err),
+                },
+                None => K::decode(k),
+            });
+            let v = self.metrics.codecs.val.decode(|| match val.take() {
+                Some(mut val) => match V::decode_from(&mut val, v, &mut self.val_storage) {
+                    Ok(()) => Ok(val),
+                    Err(err) => Err(err),
+                },
+                None => V::decode(v),
+            });
+            return Some(((k, v), t, d));
+        }
+        None
+    }
 }
 
 impl<K, V, T, D> Iterator for FetchedPart<K, V, T, D>
@@ -493,17 +666,7 @@ where
     type Item = ((Result<K, String>, Result<V, String>), T, D);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some((k, v, mut t, d)) = self.part.next() {
-            if !self.ts_filter.filter_ts(&mut t) {
-                continue;
-            }
-
-            let k = self.metrics.codecs.key.decode(|| K::decode(k));
-            let v = self.metrics.codecs.val.decode(|| V::decode(v));
-            let d = D::decode(d);
-            return Some(((k, v), t, d));
-        }
-        None
+        self.next_with_storage(&mut None, &mut None)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -574,19 +737,40 @@ where
         EncodedPart {
             registered_desc,
             part: Arc::new(part),
-            part_idx: 0,
-            idx: 0,
             needs_truncation,
         }
     }
 
-    pub fn next<'a>(&'a mut self) -> Option<(&'a [u8], &'a [u8], T, [u8; 8])> {
-        while let Some(part) = self.part.updates.get(self.part_idx) {
+    pub(crate) fn maybe_unconsolidated(&self) -> bool {
+        // At time of writing, only user parts may be unconsolidated, and they are always
+        // written with a since of [T::minimum()].
+        self.part.desc.since().borrow() == AntichainRef::new(&[T::minimum()])
+    }
+}
+
+/// A pointer into a particular encoded part, with methods for fetching an update and
+/// scanning forward to the next. It is an error to use the same cursor for distinct
+/// parts.
+///
+/// We avoid implementing copy to make it hard to accidentally duplicate a cursor. However,
+/// clone is very cheap.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Cursor {
+    part_idx: usize,
+    idx: usize,
+}
+
+impl Cursor {
+    /// A cursor points to a particular update in the backing part data.
+    /// If the update it points to is not valid, advance it to the next valid update
+    /// if there is one, and return the pointed-to data.
+    pub fn peek<'a, T: Timestamp + Codec64>(
+        &mut self,
+        encoded: &'a EncodedPart<T>,
+    ) -> Option<(&'a [u8], &'a [u8], T, [u8; 8])> {
+        while let Some(part) = encoded.part.updates.get(self.part_idx) {
             let ((k, v), t, d) = match part.get(self.idx) {
-                Some(x) => {
-                    self.idx += 1;
-                    x
-                }
+                Some(x) => x,
                 None => {
                     self.part_idx += 1;
                     self.idx = 0;
@@ -598,17 +782,36 @@ where
 
             // This filtering is really subtle, see the comment above for
             // what's going on here.
-            if self.needs_truncation {
-                if !self.registered_desc.lower().less_equal(&t) {
-                    continue;
-                }
-                if self.registered_desc.upper().less_equal(&t) {
-                    continue;
-                }
+            let truncated_t = encoded.needs_truncation && {
+                !encoded.registered_desc.lower().less_equal(&t)
+                    || encoded.registered_desc.upper().less_equal(&t)
+            };
+            if truncated_t {
+                self.idx += 1;
+                continue;
             }
             return Some((k, v, t, d));
         }
         None
+    }
+
+    /// Similar to peek, but advance the cursor just past the end of the most recent update.
+    pub fn pop<'a, T: Timestamp + Codec64>(
+        &mut self,
+        part: &'a EncodedPart<T>,
+    ) -> Option<(&'a [u8], &'a [u8], T, [u8; 8])> {
+        let update = self.peek(part);
+        if update.is_some() {
+            self.idx += 1;
+        }
+        update
+    }
+
+    /// Advance the cursor just past the end of the most recent update, if there is one.
+    pub fn advance<'a, T: Timestamp + Codec64>(&mut self, part: &'a EncodedPart<T>) {
+        if self.part_idx < part.part.updates.len() {
+            self.idx += 1;
+        }
     }
 }
 
@@ -633,6 +836,14 @@ pub struct SerdeLeasedBatchPart {
     reader_id: LeasedReaderId,
     stats: Option<LazyPartStats>,
     filter_pushdown_audit: bool,
+    key_lower: Vec<u8>,
+}
+
+impl SerdeLeasedBatchPart {
+    /// Returns the encoded size of the given part.
+    pub fn encoded_size_bytes(&self) -> usize {
+        self.encoded_size_bytes
+    }
 }
 
 impl<T: Timestamp + Codec64> LeasedBatchPart<T> {
@@ -651,9 +862,9 @@ impl<T: Timestamp + Codec64> LeasedBatchPart<T> {
             shard_id: x.shard_id,
             metadata: x.metadata,
             desc: Description::new(
-                Antichain::from(x.lower.into_iter().map(T::decode).collect::<Vec<_>>()),
-                Antichain::from(x.upper.into_iter().map(T::decode).collect::<Vec<_>>()),
-                Antichain::from(x.since.into_iter().map(T::decode).collect::<Vec<_>>()),
+                Antichain::from_iter(x.lower.into_iter().map(T::decode)),
+                Antichain::from_iter(x.upper.into_iter().map(T::decode)),
+                Antichain::from_iter(x.since.into_iter().map(T::decode)),
             ),
             key: x.key,
             encoded_size_bytes: x.encoded_size_bytes,
@@ -661,6 +872,7 @@ impl<T: Timestamp + Codec64> LeasedBatchPart<T> {
             reader_id: x.reader_id,
             stats: x.stats,
             filter_pushdown_audit: x.filter_pushdown_audit,
+            key_lower: x.key_lower,
         }
     }
 }

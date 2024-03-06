@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
+use mz_dyncfg::Config;
 use mz_ore::cast::CastFrom;
 use mz_ore::now::EpochMillis;
 use mz_persist::location::SeqNo;
@@ -33,7 +34,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::critical::CriticalReaderId;
-use crate::error::{Determinacy, InvalidUsage};
+use crate::error::InvalidUsage;
 use crate::internal::encoding::{parse_id, LazyPartStats};
 use crate::internal::gc::GcReq;
 use crate::internal::paths::{PartialBatchKey, PartialRollupKey};
@@ -51,6 +52,19 @@ include!(concat!(
     env!("OUT_DIR"),
     "/mz_persist_client.internal.diff.rs"
 ));
+
+/// Determines how often to write rollups, assigning a maintenance task after
+/// `rollup_threshold` seqnos have passed since the last rollup.
+///
+/// Tuning note: in the absence of a long reader seqno hold, and with
+/// incremental GC, this threshold will determine about how many live diffs are
+/// held in Consensus. Lowering this value decreases the live diff count at the
+/// cost of more maintenance work + blob writes.
+pub(crate) const ROLLUP_THRESHOLD: Config<usize> = Config::new(
+    "persist_rollup_threshold",
+    128,
+    "The number of seqnos between rollups.",
+);
 
 /// A token to disambiguate state commands that could not otherwise be
 /// idempotent.
@@ -146,7 +160,7 @@ pub struct WriterState<T> {
 }
 
 /// Debugging info for a reader or writer.
-#[derive(Arbitrary, Clone, Debug, PartialEq, Serialize)]
+#[derive(Arbitrary, Clone, Debug, Default, PartialEq, Serialize)]
 pub struct HandleDebugState {
     /// Hostname of the persist user that registered this writer or reader. For
     /// critical readers, this is the _most recent_ registration.
@@ -162,8 +176,13 @@ pub struct HollowBatchPart {
     pub key: PartialBatchKey,
     /// The encoded size of this part.
     pub encoded_size_bytes: usize,
+    /// A lower bound on the keys in the part. (By default, this the minimum
+    /// possible key: `vec![]`.)
+    #[serde(serialize_with = "serialize_part_bytes")]
+    pub key_lower: Vec<u8>,
     /// Aggregate statistics about data contained in this part.
     #[serde(serialize_with = "serialize_part_stats")]
+    #[proptest(strategy = "super::encoding::any_some_lazy_part_stats()")]
     pub stats: Option<LazyPartStats>,
 }
 
@@ -200,14 +219,14 @@ impl<T: Debug> Debug for HollowBatch<T> {
             .field(
                 "desc",
                 &(
-                    self.desc.lower().elements(),
-                    self.desc.upper().elements(),
-                    self.desc.since().elements(),
+                    desc.lower().elements(),
+                    desc.upper().elements(),
+                    desc.since().elements(),
                 ),
             )
-            .field("parts", &self.parts)
-            .field("len", &self.len)
-            .field("runs", &self.runs)
+            .field("parts", &parts)
+            .field("len", &len)
+            .field("runs", &runs)
             .finish()
     }
 }
@@ -217,6 +236,7 @@ impl<T: Serialize> serde::Serialize for HollowBatch<T> {
         let HollowBatch {
             desc,
             len,
+            // Both parts and runs are covered by the self.runs call.
             parts: _,
             runs: _,
         } = self;
@@ -502,47 +522,14 @@ where
         Continue(state)
     }
 
-    pub fn register_writer(
-        &mut self,
-        hostname: &str,
-        writer_id: &WriterId,
-        purpose: &str,
-        lease_duration: Duration,
-        heartbeat_timestamp_ms: u64,
-    ) -> ControlFlow<NoOpStateTransition<(Upper<T>, WriterState<T>)>, (Upper<T>, WriterState<T>)>
-    {
-        let upper = Upper(self.trace.upper().clone());
-        let writer_state = WriterState {
-            debug: HandleDebugState {
-                hostname: hostname.to_owned(),
-                purpose: purpose.to_owned(),
-            },
-            last_heartbeat_timestamp_ms: heartbeat_timestamp_ms,
-            lease_duration_ms: u64::try_from(lease_duration.as_millis())
-                .expect("lease duration as millis must fit within u64"),
-            most_recent_write_token: IdempotencyToken::SENTINEL,
-            most_recent_write_upper: Antichain::from_elem(T::minimum()),
-        };
-
-        // If the shard-global upper and since are both the empty antichain,
-        // then no further writes can ever commit and no further reads can be
-        // served. Optimize this by no-op-ing writer registration so that we can
-        // settle the shard into a final unchanging tombstone state.
-        if self.is_tombstone() {
-            return Break(NoOpStateTransition((upper, writer_state)));
-        }
-
-        // TODO: Handle if the reader or writer already exists.
-        self.writers.insert(writer_id.clone(), writer_state.clone());
-        Continue((Upper(self.trace.upper().clone()), writer_state))
-    }
-
     pub fn compare_and_append(
         &mut self,
         batch: &HollowBatch<T>,
         writer_id: &WriterId,
         heartbeat_timestamp_ms: u64,
+        lease_duration_ms: u64,
         idempotency_token: &IdempotencyToken,
+        debug_info: &HandleDebugState,
     ) -> ControlFlow<CompareAndAppendBreak<T>, Vec<FueledMergeReq<T>>> {
         // We expire all writers if the upper and since both advance to the
         // empty antichain. Gracefully handle this. At the same time,
@@ -560,14 +547,16 @@ where
             });
         }
 
-        let writer_state = match self.writers.get_mut(writer_id) {
-            Some(x) => x,
-            None => {
-                return Break(CompareAndAppendBreak::InvalidUsage(
-                    InvalidUsage::UnknownWriter(writer_id.clone()),
-                ))
-            }
-        };
+        let writer_state = self
+            .writers
+            .entry(writer_id.clone())
+            .or_insert_with(|| WriterState {
+                last_heartbeat_timestamp_ms: heartbeat_timestamp_ms,
+                lease_duration_ms,
+                most_recent_write_token: IdempotencyToken::SENTINEL,
+                most_recent_write_upper: Antichain::from_elem(T::minimum()),
+                debug: debug_info.clone(),
+            });
 
         if PartialOrder::less_than(batch.desc.upper(), batch.desc.lower()) {
             return Break(CompareAndAppendBreak::InvalidUsage(
@@ -629,7 +618,7 @@ where
         );
         writer_state.most_recent_write_upper = batch.desc.upper().clone();
 
-        // Also use this as an opportunity to heartbeat the writer
+        // Heartbeat the writer state to keep our idempotency token alive.
         writer_state.last_heartbeat_timestamp_ms = std::cmp::max(
             heartbeat_timestamp_ms,
             writer_state.last_heartbeat_timestamp_ms,
@@ -794,7 +783,7 @@ where
 
         let existed = self.leased_readers.remove(reader_id).is_some();
         if existed {
-            // TODO: Re-enable this once we have #15511.
+            // TODO(#22789): Re-enable this
             //
             // Temporarily disabling this because we think it might be the cause
             // of the remap since bug. Specifically, a clusterd process has a
@@ -827,7 +816,7 @@ where
 
         let existed = self.critical_readers.remove(reader_id).is_some();
         if existed {
-            // TODO: Re-enable this once we have #15511.
+            // TODO(#22789): Re-enable this
             //
             // Temporarily disabling this because we think it might be the cause
             // of the remap since bug. Specifically, a clusterd process has a
@@ -845,33 +834,6 @@ where
         // commit the state change so that this gets linearized (maybe we're
         // looking at old state).
         Continue(existed)
-    }
-
-    pub fn heartbeat_writer(
-        &mut self,
-        writer_id: &WriterId,
-        heartbeat_timestamp_ms: u64,
-    ) -> ControlFlow<NoOpStateTransition<bool>, bool> {
-        // We expire all writers if the upper and since both advance to the
-        // empty antichain. Gracefully handle this. At the same time,
-        // short-circuit the cmd application so we don't needlessly create new
-        // SeqNos.
-        if self.is_tombstone() {
-            return Break(NoOpStateTransition(false));
-        }
-
-        match self.writers.get_mut(writer_id) {
-            Some(writer_state) => {
-                writer_state.last_heartbeat_timestamp_ms = std::cmp::max(
-                    heartbeat_timestamp_ms,
-                    writer_state.last_heartbeat_timestamp_ms,
-                );
-                Continue(true)
-            }
-            // No-op, but we still commit the state change so that this gets
-            // linearized (maybe we're looking at old state).
-            None => Continue(false),
-        }
     }
 
     pub fn expire_writer(
@@ -963,41 +925,84 @@ where
     }
 
     pub(crate) fn is_tombstone(&self) -> bool {
-        if self.trace.upper().is_empty()
+        self.trace.upper().is_empty()
             && self.trace.since().is_empty()
             && self.writers.is_empty()
             && self.leased_readers.is_empty()
             && self.critical_readers.is_empty()
-        {
-            // Gate this more expensive check behind the cheaper is_empty ones.
-            let mut batches = Vec::new();
-            self.trace.map_batches(|b| batches.push(b));
-            if batches.len() == 1 && batches[0] == &Self::tombstone_batch() {
-                return true;
-            }
-        }
-        false
     }
 
-    pub fn become_tombstone(&mut self) -> ControlFlow<NoOpStateTransition<()>, ()> {
+    pub(crate) fn is_single_empty_batch(&self) -> bool {
+        let mut batch_count = 0;
+        let mut is_empty = true;
+        self.trace.map_batches(|b| {
+            batch_count += 1;
+            is_empty &= b.parts.is_empty()
+        });
+        batch_count <= 1 && is_empty
+    }
+
+    pub fn become_tombstone_and_shrink(&mut self) -> ControlFlow<NoOpStateTransition<()>, ()> {
         assert_eq!(self.trace.upper(), &Antichain::new());
         assert_eq!(self.trace.since(), &Antichain::new());
 
-        if self.is_tombstone() {
-            return Break(NoOpStateTransition(()));
-        }
-
+        // Enter the "tombstone" state, if we're not in it already.
         self.writers.clear();
         self.leased_readers.clear();
         self.critical_readers.clear();
-        let mut new_trace = Trace::default();
-        new_trace.downgrade_since(&Antichain::new());
-        let merge_reqs = new_trace.push_batch(Self::tombstone_batch());
-        assert_eq!(merge_reqs, Vec::new());
-        self.trace = new_trace;
 
         debug_assert!(self.is_tombstone());
-        Continue(())
+
+        // Now that we're in a "tombstone" state -- ie. nobody can read the data from a shard or write to
+        // it -- the actual contents of our batches no longer matter.
+        // This method progressively replaces batches in our state with simpler versions, to allow
+        // freeing up resources and to reduce the state size. (Since the state is unreadable, this
+        // is not visible to clients.) We do this a little bit at a time to avoid really large state
+        // transitions... most operations happen incrementally, and large single writes can overwhelm
+        // a backing store. See comments for why we believe the relevant diffs are reasonably small.
+
+        let mut to_replace = None;
+        let mut batch_count = 0;
+        self.trace.map_batches(|b| {
+            batch_count += 1;
+            if !b.parts.is_empty() && to_replace.is_none() {
+                to_replace = Some(b.desc.clone());
+            }
+        });
+        if let Some(desc) = to_replace {
+            // We have a nonempty batch: replace it with an empty batch and return.
+            // This should not produce an excessively large diff: if it did, we wouldn't have been
+            // able to append that batch in the first place.
+            let fake_merge = FueledMergeRes {
+                output: HollowBatch {
+                    desc,
+                    parts: vec![],
+                    len: 0,
+                    runs: vec![],
+                },
+            };
+            let result = self.trace.apply_merge_res(&fake_merge);
+            assert!(
+                result.matched(),
+                "merge with a matching desc should always match"
+            );
+            Continue(())
+        } else if batch_count > 1 {
+            // All our batches are empty, but we have more than one of them. Replace the whole set
+            // with a new single-batch trace.
+            // This produces a diff with a size proportional to the number of batches, but since
+            // Spine keeps a logarithmic number of batches this should never be excessively large.
+            let mut new_trace = Trace::default();
+            new_trace.downgrade_since(&Antichain::new());
+            let merge_reqs = new_trace.push_batch(Self::tombstone_batch());
+            assert_eq!(merge_reqs, Vec::new());
+            self.trace = new_trace;
+            Continue(())
+        } else {
+            // All our batches are empty, and there's only one... there's no shrinking this
+            // tombstone further.
+            Break(NoOpStateTransition(()))
+        }
     }
 }
 
@@ -1033,8 +1038,8 @@ pub struct TypedState<K, V, T, D> {
     pub(crate) _phantom: PhantomData<fn() -> (K, V, D)>,
 }
 
-#[cfg(any(test, debug_assertions))]
 impl<K, V, T: Clone, D> TypedState<K, V, T, D> {
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn clone(&self, applier_version: Version, hostname: String) -> Self {
         TypedState {
             state: State {
@@ -1043,6 +1048,20 @@ impl<K, V, T: Clone, D> TypedState<K, V, T, D> {
                 seqno: self.seqno.clone(),
                 walltime_ms: self.walltime_ms,
                 hostname,
+                collections: self.collections.clone(),
+            },
+            _phantom: PhantomData,
+        }
+    }
+
+    pub(crate) fn clone_for_rollup(&self) -> Self {
+        TypedState {
+            state: State {
+                applier_version: self.applier_version.clone(),
+                shard_id: self.shard_id.clone(),
+                seqno: self.seqno.clone(),
+                walltime_ms: self.walltime_ms,
+                hostname: self.hostname.clone(),
                 collections: self.collections.clone(),
             },
             _phantom: PhantomData,
@@ -1133,8 +1152,13 @@ where
     where
         WorkFn: FnMut(SeqNo, &PersistConfig, &mut StateCollections<T>) -> ControlFlow<E, R>,
     {
+        // Now that we support one minor version of forward compatibility, tag
+        // each version of state with the _max_ version of code that has ever
+        // contributed to it. Otherwise, we'd erroneously allow rolling back an
+        // arbitrary number of versions if they were done one-by-one.
+        let new_applier_version = std::cmp::max(&self.applier_version, &cfg.build_version);
         let mut new_state = State {
-            applier_version: cfg.build_version.clone(),
+            applier_version: new_applier_version.clone(),
             shard_id: self.shard_id,
             seqno: self.seqno.next(),
             walltime_ms: (cfg.now)(),
@@ -1284,7 +1308,7 @@ where
             let retain = (v.last_heartbeat_timestamp_ms + v.lease_duration_ms) >= walltime_ms;
             if !retain {
                 info!("Force expiring writer ({k}) of shard ({shard_id}) due to inactivity");
-                // We don't track writer expiration metrics yet.
+                metrics.writers_expired += 1;
             }
             retain
         });
@@ -1391,6 +1415,11 @@ where
     }
 }
 
+fn serialize_part_bytes<S: Serializer>(val: &[u8], s: S) -> Result<S::Ok, S::Error> {
+    let val = hex::encode(val);
+    val.serialize(s)
+}
+
 fn serialize_part_stats<S: Serializer>(
     val: &Option<LazyPartStats>,
     s: S,
@@ -1454,25 +1483,16 @@ pub struct StateSizeMetrics {
 #[derive(Default)]
 pub struct ExpiryMetrics {
     pub(crate) readers_expired: usize,
+    pub(crate) writers_expired: usize,
 }
 
 /// Wrapper for Antichain that represents a Since
 #[derive(Debug, Clone, PartialEq)]
 pub struct Since<T>(pub Antichain<T>);
 
-// When used as an error, Since is determinate.
-impl<T> Determinacy for Since<T> {
-    const DETERMINANT: bool = true;
-}
-
 /// Wrapper for Antichain that represents an Upper
 #[derive(Debug, PartialEq)]
 pub struct Upper<T>(pub Antichain<T>);
-
-// When used as an error, Upper is determinate.
-impl<T> Determinacy for Upper<T> {
-    const DETERMINANT: bool = true;
-}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1483,11 +1503,22 @@ pub(crate) mod tests {
     use proptest::prelude::*;
     use proptest::strategy::ValueTree;
 
+    use crate::cache::PersistClientCache;
     use crate::internal::paths::RollupId;
     use crate::internal::trace::tests::any_trace;
+    use crate::tests::new_test_client_cache;
     use crate::InvalidUsage::{InvalidBounds, InvalidEmptyTimeInterval};
+    use crate::PersistLocation;
 
     use super::*;
+
+    const LEASE_DURATION_MS: u64 = 900 * 1000;
+    fn debug_state() -> HandleDebugState {
+        HandleDebugState {
+            hostname: "debug".to_owned(),
+            purpose: "finding the bugs".to_owned(),
+        }
+    }
 
     pub fn any_hollow_batch<T: Arbitrary + Timestamp>() -> impl Strategy<Value = HollowBatch<T>> {
         Strategy::prop_map(
@@ -1653,6 +1684,7 @@ pub(crate) mod tests {
                 .map(|x| HollowBatchPart {
                     key: PartialBatchKey((*x).to_owned()),
                     encoded_size_bytes: 0,
+                    key_lower: vec![],
                     stats: None,
                 })
                 .collect(),
@@ -1793,7 +1825,7 @@ pub(crate) mod tests {
             state.collections.expire_leased_reader(&reader2),
             Continue(true)
         );
-        // TODO: expiry temporarily doesn't advance since until we have #15511.
+        // TODO(#22789): expiry temporarily doesn't advance since
         // Switch this assertion back when we re-enable this.
         //
         // assert_eq!(state.collections.trace.since(), &Antichain::from_elem(10));
@@ -1804,7 +1836,7 @@ pub(crate) mod tests {
             state.collections.expire_leased_reader(&reader3),
             Continue(true)
         );
-        // TODO: expiry temporarily doesn't advance since until we have #15511.
+        // TODO(#22789): expiry temporarily doesn't advance since
         // Switch this assertion back when we re-enable this.
         //
         // assert_eq!(state.collections.trace.since(), &Antichain::from_elem(10));
@@ -1822,7 +1854,6 @@ pub(crate) mod tests {
         .collections;
 
         let writer_id = WriterId::new();
-        let _ = state.register_writer("", &writer_id, "", Duration::from_secs(10), 0);
         let now = SYSTEM_TIME.clone();
 
         // State is initially empty.
@@ -1836,7 +1867,9 @@ pub(crate) mod tests {
                 &hollow(1, 2, &["key1"], 1),
                 &writer_id,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             ),
             Break(CompareAndAppendBreak::Upper {
                 shard_upper: Antichain::from_elem(0),
@@ -1850,7 +1883,9 @@ pub(crate) mod tests {
                 &hollow(0, 5, &[], 0),
                 &writer_id,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             )
             .is_continue());
 
@@ -1860,7 +1895,9 @@ pub(crate) mod tests {
                 &hollow(5, 4, &["key1"], 1),
                 &writer_id,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             ),
             Break(CompareAndAppendBreak::InvalidUsage(InvalidBounds {
                 lower: Antichain::from_elem(5),
@@ -1874,7 +1911,9 @@ pub(crate) mod tests {
                 &hollow(5, 5, &["key1"], 1),
                 &writer_id,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             ),
             Break(CompareAndAppendBreak::InvalidUsage(
                 InvalidEmptyTimeInterval {
@@ -1891,7 +1930,9 @@ pub(crate) mod tests {
                 &hollow(5, 5, &[], 0),
                 &writer_id,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             )
             .is_continue());
     }
@@ -1925,9 +1966,6 @@ pub(crate) mod tests {
         );
 
         let writer_id = WriterId::new();
-        let _ = state
-            .collections
-            .register_writer("", &writer_id, "", Duration::from_secs(10), 0);
 
         // Advance upper to 5.
         assert!(state
@@ -1936,7 +1974,9 @@ pub(crate) mod tests {
                 &hollow(0, 5, &["key1"], 1),
                 &writer_id,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             )
             .is_continue());
 
@@ -2004,7 +2044,9 @@ pub(crate) mod tests {
                 &hollow(5, 10, &[], 0),
                 &writer_id,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             )
             .is_continue());
 
@@ -2030,7 +2072,9 @@ pub(crate) mod tests {
                 &hollow(10, 15, &["key2"], 1),
                 &writer_id,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             )
             .is_continue());
 
@@ -2079,9 +2123,6 @@ pub(crate) mod tests {
         assert_eq!(state.next_listen_batch(&Antichain::new()), Err(SeqNo(0)));
 
         let writer_id = WriterId::new();
-        let _ = state
-            .collections
-            .register_writer("", &writer_id, "", Duration::from_secs(10), 0);
         let now = SYSTEM_TIME.clone();
 
         // Add two batches of data, one from [0, 5) and then another from [5, 10).
@@ -2091,7 +2132,9 @@ pub(crate) mod tests {
                 &hollow(0, 5, &["key1"], 1),
                 &writer_id,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             )
             .is_continue());
         assert!(state
@@ -2100,7 +2143,9 @@ pub(crate) mod tests {
                 &hollow(5, 10, &["key2"], 1),
                 &writer_id,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             )
             .is_continue());
 
@@ -2143,38 +2188,18 @@ pub(crate) mod tests {
 
         let writer_id_one = WriterId::new();
 
-        // Writer has not been registered and should be unable to write
-        assert_eq!(
-            state.collections.compare_and_append(
-                &hollow(0, 2, &["key1"], 1),
-                &writer_id_one,
-                now(),
-                &IdempotencyToken::new()
-            ),
-            Break(CompareAndAppendBreak::InvalidUsage(
-                InvalidUsage::UnknownWriter(writer_id_one.clone())
-            ))
-        );
-
-        assert!(state
-            .collections
-            .register_writer("", &writer_id_one, "", Duration::from_secs(10), 0)
-            .is_continue());
-
         let writer_id_two = WriterId::new();
-        assert!(state
-            .collections
-            .register_writer("", &writer_id_two, "", Duration::from_secs(10), 0)
-            .is_continue());
 
-        // Writer is registered and is now eligible to write
+        // Writer is eligible to write
         assert!(state
             .collections
             .compare_and_append(
                 &hollow(0, 2, &["key1"], 1),
                 &writer_id_one,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             )
             .is_continue());
 
@@ -2183,27 +2208,16 @@ pub(crate) mod tests {
             .expire_writer(&writer_id_one)
             .is_continue());
 
-        // Writer has been expired and should be fenced off from further writes
-        assert_eq!(
-            state.collections.compare_and_append(
-                &hollow(2, 5, &["key2"], 1),
-                &writer_id_one,
-                now(),
-                &IdempotencyToken::new()
-            ),
-            Break(CompareAndAppendBreak::InvalidUsage(
-                InvalidUsage::UnknownWriter(writer_id_one.clone())
-            ))
-        );
-
-        // But other writers should still be able to write
+        // Other writers should still be able to write
         assert!(state
             .collections
             .compare_and_append(
                 &hollow(2, 5, &["key2"], 1),
                 &writer_id_two,
                 now(),
-                &IdempotencyToken::new()
+                LEASE_DURATION_MS,
+                &IdempotencyToken::new(),
+                &debug_state(),
             )
             .is_continue());
     }
@@ -2228,9 +2242,15 @@ pub(crate) mod tests {
 
         // When a writer is present, non-writes don't gc.
         let writer_id = WriterId::new();
-        let _ = state
-            .collections
-            .register_writer("", &writer_id, "", Duration::from_secs(10), 0);
+        let now = SYSTEM_TIME.clone();
+        state.collections.compare_and_append(
+            &hollow(1, 2, &["key1"], 1),
+            &writer_id,
+            now(),
+            LEASE_DURATION_MS,
+            &IdempotencyToken::new(),
+            &debug_state(),
+        );
         assert_eq!(state.maybe_gc(false), None);
 
         // A write will gc though.
@@ -2372,5 +2392,48 @@ pub(crate) mod tests {
             "\n\nNEW GOLDEN\n{}\n",
             json
         );
+    }
+
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // too slow
+    async fn sneaky_downgrades() {
+        let mut clients = new_test_client_cache();
+        let shard_id = ShardId::new();
+
+        async fn open_and_write(
+            clients: &mut PersistClientCache,
+            version: semver::Version,
+            shard_id: ShardId,
+        ) -> Result<(), tokio::task::JoinError> {
+            clients.cfg.build_version = version.clone();
+            clients.clear_state_cache();
+            let client = clients.open(PersistLocation::new_in_mem()).await.unwrap();
+            // Run in a task so we can catch the panic.
+            mz_ore::task::spawn(|| version.to_string(), async move {
+                let (mut write, _) = client.expect_open::<String, (), u64, i64>(shard_id).await;
+                let current = *write.upper().as_option().unwrap();
+                // Do a write so that we tag the state with the version.
+                write
+                    .expect_compare_and_append_batch(&mut [], current, current + 1)
+                    .await;
+            })
+            .await
+        }
+
+        // Start at v0.10.0.
+        let res = open_and_write(&mut clients, Version::new(0, 10, 0), shard_id).await;
+        assert!(res.is_ok());
+
+        // Upgrade to v0.11.0 is allowed.
+        let res = open_and_write(&mut clients, Version::new(0, 11, 0), shard_id).await;
+        assert!(res.is_ok());
+
+        // Downgrade to v0.10.0 is allowed.
+        let res = open_and_write(&mut clients, Version::new(0, 10, 0), shard_id).await;
+        assert!(res.is_ok());
+
+        // Downgrade to v0.9.0 is _NOT_ allowed.
+        let res = open_and_write(&mut clients, Version::new(0, 9, 0), shard_id).await;
+        assert!(res.unwrap_err().is_panic());
     }
 }

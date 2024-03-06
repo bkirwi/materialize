@@ -7,13 +7,19 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use mz_ssh_util::tunnel_manager::SshTunnelManager;
 use tokio_postgres::types::Oid;
 
 use crate::desc::{PostgresColumnDesc, PostgresKeyDesc, PostgresSchemaDesc, PostgresTableDesc};
 use crate::{Config, PostgresError};
 
-pub async fn get_schemas(config: &Config) -> Result<Vec<PostgresSchemaDesc>, PostgresError> {
-    let client = config.connect("postgres_schemas").await?;
+pub async fn get_schemas(
+    ssh_tunnel_manager: &SshTunnelManager,
+    config: &Config,
+) -> Result<Vec<PostgresSchemaDesc>, PostgresError> {
+    let client = config
+        .connect("postgres_schemas", ssh_tunnel_manager)
+        .await?;
 
     Ok(client
         .query("SELECT oid, nspname, nspowner FROM pg_namespace", &[])
@@ -40,20 +46,24 @@ pub async fn get_schemas(config: &Config) -> Result<Vec<PostgresSchemaDesc>, Pos
 /// - Invalid connection string, user information, or user permissions.
 /// - Upstream publication does not exist or contains invalid values.
 pub async fn publication_info(
+    ssh_tunnel_manager: &SshTunnelManager,
     config: &Config,
     publication: &str,
     oid_filter: Option<u32>,
 ) -> Result<Vec<PostgresTableDesc>, PostgresError> {
-    let client = config.connect("postgres_publication_info").await?;
+    let client = config
+        .connect("postgres_publication_info", ssh_tunnel_manager)
+        .await?;
 
     client
         .query(
             "SELECT oid FROM pg_publication WHERE pubname = $1",
             &[&publication],
         )
-        .await?
+        .await
+        .map_err(PostgresError::from)?
         .get(0)
-        .ok_or_else(|| anyhow::anyhow!("publication {:?} does not exist", publication))?;
+        .ok_or_else(|| PostgresError::PublicationMissing(publication.to_string()))?;
 
     let tables = client
         .query(
@@ -69,7 +79,8 @@ pub async fn publication_info(
                 AND ($2::oid IS NULL OR c.oid = $2::oid)",
             &[&publication, &oid_filter],
         )
-        .await?;
+        .await
+        .map_err(PostgresError::from)?;
 
     let mut table_infos = vec![];
     for row in tables {
@@ -95,16 +106,16 @@ pub async fn publication_info(
                     ORDER BY a.attnum",
                 &[&oid],
             )
-            .await?
+            .await
+            .map_err(PostgresError::from)?
             .into_iter()
             .map(|row| {
                 let name: String = row.get("name");
                 let type_oid = row.get("typoid");
-                let col_num = Some(
-                    row.get::<_, i16>("colnum")
-                        .try_into()
-                        .expect("non-negative values"),
-                );
+                let col_num = row
+                    .get::<_, i16>("colnum")
+                    .try_into()
+                    .expect("non-negative values");
                 let type_mod: i32 = row.get("typmod");
                 let not_null: bool = row.get("not_null");
                 Ok(PostgresColumnDesc {
@@ -158,9 +169,9 @@ pub async fn publication_info(
                 if e.to_string()
                     == "db error: ERROR: column pg_index.indnullsnotdistinct does not exist" =>
             {
-                client.query(pg_14_minus_keys, &[&oid]).await?
+                client.query(pg_14_minus_keys, &[&oid]).await.map_err(PostgresError::from)?
             }
-            e => e?,
+            e => e.map_err(PostgresError::from)?,
         };
 
         let keys = keys

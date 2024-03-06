@@ -12,33 +12,35 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::{Display, Write};
 use std::rc::Rc;
 use std::time::Duration;
 
 use differential_dataflow::collection::AsCollection;
 use differential_dataflow::operators::arrange::Arranged;
-use differential_dataflow::trace::TraceReader;
-use mz_expr::{permutation_for_arrangement, MirScalarExpr};
+use differential_dataflow::trace::{BatchReader, Cursor, TraceReader};
+use differential_dataflow::Collection;
 use mz_ore::cast::CastFrom;
-use mz_repr::{Datum, DatumVec, Diff, GlobalId, Row, Timestamp};
+use mz_repr::{Datum, Diff, GlobalId, Timestamp};
 use mz_timely_util::replay::MzReplay;
 use timely::communication::Allocate;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::channels::pushers::buffer::Session;
 use timely::dataflow::channels::pushers::{Counter, Tee};
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
-use timely::dataflow::operators::{Filter, InspectCore};
-use timely::dataflow::{Scope, StreamCore};
+use timely::dataflow::operators::{Filter, InspectCore, Operator};
+use timely::dataflow::{Scope, Stream, StreamCore};
 use timely::logging::WorkerIdentifier;
+use timely::progress::frontier::{AntichainRef, MutableAntichain};
 use timely::scheduling::Scheduler;
 use timely::worker::Worker;
-use timely::Container;
+use timely::{Container, Data, PartialOrder};
 use tracing::error;
 use uuid::Uuid;
 
 use crate::extensions::arrange::MzArrange;
-use crate::logging::{ComputeLog, EventQueue, LogVariant, SharedLoggingState};
-use crate::typedefs::{KeysValsHandle, RowSpine};
+use crate::logging::{ComputeLog, EventQueue, LogVariant, PermutedRowPacker, SharedLoggingState};
+use crate::typedefs::{RowRowAgent, RowRowSpine};
 
 /// Type alias for a logger of compute events.
 pub type Logger = timely::logging_core::Logger<ComputeEvent, WorkerIdentifier>;
@@ -58,15 +60,16 @@ pub enum ComputeEvent {
         /// Identifier of the export.
         id: GlobalId,
     },
-    /// Dataflow export depends on a named dataflow import.
-    ExportDependency {
-        /// Identifier of the export.
-        export_id: GlobalId,
-        /// Identifier of the import on which the export depends.
-        import_id: GlobalId,
+    /// Peek command.
+    Peek {
+        /// The data for the peek itself.
+        peek: Peek,
+        /// The relevant _type_ of peek: index or persist.
+        // Note that this is not stored on the Peek event for data-packing reasons only.
+        peek_type: PeekType,
+        /// True if the peek is being installed; false if it's being removed.
+        installed: bool,
     },
-    /// Peek command, true for install and false for retire.
-    Peek(Peek, bool),
     /// Available frontier information for dataflow exports.
     Frontier {
         id: GlobalId,
@@ -118,6 +121,28 @@ pub enum ComputeEvent {
         /// Timely worker index of the dataflow.
         dataflow_index: usize,
     },
+    /// The number of errors in a dataflow export has changed.
+    ErrorCount {
+        /// Identifier of the export.
+        export_id: GlobalId,
+        /// The change in error count.
+        diff: i64,
+    },
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub enum PeekType {
+    Index,
+    Persist,
+}
+
+impl PeekType {
+    fn name(self) -> &'static str {
+        match self {
+            PeekType::Index => "index",
+            PeekType::Persist => "persist",
+        }
+    }
 }
 
 /// A logged peek event.
@@ -151,7 +176,7 @@ pub(super) fn construct<A: Allocate + 'static>(
     config: &mz_compute_client::logging::LoggingConfig,
     event_queue: EventQueue<ComputeEvent>,
     shared_state: Rc<RefCell<SharedLoggingState>>,
-) -> BTreeMap<LogVariant, (KeysValsHandle, Rc<dyn Any>)> {
+) -> BTreeMap<LogVariant, (RowRowAgent<Timestamp, Diff>, Rc<dyn Any>)> {
     let logging_interval_ms = std::cmp::max(1, config.interval.as_millis());
     let worker_id = worker.index();
     let worker2 = worker.clone();
@@ -175,7 +200,6 @@ pub(super) fn construct<A: Allocate + 'static>(
         let mut demux = OperatorBuilder::new("Compute Logging Demux".to_string(), scope.clone());
         let mut input = demux.new_input(&logs, Pipeline);
         let (mut export_out, export) = demux.new_output();
-        let (mut dependency_out, dependency) = demux.new_output();
         let (mut frontier_out, frontier) = demux.new_output();
         let (mut import_frontier_out, import_frontier) = demux.new_output();
         let (mut frontier_delay_out, frontier_delay) = demux.new_output();
@@ -186,13 +210,13 @@ pub(super) fn construct<A: Allocate + 'static>(
         let (mut arrangement_heap_capacity_out, arrangement_heap_capacity) = demux.new_output();
         let (mut arrangement_heap_allocations_out, arrangement_heap_allocations) =
             demux.new_output();
+        let (mut error_count_out, error_count) = demux.new_output();
 
         let mut demux_state = DemuxState::new(worker2);
         let mut demux_buffer = Vec::new();
         demux.build(move |_capability| {
             move |_frontiers| {
                 let mut export = export_out.activate();
-                let mut dependency = dependency_out.activate();
                 let mut frontier = frontier_out.activate();
                 let mut import_frontier = import_frontier_out.activate();
                 let mut frontier_delay = frontier_delay_out.activate();
@@ -202,13 +226,13 @@ pub(super) fn construct<A: Allocate + 'static>(
                 let mut arrangement_heap_size = arrangement_heap_size_out.activate();
                 let mut arrangement_heap_capacity = arrangement_heap_capacity_out.activate();
                 let mut arrangement_heap_allocations = arrangement_heap_allocations_out.activate();
+                let mut error_count = error_count_out.activate();
 
                 input.for_each(|cap, data| {
                     data.swap(&mut demux_buffer);
 
                     let mut output_sessions = DemuxOutput {
                         export: export.session(&cap),
-                        dependency: dependency.session(&cap),
                         frontier: frontier.session(&cap),
                         import_frontier: import_frontier.session(&cap),
                         frontier_delay: frontier_delay.session(&cap),
@@ -218,6 +242,7 @@ pub(super) fn construct<A: Allocate + 'static>(
                         arrangement_heap_size: arrangement_heap_size.session(&cap),
                         arrangement_heap_capacity: arrangement_heap_capacity.session(&cap),
                         arrangement_heap_allocations: arrangement_heap_allocations.session(&cap),
+                        error_count: error_count.session(&cap),
                     };
 
                     for (time, logger_id, event) in demux_buffer.drain(..) {
@@ -240,87 +265,124 @@ pub(super) fn construct<A: Allocate + 'static>(
         });
 
         // Encode the contents of each logging stream into its expected `Row` format.
-        let dataflow_current = export.as_collection().map(move |datum| {
-            Row::pack_slice(&[
-                Datum::String(&datum.id.to_string()),
-                Datum::UInt64(u64::cast_from(worker_id)),
-                Datum::UInt64(u64::cast_from(datum.dataflow_id)),
-            ])
+        let mut packer = PermutedRowPacker::new(ComputeLog::DataflowCurrent);
+        let dataflow_current = export.as_collection().map({
+            let mut scratch = String::new();
+            move |datum| {
+                packer.pack_slice(&[
+                    make_string_datum(datum.id, &mut scratch),
+                    Datum::UInt64(u64::cast_from(worker_id)),
+                    Datum::UInt64(u64::cast_from(datum.dataflow_id)),
+                ])
+            }
         });
-        let dataflow_dependency = dependency.as_collection().map(move |datum| {
-            Row::pack_slice(&[
-                Datum::String(&datum.export_id.to_string()),
-                Datum::String(&datum.import_id.to_string()),
-                Datum::UInt64(u64::cast_from(worker_id)),
-            ])
+        let mut packer = PermutedRowPacker::new(ComputeLog::FrontierCurrent);
+        let frontier_current = frontier.as_collection().map({
+            let mut scratch = String::new();
+            move |datum| {
+                packer.pack_slice(&[
+                    make_string_datum(datum.export_id, &mut scratch),
+                    Datum::UInt64(u64::cast_from(worker_id)),
+                    Datum::MzTimestamp(datum.frontier),
+                ])
+            }
         });
-        let frontier_current = frontier.as_collection().map(move |datum| {
-            Row::pack_slice(&[
-                Datum::String(&datum.export_id.to_string()),
-                Datum::UInt64(u64::cast_from(worker_id)),
-                Datum::MzTimestamp(datum.frontier),
-            ])
+        let mut packer = PermutedRowPacker::new(ComputeLog::ImportFrontierCurrent);
+        let import_frontier_current = import_frontier.as_collection().map({
+            let mut scratch1 = String::new();
+            let mut scratch2 = String::new();
+            move |datum| {
+                packer.pack_slice(&[
+                    make_string_datum(datum.export_id, &mut scratch1),
+                    make_string_datum(datum.import_id, &mut scratch2),
+                    Datum::UInt64(u64::cast_from(worker_id)),
+                    Datum::MzTimestamp(datum.frontier),
+                ])
+            }
         });
-        let import_frontier_current = import_frontier.as_collection().map(move |datum| {
-            Row::pack_slice(&[
-                Datum::String(&datum.export_id.to_string()),
-                Datum::String(&datum.import_id.to_string()),
-                Datum::UInt64(u64::cast_from(worker_id)),
-                Datum::MzTimestamp(datum.frontier),
-            ])
+        let mut packer = PermutedRowPacker::new(ComputeLog::FrontierDelay);
+        let frontier_delay = frontier_delay.as_collection().map({
+            let mut scratch1 = String::new();
+            let mut scratch2 = String::new();
+            move |datum| {
+                packer.pack_slice(&[
+                    make_string_datum(datum.export_id, &mut scratch1),
+                    make_string_datum(datum.import_id, &mut scratch2),
+                    Datum::UInt64(u64::cast_from(worker_id)),
+                    Datum::UInt64(datum.delay_pow.try_into().expect("pow too big")),
+                ])
+            }
         });
-        let frontier_delay = frontier_delay.as_collection().map(move |datum| {
-            Row::pack_slice(&[
-                Datum::String(&datum.export_id.to_string()),
-                Datum::String(&datum.import_id.to_string()),
-                Datum::UInt64(u64::cast_from(worker_id)),
-                Datum::UInt64(datum.delay_pow.try_into().expect("pow too big")),
-            ])
+        let mut packer = PermutedRowPacker::new(ComputeLog::PeekCurrent);
+        let peek_current = peek.as_collection().map({
+            let mut scratch = String::new();
+            move |PeekDatum { peek, peek_type }| {
+                packer.pack_slice(&[
+                    Datum::Uuid(peek.uuid),
+                    Datum::UInt64(u64::cast_from(worker_id)),
+                    make_string_datum(peek.id, &mut scratch),
+                    Datum::String(peek_type.name()),
+                    Datum::MzTimestamp(peek.time),
+                ])
+            }
         });
-        let peek_current = peek.as_collection().map(move |datum| {
-            Row::pack_slice(&[
-                Datum::Uuid(datum.uuid),
-                Datum::UInt64(u64::cast_from(worker_id)),
-                Datum::String(&datum.id.to_string()),
-                Datum::MzTimestamp(datum.time),
-            ])
-        });
-        let peek_duration = peek_duration.as_collection().map(move |bucket| {
-            Row::pack_slice(&[
-                Datum::UInt64(u64::cast_from(worker_id)),
-                Datum::UInt64(bucket.try_into().expect("bucket too big")),
-            ])
-        });
+        let mut packer = PermutedRowPacker::new(ComputeLog::PeekDuration);
+        let peek_duration =
+            peek_duration
+                .as_collection()
+                .map(move |PeekDurationDatum { peek_type, bucket }| {
+                    packer.pack_slice(&[
+                        Datum::UInt64(u64::cast_from(worker_id)),
+                        Datum::String(peek_type.name()),
+                        Datum::UInt64(bucket.try_into().expect("bucket too big")),
+                    ])
+                });
+        let mut packer = PermutedRowPacker::new(ComputeLog::ShutdownDuration);
         let shutdown_duration = shutdown_duration.as_collection().map(move |bucket| {
-            Row::pack_slice(&[
+            packer.pack_slice(&[
                 Datum::UInt64(u64::cast_from(worker_id)),
                 Datum::UInt64(bucket.try_into().expect("bucket too big")),
             ])
         });
 
-        let arrangement_heap_datum_to_row = move |ArrangementHeapDatum { operator_id }| {
-            Row::pack_slice(&[
-                Datum::UInt64(operator_id.try_into().expect("operator_id too big")),
-                Datum::UInt64(u64::cast_from(worker_id)),
-            ])
-        };
+        let arrangement_heap_datum_to_row =
+            move |packer: &mut PermutedRowPacker, ArrangementHeapDatum { operator_id }| {
+                packer.pack_slice(&[
+                    Datum::UInt64(operator_id.try_into().expect("operator_id too big")),
+                    Datum::UInt64(u64::cast_from(worker_id)),
+                ])
+            };
 
+        let mut packer = PermutedRowPacker::new(ComputeLog::ArrangementHeapSize);
         let arrangement_heap_size = arrangement_heap_size
             .as_collection()
-            .map(arrangement_heap_datum_to_row.clone());
+            .map(move |d| arrangement_heap_datum_to_row(&mut packer, d));
 
+        let mut packer = PermutedRowPacker::new(ComputeLog::ArrangementHeapCapacity);
         let arrangement_heap_capacity = arrangement_heap_capacity
             .as_collection()
-            .map(arrangement_heap_datum_to_row.clone());
+            .map(move |d| arrangement_heap_datum_to_row(&mut packer, d));
 
+        let mut packer = PermutedRowPacker::new(ComputeLog::ArrangementHeapSize);
         let arrangement_heap_allocations = arrangement_heap_allocations
             .as_collection()
-            .map(arrangement_heap_datum_to_row);
+            .map(move |d| arrangement_heap_datum_to_row(&mut packer, d));
+
+        let mut packer = PermutedRowPacker::new(ComputeLog::ErrorCount);
+        let error_count = error_count.as_collection().map({
+            let mut scratch = String::new();
+            move |datum| {
+                packer.pack_slice(&[
+                    make_string_datum(datum.export_id, &mut scratch),
+                    Datum::UInt64(u64::cast_from(worker_id)),
+                    Datum::Int64(datum.count),
+                ])
+            }
+        });
 
         use ComputeLog::*;
         let logs = [
             (DataflowCurrent, dataflow_current),
-            (DataflowDependency, dataflow_dependency),
             (FrontierCurrent, frontier_current),
             (ImportFrontierCurrent, import_frontier_current),
             (FrontierDelay, frontier_delay),
@@ -330,6 +392,7 @@ pub(super) fn construct<A: Allocate + 'static>(
             (ArrangementHeapSize, arrangement_heap_size),
             (ArrangementHeapCapacity, arrangement_heap_capacity),
             (ArrangementHeapAllocations, arrangement_heap_allocations),
+            (ErrorCount, error_count),
         ];
 
         // Build the output arrangements.
@@ -337,30 +400,10 @@ pub(super) fn construct<A: Allocate + 'static>(
         for (variant, collection) in logs {
             let variant = LogVariant::Compute(variant);
             if config.index_logs.contains_key(&variant) {
-                let key = variant.index_by();
-                let (_, value) = permutation_for_arrangement(
-                    &key.iter()
-                        .cloned()
-                        .map(MirScalarExpr::Column)
-                        .collect::<Vec<_>>(),
-                    variant.desc().arity(),
-                );
                 let trace = collection
-                    .map({
-                        let mut row_buf = Row::default();
-                        let mut datums = DatumVec::new();
-                        move |row| {
-                            let datums = datums.borrow_with(&row);
-                            row_buf.packer().extend(key.iter().map(|k| datums[*k]));
-                            let row_key = row_buf.clone();
-                            row_buf.packer().extend(value.iter().map(|k| datums[*k]));
-                            let row_val = row_buf.clone();
-                            (row_key, row_val)
-                        }
-                    })
-                    .mz_arrange::<RowSpine<_, _, _, _>>(&format!("ArrangeByKey {:?}", variant))
+                    .mz_arrange::<RowRowSpine<_, _>>(&format!("Arrange {variant:?}"))
                     .trace;
-                traces.insert(variant.clone(), (trace, Rc::clone(&token)));
+                traces.insert(variant, (trace, Rc::clone(&token)));
             }
         }
 
@@ -368,14 +411,26 @@ pub(super) fn construct<A: Allocate + 'static>(
     })
 }
 
+/// Format the given value and pack it into a `Datum::String`.
+///
+/// The `scratch` buffer is used to perform the string conversion without an allocation.
+/// Callers should not assume anything about the contents of this buffer after this function
+/// returns.
+fn make_string_datum<V>(value: V, scratch: &mut String) -> Datum<'_>
+where
+    V: Display,
+{
+    scratch.clear();
+    write!(scratch, "{}", value).expect("writing to a `String` can't fail");
+    Datum::String(scratch)
+}
+
 /// State maintained by the demux operator.
 struct DemuxState<A: Allocate> {
     /// The worker hosting this operator.
     worker: Worker<A>,
-    /// Maps dataflow exports to dataflow IDs.
-    export_dataflows: BTreeMap<GlobalId, usize>,
-    /// Maps dataflow exports to their imports and frontier delay tracking state.
-    export_imports: BTreeMap<GlobalId, BTreeMap<GlobalId, FrontierDelayState>>,
+    /// State tracked per dataflow export.
+    exports: BTreeMap<GlobalId, ExportState>,
     /// Maps live dataflows to counts of their exports.
     dataflow_export_counts: BTreeMap<usize, u32>,
     /// Maps dropped dataflows to their drop time.
@@ -392,13 +447,38 @@ impl<A: Allocate> DemuxState<A> {
     fn new(worker: Worker<A>) -> Self {
         Self {
             worker,
-            export_dataflows: Default::default(),
-            export_imports: Default::default(),
+            exports: Default::default(),
             dataflow_export_counts: Default::default(),
             dataflow_drop_times: Default::default(),
             shutdown_dataflows: Default::default(),
             peek_stash: Default::default(),
             arrangement_size: Default::default(),
+        }
+    }
+}
+
+/// State tracked for each dataflow export.
+struct ExportState {
+    /// The ID of the dataflow maintaining this export.
+    dataflow_id: usize,
+    /// The most recently reported frontier of this export.
+    reported_frontier: MutableAntichain<Timestamp>,
+    /// Imports feeding this export, and their frontier delay tracking state.
+    imports: BTreeMap<GlobalId, FrontierDelayState>,
+    /// Number of errors in this export.
+    ///
+    /// This must be a signed integer, since per-worker error counts can be negative, only the
+    /// cross-worker total has to sum up to a non-negative value.
+    error_count: i64,
+}
+
+impl ExportState {
+    fn new(dataflow_id: usize) -> Self {
+        Self {
+            dataflow_id,
+            reported_frontier: MutableAntichain::new(),
+            imports: Default::default(),
+            error_count: 0,
         }
     }
 }
@@ -414,6 +494,14 @@ struct FrontierDelayState {
     delay_map: BTreeMap<u128, i64>,
 }
 
+/// State for tracking arrangement sizes.
+#[derive(Default)]
+struct ArrangementSizeState {
+    size: isize,
+    capacity: isize,
+    count: isize,
+}
+
 type Update<D> = (D, Timestamp, Diff);
 type Pusher<D> = Counter<Timestamp, Update<D>, Tee<Timestamp, Update<D>>>;
 type OutputSession<'a, D> = Session<'a, Timestamp, Vec<Update<D>>, Pusher<D>>;
@@ -421,28 +509,22 @@ type OutputSession<'a, D> = Session<'a, Timestamp, Vec<Update<D>>, Pusher<D>>;
 /// Bundled output sessions used by the demux operator.
 struct DemuxOutput<'a> {
     export: OutputSession<'a, ExportDatum>,
-    dependency: OutputSession<'a, DependencyDatum>,
     frontier: OutputSession<'a, FrontierDatum>,
     import_frontier: OutputSession<'a, ImportFrontierDatum>,
     frontier_delay: OutputSession<'a, FrontierDelayDatum>,
-    peek: OutputSession<'a, Peek>,
-    peek_duration: OutputSession<'a, u128>,
+    peek: OutputSession<'a, PeekDatum>,
+    peek_duration: OutputSession<'a, PeekDurationDatum>,
     shutdown_duration: OutputSession<'a, u128>,
     arrangement_heap_size: OutputSession<'a, ArrangementHeapDatum>,
     arrangement_heap_capacity: OutputSession<'a, ArrangementHeapDatum>,
     arrangement_heap_allocations: OutputSession<'a, ArrangementHeapDatum>,
+    error_count: OutputSession<'a, ErrorCountDatum>,
 }
 
 #[derive(Clone)]
 struct ExportDatum {
     id: GlobalId,
     dataflow_id: usize,
-}
-
-#[derive(Clone)]
-struct DependencyDatum {
-    export_id: GlobalId,
-    import_id: GlobalId,
 }
 
 #[derive(Clone)]
@@ -466,15 +548,29 @@ struct FrontierDelayDatum {
 }
 
 #[derive(Clone)]
+struct PeekDatum {
+    peek: Peek,
+    peek_type: PeekType,
+}
+
+#[derive(Clone)]
+struct PeekDurationDatum {
+    peek_type: PeekType,
+    bucket: u128,
+}
+
+#[derive(Clone)]
 struct ArrangementHeapDatum {
     operator_id: usize,
 }
 
-#[derive(Default)]
-struct ArrangementSizeState {
-    size: isize,
-    capacity: isize,
-    count: isize,
+#[derive(Clone)]
+struct ErrorCountDatum {
+    export_id: GlobalId,
+    // Normally we would use DD's diff field to encode counts, but in this case we can't: The total
+    // per-worker error count might be negative and at the SQL level having negative multiplicities
+    // is treated as an error.
+    count: i64,
 }
 
 /// Event handler of the demux operator.
@@ -508,12 +604,16 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
         match event {
             Export { id, dataflow_index } => self.handle_export(id, dataflow_index),
             ExportDropped { id } => self.handle_export_dropped(id),
-            ExportDependency {
-                export_id,
-                import_id,
-            } => self.handle_export_dependency(export_id, import_id),
-            Peek(peek, true) => self.handle_peek_install(peek),
-            Peek(peek, false) => self.handle_peek_retire(peek),
+            Peek {
+                peek,
+                peek_type,
+                installed: true,
+            } => self.handle_peek_install(peek, peek_type),
+            Peek {
+                peek,
+                peek_type,
+                installed: false,
+            } => self.handle_peek_retire(peek, peek_type),
             Frontier { id, time, diff } => self.handle_frontier(id, time, diff),
             ImportFrontier {
                 import_id,
@@ -540,6 +640,7 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
                 self.handle_arrangement_heap_size_operator_dropped(operator)
             }
             DataflowShutdown { dataflow_index } => self.handle_dataflow_shutdown(dataflow_index),
+            ErrorCount { export_id, diff } => self.handle_error_count(export_id, diff),
         }
     }
 
@@ -548,8 +649,7 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
         let datum = ExportDatum { id, dataflow_id };
         self.output.export.give((datum, ts, 1));
 
-        self.state.export_dataflows.insert(id, dataflow_id);
-        self.state.export_imports.insert(id, BTreeMap::new());
+        self.state.exports.insert(id, ExportState::new(dataflow_id));
         *self
             .state
             .dataflow_export_counts
@@ -558,52 +658,51 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
     }
 
     fn handle_export_dropped(&mut self, id: GlobalId) {
-        let ts = self.ts();
-        if let Some(dataflow_id) = self.state.export_dataflows.remove(&id) {
-            let datum = ExportDatum { id, dataflow_id };
-            self.output.export.give((datum, ts, -1));
-
-            match self.state.dataflow_export_counts.get_mut(&dataflow_id) {
-                entry @ Some(0) | entry @ None => {
-                    error!(
-                        export = ?id,
-                        dataflow = ?dataflow_id,
-                        "invalid dataflow_export_counts entry at time of export drop: {entry:?}",
-                    );
-                }
-                Some(1) => self.handle_dataflow_dropped(dataflow_id),
-                Some(count) => *count -= 1,
-            }
-        } else {
+        let Some(export) = self.state.exports.remove(&id) else {
             error!(
                 export = ?id,
-                "missing export_dataflows entry at time of export drop"
+                "missing exports entry at time of export drop"
             );
+            return;
+        };
+
+        let ts = self.ts();
+        let dataflow_id = export.dataflow_id;
+
+        let datum = ExportDatum { id, dataflow_id };
+        self.output.export.give((datum, ts, -1));
+
+        match self.state.dataflow_export_counts.get_mut(&dataflow_id) {
+            entry @ Some(0) | entry @ None => {
+                error!(
+                    export = ?id,
+                    dataflow = ?dataflow_id,
+                    "invalid dataflow_export_counts entry at time of export drop: {entry:?}",
+                );
+            }
+            Some(1) => self.handle_dataflow_dropped(dataflow_id),
+            Some(count) => *count -= 1,
         }
 
-        // Remove dependency and frontier delay logging for this export.
-        if let Some(imports) = self.state.export_imports.remove(&id) {
-            for (import_id, delay_state) in imports {
-                let datum = DependencyDatum {
+        // Remove frontier delay logging for this export.
+        for (import_id, delay_state) in export.imports {
+            for (delay_pow, count) in delay_state.delay_map {
+                let datum = FrontierDelayDatum {
                     export_id: id,
                     import_id,
+                    delay_pow,
                 };
-                self.output.dependency.give((datum, ts, -1));
-
-                for (delay_pow, count) in delay_state.delay_map {
-                    let datum = FrontierDelayDatum {
-                        export_id: id,
-                        import_id,
-                        delay_pow,
-                    };
-                    self.output.frontier_delay.give((datum, ts, -count));
-                }
+                self.output.frontier_delay.give((datum, ts, -count));
             }
-        } else {
-            error!(
-                export = ?id,
-                "missing export_imports entry at time of export drop"
-            );
+        }
+
+        // Remove error count logging for this export.
+        if export.error_count != 0 {
+            let datum = ErrorCountDatum {
+                export_id: id,
+                count: export.error_count,
+            };
+            self.output.error_count.give((datum, ts, -1));
         }
     }
 
@@ -639,28 +738,42 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
         }
     }
 
-    fn handle_export_dependency(&mut self, export_id: GlobalId, import_id: GlobalId) {
+    fn handle_error_count(&mut self, export_id: GlobalId, diff: i64) {
         let ts = self.ts();
-        let datum = DependencyDatum {
-            export_id,
-            import_id,
-        };
-        self.output.dependency.give((datum, ts, 1));
 
-        if let Some(imports) = self.state.export_imports.get_mut(&export_id) {
-            imports.insert(import_id, Default::default());
-        } else {
-            error!(
-                export = ?export_id, import = ?import_id,
-                "tried to create import for export that doesn't exist"
-            );
+        let Some(export) = self.state.exports.get_mut(&export_id) else {
+            // The export might have already been dropped, in which case we are no longer
+            // interested in its errors.
+            return;
+        };
+
+        let old_count = export.error_count;
+        let new_count = old_count + diff;
+
+        if old_count != 0 {
+            let datum = ErrorCountDatum {
+                export_id,
+                count: old_count,
+            };
+            self.output.error_count.give((datum, ts, -1));
         }
+        if new_count != 0 {
+            let datum = ErrorCountDatum {
+                export_id,
+                count: new_count,
+            };
+            self.output.error_count.give((datum, ts, 1));
+        }
+
+        export.error_count = new_count;
     }
 
-    fn handle_peek_install(&mut self, peek: Peek) {
+    fn handle_peek_install(&mut self, peek: Peek, peek_type: PeekType) {
         let uuid = peek.uuid;
         let ts = self.ts();
-        self.output.peek.give((peek, ts, 1));
+        self.output
+            .peek
+            .give((PeekDatum { peek, peek_type }, ts, 1));
 
         let existing = self.state.peek_stash.insert(uuid, self.time);
         if existing.is_some() {
@@ -671,15 +784,19 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
         }
     }
 
-    fn handle_peek_retire(&mut self, peek: Peek) {
+    fn handle_peek_retire(&mut self, peek: Peek, peek_type: PeekType) {
         let uuid = peek.uuid;
         let ts = self.ts();
-        self.output.peek.give((peek, ts, -1));
+        self.output
+            .peek
+            .give((PeekDatum { peek, peek_type }, ts, -1));
 
         if let Some(start) = self.state.peek_stash.remove(&uuid) {
             let elapsed_ns = self.time.saturating_sub(start).as_nanos();
-            let elapsed_pow = elapsed_ns.next_power_of_two();
-            self.output.peek_duration.give((elapsed_pow, ts, 1));
+            let bucket = elapsed_ns.next_power_of_two();
+            self.output
+                .peek_duration
+                .give((PeekDurationDatum { peek_type, bucket }, ts, 1));
         } else {
             error!(
                 uuid = ?uuid,
@@ -689,12 +806,21 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
     }
 
     fn handle_frontier(&mut self, export_id: GlobalId, frontier: Timestamp, diff: i8) {
+        let diff = i64::from(diff);
         let ts = self.ts();
         let datum = FrontierDatum {
             export_id,
             frontier,
         };
-        self.output.frontier.give((datum, ts, diff.into()));
+        self.output.frontier.give((datum, ts, diff));
+
+        let Some(export) = self.state.exports.get_mut(&export_id) else {
+            // We might see frontier updates from dataflows we have already dropped but that are
+            // still running in Timely. We ignore those.
+            return;
+        };
+
+        export.reported_frontier.update_iter([(frontier, diff)]);
 
         // Everything below only applies to frontier insertions.
         if diff <= 0 {
@@ -703,30 +829,28 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
 
         // Check if we have imports associated to this export and report frontier advancement
         // delays.
-        if let Some(import_map) = self.state.export_imports.get_mut(&export_id) {
-            for (&import_id, delay_state) in import_map {
-                let FrontierDelayState {
-                    time_deque,
-                    delay_map,
-                } = delay_state;
-                while let Some(current_front) = time_deque.pop_front() {
-                    let (import_frontier, update_time) = current_front;
-                    if frontier >= import_frontier {
-                        let elapsed_ns = self.time.saturating_sub(update_time).as_nanos();
-                        let elapsed_pow = elapsed_ns.next_power_of_two();
-                        let datum = FrontierDelayDatum {
-                            export_id,
-                            import_id,
-                            delay_pow: elapsed_pow,
-                        };
-                        self.output.frontier_delay.give((datum, ts, 1));
+        for (&import_id, delay_state) in &mut export.imports {
+            let FrontierDelayState {
+                time_deque,
+                delay_map,
+            } = delay_state;
+            while let Some(current_front) = time_deque.pop_front() {
+                let (import_frontier, update_time) = current_front;
+                if frontier >= import_frontier {
+                    let elapsed_ns = self.time.saturating_sub(update_time).as_nanos();
+                    let elapsed_pow = elapsed_ns.next_power_of_two();
+                    let datum = FrontierDelayDatum {
+                        export_id,
+                        import_id,
+                        delay_pow: elapsed_pow,
+                    };
+                    self.output.frontier_delay.give((datum, ts, 1));
 
-                        let delay_count = delay_map.entry(elapsed_pow).or_default();
-                        *delay_count += 1;
-                    } else {
-                        time_deque.push_front(current_front);
-                        break;
-                    }
+                    let delay_count = delay_map.entry(elapsed_pow).or_default();
+                    *delay_count += 1;
+                } else {
+                    time_deque.push_front(current_front);
+                    break;
                 }
             }
         }
@@ -753,17 +877,19 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
         }
 
         // Note that it is possible that we receive frontier updates for exports no longer present
-        // in `export_imports`. This behavior arises because `ImportFrontier` events are generated
+        // in `exports`. This behavior arises because `ImportFrontier` events are generated
         // by a dataflow `inspect_container` operator, which may outlive the corresponding trace or
         // sink recording in the current `ComputeState` until Timely eventually drops it.
-        if let Some(import_map) = self.state.export_imports.get_mut(&export_id) {
-            if let Some(delay_state) = import_map.get_mut(&import_id) {
+        if let Some(export) = self.state.exports.get_mut(&export_id) {
+            // It is possible that an export's frontier is beyond the frontier of its inputs. In
+            // particular, `persist_sink` is known to immediately advance non-active workers to the
+            // empty frontier. We must be careful to not enqueue import frontiers in this case, as
+            // they might otherwise never be picked up and leak.
+            let import_frontier = [frontier];
+            let export_frontier = export.reported_frontier.frontier();
+            if PartialOrder::less_than(&export_frontier, &AntichainRef::new(&import_frontier)) {
+                let delay_state = export.imports.entry(import_id).or_default();
                 delay_state.time_deque.push_back((frontier, self.time));
-            } else {
-                error!(
-                    export = ?export_id, import = ?import_id,
-                    "tried to create update frontier for import that doesn't exist"
-                );
             }
         }
     }
@@ -771,7 +897,9 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
     /// Update the allocation size for an arrangement.
     fn handle_arrangement_heap_size(&mut self, operator_id: usize, size: isize) {
         let ts = self.ts();
-        let Some(state) = self.state.arrangement_size.get_mut(&operator_id) else {return};
+        let Some(state) = self.state.arrangement_size.get_mut(&operator_id) else {
+            return;
+        };
 
         let datum = ArrangementHeapDatum { operator_id };
         self.output
@@ -784,7 +912,9 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
     /// Update the allocation capacity for an arrangement.
     fn handle_arrangement_heap_capacity(&mut self, operator_id: usize, capacity: isize) {
         let ts = self.ts();
-        let Some(state) = self.state.arrangement_size.get_mut(&operator_id) else {return};
+        let Some(state) = self.state.arrangement_size.get_mut(&operator_id) else {
+            return;
+        };
 
         let datum = ArrangementHeapDatum { operator_id };
         self.output
@@ -797,7 +927,9 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
     /// Update the allocation count for an arrangement.
     fn handle_arrangement_heap_allocations(&mut self, operator_id: usize, count: isize) {
         let ts = self.ts();
-        let Some(state) = self.state.arrangement_size.get_mut(&operator_id) else {return};
+        let Some(state) = self.state.arrangement_size.get_mut(&operator_id) else {
+            return;
+        };
 
         let datum = ArrangementHeapDatum { operator_id };
         self.output
@@ -845,6 +977,8 @@ impl<A: Allocate> DemuxHandler<'_, '_, A> {
     }
 }
 
+/// Extension trait to attach `ComputeEvent::ImportFrontier` logging operators to streams and
+/// arrangements.
 pub(crate) trait LogImportFrontiers {
     fn log_import_frontiers(
         self,
@@ -936,5 +1070,92 @@ impl RetractImportFrontiers {
 impl Drop for RetractImportFrontiers {
     fn drop(&mut self) {
         self.log();
+    }
+}
+
+/// Extension trait to attach `ComputeEvent::DataflowError` logging operators to collections and
+/// batch streams.
+pub(crate) trait LogDataflowErrors {
+    fn log_dataflow_errors(self, logger: Logger, export_id: GlobalId) -> Self;
+}
+
+impl<G, D> LogDataflowErrors for Collection<G, D, Diff>
+where
+    G: Scope,
+    D: Data,
+{
+    fn log_dataflow_errors(self, logger: Logger, export_id: GlobalId) -> Self {
+        self.inner
+            .unary(Pipeline, "LogDataflowErrorsCollection", |_cap, _info| {
+                let mut buffer = Vec::new();
+                move |input, output| {
+                    input.for_each(|cap, data| {
+                        data.swap(&mut buffer);
+
+                        let diff = buffer.iter().map(|(_d, _t, r)| r).sum();
+                        logger.log(ComputeEvent::ErrorCount { export_id, diff });
+
+                        output.session(&cap).give_vec(&mut buffer);
+                    });
+                }
+            })
+            .as_collection()
+    }
+}
+
+impl<G, B> LogDataflowErrors for Stream<G, B>
+where
+    G: Scope,
+    B: BatchReader<Diff = Diff> + Clone + 'static,
+{
+    fn log_dataflow_errors(self, logger: Logger, export_id: GlobalId) -> Self {
+        self.unary(Pipeline, "LogDataflowErrorsStream", |_cap, _info| {
+            let mut buffer = Vec::new();
+            move |input, output| {
+                input.for_each(|cap, data| {
+                    data.swap(&mut buffer);
+
+                    let diff = buffer.iter().map(sum_batch_diffs).sum();
+                    logger.log(ComputeEvent::ErrorCount { export_id, diff });
+
+                    output.session(&cap).give_vec(&mut buffer);
+                });
+            }
+        })
+    }
+}
+
+/// Return the sum of all diffs within the given batch.
+///
+/// Note that this operation can be expensive: Its runtime is O(N) with N being the number of
+/// unique (key, value, time) tuples. We only use it on error streams, which are expected to
+/// contain only a small number of records, so this doesn't matter much. But avoid using it when
+/// batches might become large.
+fn sum_batch_diffs<B>(batch: &B) -> Diff
+where
+    B: BatchReader<Diff = Diff>,
+{
+    let mut sum = 0;
+    let mut cursor = batch.cursor();
+
+    while cursor.key_valid(batch) {
+        while cursor.val_valid(batch) {
+            cursor.map_times(batch, |_t, r| sum += r);
+            cursor.step_val(batch);
+        }
+        cursor.step_key(batch);
+    }
+
+    sum
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[mz_ore::test]
+    fn test_compute_event_size() {
+        // This could be a static assertion, but we don't use those yet in this crate.
+        assert_eq!(48, std::mem::size_of::<ComputeEvent>())
     }
 }

@@ -31,40 +31,44 @@
 use mz_expr::visit::VisitChildren;
 use mz_expr::{MapFilterProject, MirRelationExpr};
 
-use crate::{IndexOracle, TransformArgs};
+use crate::TransformCtx;
 
 /// Canonicalizes MFPs and performs common sub-expression elimination.
 #[derive(Debug)]
 pub struct CanonicalizeMfp;
 
 impl crate::Transform for CanonicalizeMfp {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "canonicalize_mfp")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        args: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
-        let result = self.action(relation, args.indexes);
+        let result = self.action(relation);
         mz_repr::explain::trace_plan(&*relation);
         result
     }
 }
 
 impl CanonicalizeMfp {
-    fn action(
-        &self,
-        relation: &mut MirRelationExpr,
-        indexes: &dyn IndexOracle,
-    ) -> Result<(), crate::TransformError> {
+    /// Extract and optimzie MFPs.
+    pub fn action(&self, relation: &mut MirRelationExpr) -> Result<(), crate::TransformError> {
         let mut mfp = MapFilterProject::extract_non_errors_from_expr_mut(relation);
-        relation.try_visit_mut_children(|e| self.action(e, indexes))?;
-        mfp.optimize(); // Optimize MFP, e.g., perform CSE
-        Self::rebuild_mfp(mfp, relation);
+        // Optimize MFP, e.g., perform CSE Push MFPs through `Negate` operators,
+        // if encountered. This is a first steps toward a `CanonicalizeLinear`,
+        // which puts linear operators in a canonical representation.
+        mfp.optimize();
+        if let MirRelationExpr::Negate { input } = relation {
+            Self::rebuild_mfp(mfp, &mut **input);
+            relation.try_visit_mut_children(|e| self.action(e))?;
+        } else {
+            relation.try_visit_mut_children(|e| self.action(e))?;
+            Self::rebuild_mfp(mfp, relation);
+        }
         Ok(())
     }
 

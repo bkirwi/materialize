@@ -22,19 +22,27 @@ use futures::future::FutureExt;
 use itertools::Itertools;
 use mz_adapter::catalog::{Catalog, ConnCatalog};
 use mz_adapter::session::Session;
+use mz_build_info::BuildInfo;
+use mz_catalog::durable::StashConfig;
 use mz_kafka_util::client::{create_new_client_config_simple, MzClientContext};
 use mz_ore::error::ErrorExt;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::SYSTEM_TIME;
 use mz_ore::retry::Retry;
 use mz_ore::task;
-use mz_postgres_util::make_tls;
+use mz_persist_client::cache::PersistClientCache;
+use mz_persist_client::cfg::PersistConfig;
+use mz_persist_client::rpc::PubSubClientConnection;
+use mz_persist_client::{PersistClient, PersistLocation};
+use mz_sql::catalog::EnvironmentId;
 use mz_stash::StashFactory;
+use mz_tls_util::make_tls;
 use once_cell::sync::Lazy;
 use rand::Rng;
 use rdkafka::producer::Producer;
 use rdkafka::ClientConfig;
 use regex::{Captures, Regex};
+use tracing::info;
 use url::Url;
 
 use crate::error::PosError;
@@ -44,20 +52,26 @@ use crate::parser::{
 use crate::util;
 use crate::util::postgres::postgres_client;
 
+pub mod consistency;
+
 mod file;
 mod http;
 mod kafka;
 mod mysql;
+mod nop;
+mod persist;
 mod postgres;
 mod protobuf;
 mod psql;
 mod schema_registry;
 mod set;
+mod skip_end;
 mod skip_if;
 mod sleep;
 mod sql;
 mod sql_server;
 mod version_check;
+mod webhook;
 
 /// User-settable configuration parameters.
 #[derive(Debug)]
@@ -78,6 +92,8 @@ pub struct Config {
     /// If unspecified, testdrive creates a temporary directory with a random
     /// name.
     pub temp_dir: Option<String>,
+    /// Source string to print out on errors.
+    pub source: Option<String>,
     /// The default timeout for cancellable operations.
     pub default_timeout: Duration,
     /// The default number of tries for retriable operations.
@@ -90,6 +106,8 @@ pub struct Config {
     ///
     /// Set to 1 to retry at a steady pace.
     pub backoff_factor: f64,
+    /// Should we skip coordinator and catalog consistency checks.
+    pub consistency_checks: consistency::Level,
 
     // === Materialize options. ===
     /// The pgwire connection parameters for the Materialize instance that
@@ -106,8 +124,16 @@ pub struct Config {
     pub materialize_internal_http_port: u16,
     /// Session parameters to set after connecting to materialize.
     pub materialize_params: Vec<(String, String)>,
-    /// An optional Postgres connection string to the catalog stash.
-    pub materialize_catalog_postgres_stash: Option<String>,
+    /// An optional catalog configuration.
+    pub materialize_catalog_config: Option<CatalogConfig>,
+    /// Build information
+    pub build_info: &'static BuildInfo,
+
+    // === Persist options. ===
+    /// Handle to the persist consensus system.
+    pub persist_consensus_url: Option<String>,
+    /// Handle to the persist blob storage.
+    pub persist_blob_url: Option<String>,
 
     // === Confluent options. ===
     /// The address of the Kafka broker that testdrive will interact with.
@@ -152,17 +178,28 @@ pub struct State {
     max_tries: usize,
     initial_backoff: Duration,
     backoff_factor: f64,
+    consistency_checks: consistency::Level,
+    consistency_checks_adhoc_skip: bool,
     regex: Option<Regex>,
     regex_replacement: String,
     postgres_factory: StashFactory,
 
     // === Materialize state. ===
-    materialize_catalog_postgres_stash: Option<String>,
+    materialize_catalog_config: Option<CatalogConfig>,
+
     materialize_sql_addr: String,
+    materialize_http_addr: String,
     materialize_internal_sql_addr: String,
     materialize_internal_http_addr: String,
     materialize_user: String,
     pgclient: tokio_postgres::Client,
+    environment_id: EnvironmentId,
+
+    // === Persist state. ===
+    persist_consensus_url: Option<String>,
+    persist_blob_url: Option<String>,
+    build_info: &'static BuildInfo,
+    persist_clients: PersistClientCache,
 
     // === Confluent state. ===
     schema_registry_url: Url,
@@ -240,6 +277,10 @@ impl State {
             );
         }
         self.cmd_vars.insert(
+            "testdrive.materialize-environment-id".into(),
+            self.environment_id.to_string(),
+        );
+        self.cmd_vars.insert(
             "testdrive.materialize-sql-addr".into(),
             self.materialize_sql_addr.clone(),
         );
@@ -264,20 +305,65 @@ impl State {
 
         Ok(())
     }
-    /// Makes of copy of the stash's catalog and runs a function on its
+    /// Makes of copy of the durable catalog and runs a function on its
     /// state. Returns `None` if there's no catalog information in the State.
     pub async fn with_catalog_copy<F, T>(&self, f: F) -> Result<Option<T>, anyhow::Error>
     where
         F: FnOnce(ConnCatalog) -> T,
     {
-        if let Some(url) = &self.materialize_catalog_postgres_stash {
-            let tls = mz_postgres_util::make_tls(&tokio_postgres::Config::new()).unwrap();
-            let stash = self
-                .postgres_factory
-                .open_readonly(url.clone(), None, tls)
-                .await?;
-            let catalog = Catalog::open_debug_stash(stash, SYSTEM_TIME.clone()).await?;
+        fn stash_config(stash_url: String, stash_factory: StashFactory) -> StashConfig {
+            let tls = mz_tls_util::make_tls(&tokio_postgres::Config::new()).unwrap();
+            StashConfig {
+                stash_factory,
+                stash_url,
+                schema: None,
+                tls,
+            }
+        }
+
+        async fn persist_client(
+            persist_consensus_url: String,
+            persist_blob_url: String,
+            persist_clients: &PersistClientCache,
+        ) -> Result<PersistClient, anyhow::Error> {
+            let persist_location = PersistLocation {
+                blob_uri: persist_blob_url,
+                consensus_uri: persist_consensus_url,
+            };
+            Ok(persist_clients.open(persist_location).await?)
+        }
+
+        if let Some(catalog_config) = &self.materialize_catalog_config {
+            let catalog = match catalog_config {
+                CatalogConfig::Stash { url } => {
+                    let stash_config = stash_config(url.clone(), self.postgres_factory.clone());
+                    Catalog::open_debug_read_only_stash_catalog_config(
+                        stash_config,
+                        SYSTEM_TIME.clone(),
+                        Some(self.environment_id.clone()),
+                    )
+                    .await?
+                }
+                CatalogConfig::Persist {
+                    persist_consensus_url,
+                    persist_blob_url,
+                } => {
+                    let persist_client = persist_client(
+                        persist_consensus_url.clone(),
+                        persist_blob_url.clone(),
+                        &self.persist_clients,
+                    )
+                    .await?;
+                    Catalog::open_debug_read_only_persist_catalog_config(
+                        persist_client,
+                        SYSTEM_TIME.clone(),
+                        self.environment_id.clone(),
+                    )
+                    .await?
+                }
+            };
             let res = f(catalog.for_session(&Session::dummy()));
+            catalog.expire().await;
             Ok(Some(res))
         } else {
             Ok(None)
@@ -292,16 +378,38 @@ impl State {
         self.aws_config.region().map(|r| r.as_ref()).unwrap_or("")
     }
 
+    /// Resets the adhoc skip consistency check that users can toggle per-file, and returns whether
+    /// the consistency checks should be skipped for this current run.
+    pub fn clear_skip_consistency_checks(&mut self) -> bool {
+        std::mem::replace(&mut self.consistency_checks_adhoc_skip, false)
+    }
+
     pub async fn reset_materialize(&mut self) -> Result<(), anyhow::Error> {
-        let (inner_client, _) = postgres_client(&format!(
-            "postgres://mz_system:materialize@{}",
-            self.materialize_internal_sql_addr
-        ))
+        let (inner_client, _) = postgres_client(
+            &format!(
+                "postgres://mz_system:materialize@{}",
+                self.materialize_internal_sql_addr
+            ),
+            self.default_timeout,
+        )
         .await?;
+
+        let version = inner_client
+            .query_one("SELECT mz_version_num()", &[])
+            .await
+            .context("getting version of materialize")
+            .map(|row| row.get::<_, i32>(0))?;
+
         inner_client
             .batch_execute("ALTER SYSTEM RESET ALL")
             .await
             .context("resetting materialize state: ALTER SYSTEM RESET ALL")?;
+
+        // Dangerous functions are useful for tests so we enable it for all tests.
+        inner_client
+            .batch_execute("ALTER SYSTEM SET enable_unsafe_functions = on")
+            .await
+            .context("enabling dangerous functions")?;
 
         for row in inner_client
             .query("SHOW DATABASES", &[])
@@ -309,6 +417,9 @@ impl State {
             .context("resetting materialize state: SHOW DATABASES")?
         {
             let db_name: String = row.get(0);
+            if db_name.starts_with("testdrive_no_reset_") {
+                continue;
+            }
             let query = format!("DROP DATABASE {}", db_name);
             sql::print_query(&query, None);
             inner_client.batch_execute(&query).await.context(format!(
@@ -316,6 +427,58 @@ impl State {
                 db_name,
             ))?;
         }
+
+        // Get all user clusters not running any objects owned by users
+        let inactive_user_clusters = "
+        WITH
+            active_user_clusters AS
+            (
+                SELECT DISTINCT cluster_id, object_id
+                FROM
+                    (
+                        SELECT cluster_id, id FROM mz_catalog.mz_sources
+                        UNION ALL SELECT cluster_id, id FROM mz_catalog.mz_sinks
+                        UNION ALL
+                            SELECT cluster_id, id
+                            FROM mz_catalog.mz_materialized_views
+                        UNION ALL
+                            SELECT cluster_id, id FROM mz_catalog.mz_indexes
+                        UNION ALL
+                            SELECT cluster_id, id
+                            FROM mz_internal.mz_subscriptions
+                    )
+                    AS t (cluster_id, object_id)
+                WHERE cluster_id IS NOT NULL AND object_id LIKE 'u%'
+            )
+        SELECT name
+        FROM mz_catalog.mz_clusters
+        WHERE
+            id NOT IN ( SELECT cluster_id FROM active_user_clusters ) AND id LIKE 'u%'
+                AND
+            owner_id LIKE 'u%';";
+
+        let inactive_clusters = inner_client
+            .query(inactive_user_clusters, &[])
+            .await
+            .context("resetting materialize state: inactive_user_clusters")?;
+
+        if !inactive_clusters.is_empty() {
+            println!("cleaning up user clusters from previous tests...")
+        }
+
+        for cluster_name in inactive_clusters {
+            let cluster_name: String = cluster_name.get(0);
+            if cluster_name.starts_with("testdrive_no_reset_") {
+                continue;
+            }
+            let query = format!("DROP CLUSTER {}", cluster_name);
+            sql::print_query(&query, None);
+            inner_client.batch_execute(&query).await.context(format!(
+                "resetting materialize state: DROP CLUSTER {}",
+                cluster_name,
+            ))?;
+        }
+
         inner_client
             .batch_execute("CREATE DATABASE materialize")
             .await
@@ -339,10 +502,10 @@ impl State {
             }
         }
 
-        // Alter materialize user with all attributes.
+        // Alter materialize user with all system privileges.
         inner_client
             .batch_execute(&format!(
-                "ALTER ROLE {} WITH CREATEDB CREATECLUSTER CREATEROLE",
+                "GRANT ALL PRIVILEGES ON SYSTEM TO {}",
                 self.materialize_user
             ))
             .await?;
@@ -363,12 +526,17 @@ impl State {
                 self.materialize_user
             ))
             .await?;
+
+        let cluster = match version {
+            ..=8199 => "default",
+            8200.. => "quickstart",
+        };
         inner_client
-            .batch_execute("GRANT USAGE ON CLUSTER default TO PUBLIC")
+            .batch_execute(&format!("GRANT USAGE ON CLUSTER {cluster} TO PUBLIC"))
             .await?;
         inner_client
             .batch_execute(&format!(
-                "GRANT ALL PRIVILEGES ON CLUSTER default TO {}",
+                "GRANT ALL PRIVILEGES ON CLUSTER {cluster} TO {}",
                 self.materialize_user
             ))
             .await?;
@@ -468,9 +636,27 @@ impl State {
     }
 }
 
+/// Configuration for the Catalog.
+#[derive(Debug, Clone)]
+pub enum CatalogConfig {
+    /// The catalog contents are stored the stash.
+    Stash {
+        /// The PostgreSQL URL for the adapter stash.
+        url: String,
+    },
+    /// The catalog contents are stored in persist.
+    Persist {
+        /// Handle to the persist consensus system.
+        persist_consensus_url: String,
+        /// Handle to the persist blob storage.
+        persist_blob_url: String,
+    },
+}
+
 pub enum ControlFlow {
     Continue,
-    Break,
+    SkipBegin,
+    SkipEnd,
 }
 
 #[async_trait]
@@ -520,16 +706,27 @@ impl Run for PosCommand {
                     *line = subst(line, &state.cmd_vars)?;
                 }
                 match builtin.name.as_ref() {
+                    "check-consistency" => consistency::run_consistency_checks(state).await,
+                    "skip-consistency-checks" => {
+                        consistency::skip_consistency_checks(builtin, state)
+                    }
+                    "check-shard-tombstone" => {
+                        consistency::run_check_shard_tombstoned(builtin, state).await
+                    }
                     "file-append" => file::run_append(builtin, state).await,
                     "file-delete" => file::run_delete(builtin, state).await,
                     "http-request" => http::run_request(builtin, state).await,
                     "kafka-add-partitions" => kafka::run_add_partitions(builtin, state).await,
                     "kafka-create-topic" => kafka::run_create_topic(builtin, state).await,
+                    "kafka-wait-topic" => kafka::run_wait_topic(builtin, state).await,
+                    "kafka-delete-topic-flaky" => kafka::run_delete_topic(builtin, state).await,
                     "kafka-ingest" => kafka::run_ingest(builtin, state).await,
                     "kafka-verify-data" => kafka::run_verify_data(builtin, state).await,
                     "kafka-verify-commit" => kafka::run_verify_commit(builtin, state).await,
+                    "kafka-verify-topic" => kafka::run_verify_topic(builtin, state).await,
                     "mysql-connect" => mysql::run_connect(builtin, state).await,
                     "mysql-execute" => mysql::run_execute(builtin, state).await,
+                    "nop" => nop::run_nop(),
                     "postgres-connect" => postgres::run_connect(builtin, state).await,
                     "postgres-execute" => postgres::run_execute(builtin, state).await,
                     "postgres-verify-slot" => postgres::run_verify_slot(builtin, state).await,
@@ -541,8 +738,12 @@ impl Run for PosCommand {
                     "schema-registry-verify" => schema_registry::run_verify(builtin, state).await,
                     "schema-registry-wait" => schema_registry::run_wait(builtin, state).await,
                     "skip-if" => skip_if::run_skip_if(builtin, state).await,
+                    "skip-end" => skip_end::run_skip_end(),
                     "sql-server-connect" => sql_server::run_connect(builtin, state).await,
                     "sql-server-execute" => sql_server::run_execute(builtin, state).await,
+                    "persist-force-compaction" => {
+                        persist::run_force_compaction(builtin, state).await
+                    }
                     "random-sleep" => sleep::run_random_sleep(builtin),
                     "set-regex" => set::run_regex_set(builtin, state),
                     "unset-regex" => set::run_regex_unset(builtin, state),
@@ -553,6 +754,8 @@ impl Run for PosCommand {
                     }
                     "set" => set::set_vars(builtin, state),
                     "set-from-sql" => set::run_set_from_sql(builtin, state).await,
+                    "set-from-file" => set::run_set_from_file(builtin, state).await,
+                    "webhook-append" => webhook::run_append(builtin, state).await,
                     // "verify-timestamp-compaction" => Box::new(
                     //     verify_timestamp_compaction::run_verify_timestamp_compaction_action(
                     //         builtin,
@@ -663,10 +866,11 @@ pub async fn create_state(
         }
     };
 
-    let materialize_catalog_postgres_stash = config.materialize_catalog_postgres_stash.clone();
+    let materialize_catalog_config = config.materialize_catalog_config.clone();
 
     let (
         materialize_sql_addr,
+        materialize_http_addr,
         materialize_internal_sql_addr,
         materialize_internal_http_addr,
         materialize_user,
@@ -677,6 +881,7 @@ pub async fn create_state(
         let materialize_internal_url =
             util::postgres::config_url(&config.materialize_internal_pgconfig)?;
 
+        info!("Connecting to {}", materialize_url.as_str());
         let (pgclient, pgconn) = Retry::default()
             .max_duration(config.default_timeout)
             .retry_async_canceling(|_| async move {
@@ -708,6 +913,11 @@ pub async fn create_state(
             materialize_url.host_str().unwrap(),
             materialize_url.port().unwrap()
         );
+        let materialize_http_addr = format!(
+            "{}:{}",
+            materialize_url.host_str().unwrap(),
+            config.materialize_http_port
+        );
         let materialize_internal_sql_addr = format!(
             "{}:{}",
             materialize_internal_url.host_str().unwrap(),
@@ -720,6 +930,7 @@ pub async fn create_state(
         );
         (
             materialize_sql_addr,
+            materialize_http_addr,
             materialize_internal_sql_addr,
             materialize_internal_http_addr,
             materialize_user,
@@ -727,6 +938,13 @@ pub async fn create_state(
             pgconn_task,
         )
     };
+
+    let environment_id = pgclient
+        .query_one("SELECT mz_environment_id()", &[])
+        .await?
+        .get::<_, String>(0)
+        .parse()
+        .context("parsing environment ID")?;
 
     let schema_registry_url = config.schema_registry_url.to_owned();
 
@@ -764,19 +982,20 @@ pub async fn create_state(
                 kafka_config.set("ssl.keystore.password", cert_password);
             }
         }
+        kafka_config.set("message.max.bytes", "15728640");
+
         for (key, value) in &config.kafka_opts {
             kafka_config.set(key, value);
         }
 
         let admin: AdminClient<_> = kafka_config
-            .create_with_context(MzClientContext)
+            .create_with_context(MzClientContext::default())
             .with_context(|| format!("opening Kafka connection: {}", config.kafka_addr))?;
 
         let admin_opts = AdminOptions::new().operation_timeout(Some(config.default_timeout));
 
-        kafka_config.set("message.max.bytes", "15728640");
         let producer: FutureProducer<_> = kafka_config
-            .create_with_context(MzClientContext)
+            .create_with_context(MzClientContext::default())
             .with_context(|| format!("opening Kafka producer connection: {}", config.kafka_addr))?;
 
         let topics = BTreeMap::new();
@@ -803,17 +1022,31 @@ pub async fn create_state(
         max_tries: config.default_max_tries,
         initial_backoff: config.initial_backoff,
         backoff_factor: config.backoff_factor,
+        consistency_checks: config.consistency_checks,
+        consistency_checks_adhoc_skip: false,
         regex: None,
         regex_replacement: set::DEFAULT_REGEX_REPLACEMENT.into(),
         postgres_factory: StashFactory::new(&MetricsRegistry::new()),
 
         // === Materialize state. ===
-        materialize_catalog_postgres_stash,
+        materialize_catalog_config,
         materialize_sql_addr,
+        materialize_http_addr,
         materialize_internal_sql_addr,
         materialize_internal_http_addr,
         materialize_user,
         pgclient,
+        environment_id,
+
+        // === Persist state. ===
+        persist_consensus_url: config.persist_consensus_url.clone(),
+        persist_blob_url: config.persist_blob_url.clone(),
+        build_info: config.build_info,
+        persist_clients: PersistClientCache::new(
+            PersistConfig::new_default_configs(config.build_info, SYSTEM_TIME.clone()),
+            &MetricsRegistry::new(),
+            |_, _| PubSubClientConnection::noop(),
+        ),
 
         // === Confluent state. ===
         schema_registry_url,

@@ -38,7 +38,7 @@ $ kafka-ingest format=avro topic=upsert key-format=avro key-schema=${keyschema} 
 {"key": "mammalmore"} {"f1":"moose", "f2": 2}
 
 > CREATE CONNECTION conn
-  FOR KAFKA BROKER '${testdrive.kafka-addr}'
+  FOR KAFKA BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT
 
 > CREATE CONNECTION c_conn
   FOR CONFLUENT SCHEMA REGISTRY URL '${testdrive.schema-registry-url}'
@@ -63,11 +63,23 @@ mammalmore    moose    2
 #
 # Ensure that statistics are correctly updated
 > SELECT
-    SUM(u.envelope_state_bytes) > 0,
-    SUM(u.envelope_state_count)
+    SUM(u.bytes_indexed) > 0,
+    SUM(u.records_indexed),
+    bool_and(u.rehydration_latency IS NOT NULL)
   FROM mz_sources s
-  JOIN mz_internal.mz_source_statistics u ON s.id = u.id
+  JOIN mz_internal.mz_source_statistics_raw u ON s.id = u.id
   WHERE s.name IN ('upsert')
   GROUP BY s.name
   ORDER BY s.name
-true 3
+true 3 true
+
+# Write another part to test backpressure
+$ kafka-ingest format=avro topic=upsert key-format=avro key-schema=${keyschema} schema=${schema}
+{"key": "fish"} {"f1": "fish", "f2": 1001}
+
+> SELECT * from upsert
+key           f1       f2
+---------------------------
+fish          fish     1001
+birdmore      geese    56
+mammalmore    moose    2

@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ set-regex match=cluster1|default replacement=<CLUSTER_NAME>
+$ set-regex match=cluster1|quickstart replacement=<CLUSTER_NAME>
 
 ! INSERT INTO t VALUES (1, 'a');
 contains:unknown catalog item 't'
@@ -54,8 +54,8 @@ name
 t
 
 > SHOW SOURCES;
-name    type  size
-------------------
+name    type  size  cluster
+---------------------------
 
 > SHOW INDEXES ON t;
 
@@ -103,9 +103,10 @@ $ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
 {"id": "valid1", "a": 2, "b": 1}
 
 > CREATE CONNECTION kafka_conn
-  TO KAFKA (BROKER '${testdrive.kafka-addr}');
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > CREATE SOURCE data
+  IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
   FORMAT AVRO USING SCHEMA '${schema}'
 
@@ -248,8 +249,8 @@ v
 v
 
 > SHOW SOURCES;
-name    type   size
--------------------
+name    type   size   cluster
+-----------------------------
 
 > CREATE TABLE t (a int, b text NOT NULL)
 
@@ -377,3 +378,37 @@ name nullable type
 -----------------------
 b    true     integer
 a    true     integer
+
+
+# Test that the underlying Persist shard gets cleaned up on DROP.
+> CREATE TABLE shard_drop_test (a int, b text);
+> INSERT INTO shard_drop_test VALUES (1, 'hello');
+
+> CREATE TABLE shard_drop_test_empty (a int, b text);
+
+$ set-from-sql var=shard-drop-test-id
+SELECT id FROM mz_tables WHERE name = 'shard_drop_test';
+
+$ set-from-sql var=shard-drop-test-empty-id
+SELECT id FROM mz_tables WHERE name = 'shard_drop_test_empty';
+
+# Wait for the mz_storage_shards table to get updated.
+> SELECT COUNT(shard_id) FROM mz_internal.mz_storage_shards WHERE object_id IN ('${shard-drop-test-id}', '${shard-drop-test-empty-id}');
+2
+
+$ set-from-sql var=shard-drop-test-shard-id
+SELECT shard_id FROM mz_internal.mz_storage_shards WHERE object_id = '${shard-drop-test-id}';
+
+$ set-from-sql var=shard-drop-test-empty-shard-id
+SELECT shard_id FROM mz_internal.mz_storage_shards WHERE object_id = '${shard-drop-test-empty-id}';
+
+> DROP TABLE shard_drop_test;
+> DROP TABLE shard_drop_test_empty;
+
+> SELECT COUNT(*) FROM mz_internal.mz_storage_shards WHERE object_id IN ('${shard-drop-test-id}', '${shard-drop-test-empty-id}');
+0
+
+$ check-shard-tombstone shard-id=${shard-drop-test-shard-id}
+
+# TODO(parkmycar): The since and upper of the shard are empty, but the controller still has it's handle registered.
+# $ check-shard-tombstone shard-id=${shard-drop-test-empty-shard-id}

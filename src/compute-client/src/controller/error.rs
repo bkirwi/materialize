@@ -41,8 +41,10 @@ pub struct CollectionMissing(pub GlobalId);
 /// Errors arising during compute collection lookup.
 #[derive(Error, Debug)]
 pub enum CollectionLookupError {
+    /// TODO(#25239): Add documentation.
     #[error("instance does not exist: {0}")]
     InstanceMissing(ComputeInstanceId),
+    /// TODO(#25239): Add documentation.
     #[error("collection does not exist: {0}")]
     CollectionMissing(GlobalId),
 }
@@ -62,10 +64,13 @@ impl From<CollectionMissing> for CollectionLookupError {
 /// Errors arising during compute replica creation.
 #[derive(Error, Debug)]
 pub enum ReplicaCreationError {
+    /// TODO(#25239): Add documentation.
     #[error("instance does not exist: {0}")]
     InstanceMissing(ComputeInstanceId),
+    /// TODO(#25239): Add documentation.
     #[error("replica exists already: {0}")]
     ReplicaExists(ReplicaId),
+    /// TODO(#25239): Add documentation.
     #[error("collection does not exist: {0}")]
     CollectionMissing(GlobalId),
 }
@@ -91,8 +96,10 @@ impl From<CollectionMissing> for ReplicaCreationError {
 /// Errors arising during compute replica removal.
 #[derive(Error, Debug)]
 pub enum ReplicaDropError {
+    /// TODO(#25239): Add documentation.
     #[error("instance does not exist: {0}")]
     InstanceMissing(ComputeInstanceId),
+    /// TODO(#25239): Add documentation.
     #[error("replica does not exist: {0}")]
     ReplicaMissing(ReplicaId),
 }
@@ -112,14 +119,26 @@ impl From<instance::ReplicaMissing> for ReplicaDropError {
 /// Errors arising during dataflow creation.
 #[derive(Error, Debug)]
 pub enum DataflowCreationError {
+    /// TODO(#25239): Add documentation.
     #[error("instance does not exist: {0}")]
     InstanceMissing(ComputeInstanceId),
+    /// TODO(#25239): Add documentation.
     #[error("collection does not exist: {0}")]
     CollectionMissing(GlobalId),
+    /// TODO(#25239): Add documentation.
     #[error("dataflow definition lacks an as_of value")]
     MissingAsOf,
+    /// TODO(#25239): Add documentation.
     #[error("dataflow has an as_of not beyond the since of collection: {0}")]
     SinceViolation(GlobalId),
+    /// We skip dataflow creation for empty `as_of`s, which would be a problem for a SUBSCRIBE,
+    /// because an initial response is expected.
+    #[error("subscribe dataflow has an empty as_of")]
+    EmptyAsOfForSubscribe,
+    /// We skip dataflow creation for empty `as_of`s, which would be a problem for a COPY TO,
+    /// because it should always have an external side effect.
+    #[error("copy to dataflow has an empty as_of")]
+    EmptyAsOfForCopyTo,
 }
 
 impl From<InstanceMissing> for DataflowCreationError {
@@ -135,6 +154,8 @@ impl From<instance::DataflowCreationError> for DataflowCreationError {
             CollectionMissing(id) => Self::CollectionMissing(id),
             MissingAsOf => Self::MissingAsOf,
             SinceViolation(id) => Self::SinceViolation(id),
+            EmptyAsOfForSubscribe => Self::EmptyAsOfForSubscribe,
+            EmptyAsOfForCopyTo => Self::EmptyAsOfForCopyTo,
         }
     }
 }
@@ -142,12 +163,16 @@ impl From<instance::DataflowCreationError> for DataflowCreationError {
 /// Errors arising during peek processing.
 #[derive(Error, Debug)]
 pub enum PeekError {
+    /// TODO(#25239): Add documentation.
     #[error("instance does not exist: {0}")]
     InstanceMissing(ComputeInstanceId),
+    /// TODO(#25239): Add documentation.
     #[error("collection does not exist: {0}")]
     CollectionMissing(GlobalId),
+    /// TODO(#25239): Add documentation.
     #[error("replica does not exist: {0}")]
     ReplicaMissing(ReplicaId),
+    /// TODO(#25239): Add documentation.
     #[error("peek timestamp is not beyond the since of collection: {0}")]
     SinceViolation(GlobalId),
 }
@@ -164,7 +189,7 @@ impl From<instance::PeekError> for PeekError {
         match error {
             CollectionMissing(id) => Self::CollectionMissing(id),
             ReplicaMissing(id) => Self::ReplicaMissing(id),
-            SinceViolation(id) => Self::CollectionMissing(id),
+            SinceViolation(id) => Self::SinceViolation(id),
         }
     }
 }
@@ -172,8 +197,10 @@ impl From<instance::PeekError> for PeekError {
 /// Errors arising during collection updates.
 #[derive(Error, Debug)]
 pub enum CollectionUpdateError {
+    /// TODO(#25239): Add documentation.
     #[error("instance does not exist: {0}")]
     InstanceMissing(ComputeInstanceId),
+    /// TODO(#25239): Add documentation.
     #[error("collection does not exist: {0}")]
     CollectionMissing(GlobalId),
 }
@@ -190,15 +217,49 @@ impl From<CollectionMissing> for CollectionUpdateError {
     }
 }
 
-// Errors arising during subscribe target assignment.
+/// Errors arising during collection read policy assignment.
 #[derive(Error, Debug)]
-pub enum SubscribeTargetError {
+pub enum ReadPolicyError {
+    /// TODO(#25239): Add documentation.
     #[error("instance does not exist: {0}")]
     InstanceMissing(ComputeInstanceId),
+    /// TODO(#25239): Add documentation.
+    #[error("collection does not exist: {0}")]
+    CollectionMissing(GlobalId),
+    /// TODO(#25239): Add documentation.
+    #[error("collection is write-only: {0}")]
+    WriteOnlyCollection(GlobalId),
+}
+
+impl From<InstanceMissing> for ReadPolicyError {
+    fn from(error: InstanceMissing) -> Self {
+        Self::InstanceMissing(error.0)
+    }
+}
+
+impl From<instance::ReadPolicyError> for ReadPolicyError {
+    fn from(error: instance::ReadPolicyError) -> Self {
+        use instance::ReadPolicyError::*;
+        match error {
+            CollectionMissing(id) => Self::CollectionMissing(id),
+            WriteOnlyCollection(id) => Self::WriteOnlyCollection(id),
+        }
+    }
+}
+
+/// Errors arising during subscribe target assignment.
+#[derive(Error, Debug)]
+pub enum SubscribeTargetError {
+    /// TODO(#25239): Add documentation.
+    #[error("instance does not exist: {0}")]
+    InstanceMissing(ComputeInstanceId),
+    /// TODO(#25239): Add documentation.
     #[error("subscribe does not exist: {0}")]
     SubscribeMissing(GlobalId),
+    /// TODO(#25239): Add documentation.
     #[error("replica does not exist: {0}")]
     ReplicaMissing(ReplicaId),
+    /// TODO(#25239): Add documentation.
     #[error("subscribe has already produced output")]
     SubscribeAlreadyStarted,
 }
@@ -223,6 +284,7 @@ impl From<instance::SubscribeTargetError> for SubscribeTargetError {
 /// Errors arising during orphan removal.
 #[derive(Error, Debug)]
 pub enum RemoveOrphansError {
+    /// TODO(#25239): Add documentation.
     #[error("orchestrator error: {0}")]
     OrchestratorError(anyhow::Error),
 }

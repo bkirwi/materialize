@@ -8,27 +8,20 @@
 # by the Apache License, Version 2.0.
 
 from dataclasses import dataclass
+from textwrap import dedent
 from typing import Dict, List, Optional
 
-from materialize.mzcompose import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services import Materialized, Redpanda, Service
+from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.services.dbt import Dbt
+from materialize.mzcompose.services.materialized import Materialized
+from materialize.mzcompose.services.redpanda import Redpanda
+from materialize.mzcompose.services.testdrive import Testdrive
 
 SERVICES = [
     Materialized(),
     Redpanda(),
-    Service(
-        "dbt-test",
-        {
-            "mzbuild": "dbt-materialize",
-            "environment": [
-                "TMPDIR=/share/tmp",
-            ],
-            "volumes": [
-                "secrets:/secrets",
-                "tmp:/share/tmp",
-            ],
-        },
-    ),
+    Dbt(),
+    Testdrive(seed=1),
 ]
 
 
@@ -65,12 +58,11 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
                 options=test_case.materialized_options,
                 image=test_case.materialized_image,
                 volumes_extra=["secrets:/secrets"],
-                # Disable RBAC checks because of error on "DROP CLUSTER default CASCADE":
-                # InsufficientPrivilege: must be owner of CLUSTER default
+                # Disable RBAC checks because of error on "DROP CLUSTER quickstart CASCADE":
+                # InsufficientPrivilege: must be owner of CLUSTER quickstart
                 # TODO: Can dbt connect using mz_system user instead of materialize?
                 additional_system_parameter_defaults={
                     "enable_rbac_checks": "false",
-                    "enable_ld_rbac_checks": "false",
                 },
             )
             test_args = ["dbt-materialize/tests"]
@@ -82,8 +74,19 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
                     c.down()
                     c.up("redpanda")
                     c.up("materialized")
+                    c.up("testdrive", persistent=True)
+
+                    # Create a topic that some tests rely on
+                    c.testdrive(
+                        input=dedent(
+                            """
+                                $ kafka-create-topic topic=test-source partitions=1
+                                """
+                        )
+                    )
+
                     c.run(
-                        "dbt-test",
+                        "dbt",
                         "pytest",
                         *test_args,
                         env_extra={

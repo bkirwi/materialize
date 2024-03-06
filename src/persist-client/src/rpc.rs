@@ -23,16 +23,17 @@ use anyhow::{anyhow, Error};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
+use mz_dyncfg::Config;
 use mz_ore::cast::CastFrom;
 use mz_ore::collections::{HashMap, HashSet};
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::retry::RetryResult;
+use mz_ore::task::JoinHandle;
 use mz_persist::location::VersionedData;
 use mz_proto::{ProtoType, RustType};
 use prost::Message;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
-use tokio::task::JoinHandle;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::StreamExt;
@@ -52,6 +53,22 @@ use crate::internal::service::{
 };
 use crate::metrics::Metrics;
 use crate::ShardId;
+
+/// Determines whether PubSub clients should connect to the PubSub server.
+pub(crate) const PUBSUB_CLIENT_ENABLED: Config<bool> = Config::new(
+    "persist_pubsub_client_enabled",
+    true,
+    "Whether to connect to the Persist PubSub service.",
+);
+
+/// For connected clients, determines whether to push state diffs to the PubSub
+/// server. For the server, determines whether to broadcast state diffs to
+/// subscribed clients.
+pub(crate) const PUBSUB_PUSH_DIFF_ENABLED: Config<bool> = Config::new(
+    "persist_pubsub_push_diff_enabled",
+    true,
+    "Whether to push state diffs to Persist PubSub.",
+);
 
 /// Top-level Trait to create a PubSubClient.
 ///
@@ -187,7 +204,7 @@ pub struct GrpcPubSubClient;
 impl GrpcPubSubClient {
     async fn reconnect_to_server_forever(
         send_requests: tokio::sync::broadcast::Sender<ProtoPubSubMessage>,
-        receiver_input: &mut tokio::sync::mpsc::Sender<ProtoPubSubMessage>,
+        receiver_input: &tokio::sync::mpsc::Sender<ProtoPubSubMessage>,
         sender: Arc<SubscriptionTrackingSender>,
         metadata: MetadataMap,
         config: PersistPubSubClientConfig,
@@ -197,7 +214,7 @@ impl GrpcPubSubClient {
         loop {
             metrics.pubsub_client.grpc_connection.connected.set(0);
 
-            if !config.persist_cfg.dynamic.pubsub_client_enabled() {
+            if !PUBSUB_CLIENT_ENABLED.get(&config.persist_cfg) {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -223,7 +240,9 @@ impl GrpcPubSubClient {
                         Err(err) => return RetryResult::FatalErr(err),
                     };
                     ProtoPersistPubSubClient::connect(
-                        endpoint.timeout(config.persist_cfg.pubsub_connect_attempt_timeout),
+                        endpoint
+                            .connect_timeout(config.persist_cfg.pubsub_connect_attempt_timeout)
+                            .timeout(config.persist_cfg.pubsub_request_timeout),
                     )
                     .await
                     .into()
@@ -305,12 +324,12 @@ impl GrpcPubSubClient {
 
     async fn consume_grpc_stream(
         mut responses: Streaming<ProtoPubSubMessage>,
-        receiver_input: &mut Sender<ProtoPubSubMessage>,
+        receiver_input: &Sender<ProtoPubSubMessage>,
         config: &PersistPubSubClientConfig,
         metrics: &Metrics,
     ) -> Result<(), Error> {
         loop {
-            if !config.persist_cfg.dynamic.pubsub_client_enabled() {
+            if !PUBSUB_CLIENT_ENABLED.get(&config.persist_cfg) {
                 return Ok(());
             }
 
@@ -349,7 +368,7 @@ impl PersistPubSubClient for GrpcPubSubClient {
         // Create a stable channel to receive messages from our gRPC stream. The input end lives inside
         // a task that continuously reads from the active gRPC stream, decoupling the `PubSubReceiver`
         // from the lifetime of a specific gRPC connection.
-        let (mut receiver_input, receiver_output) =
+        let (receiver_input, receiver_output) =
             tokio::sync::mpsc::channel(config.persist_cfg.pubsub_client_receiver_channel_size);
 
         let sender = Arc::new(SubscriptionTrackingSender::new(Arc::new(
@@ -371,7 +390,7 @@ impl PersistPubSubClient for GrpcPubSubClient {
 
                 GrpcPubSubClient::reconnect_to_server_forever(
                     send_requests,
-                    &mut receiver_input,
+                    &receiver_input,
                     pubsub_sender,
                     metadata,
                     config,
@@ -942,8 +961,9 @@ impl PersistGrpcPubSubServer {
 
     /// Starts the gRPC server. Consumes `self` and runs until the task is cancelled.
     pub async fn serve(self, listen_addr: SocketAddr) -> Result<(), anyhow::Error> {
+        // Increase the default message decoding limit to avoid unnecessary panics
         tonic::transport::Server::builder()
-            .add_service(ProtoPersistPubSubServer::new(self))
+            .add_service(ProtoPersistPubSubServer::new(self).max_decoding_message_size(usize::MAX))
             .serve(listen_addr)
             .await?;
         Ok(())
@@ -967,7 +987,7 @@ impl PersistGrpcPubSubServer {
 impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServer {
     type PubSubStream = Pin<Box<dyn Stream<Item = Result<ProtoPubSubMessage, Status>> + Send>>;
 
-    #[tracing::instrument(name = "persist::rpc::server", level = "info", skip_all)]
+    #[mz_ore::instrument(name = "persist::rpc::server", level = "info")]
     async fn pub_sub(
         &self,
         request: Request<Streaming<ProtoPubSubMessage>>,
@@ -985,7 +1005,7 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
         let (tx, rx) = tokio::sync::mpsc::channel(self.cfg.pubsub_server_connection_channel_size);
 
         let caller = caller_id.clone();
-        let dynamic_cfg = Arc::clone(&self.cfg.dynamic);
+        let cfg = self.cfg.configs.clone();
         let server_state = Arc::clone(&self.state);
         // this spawn here to cleanup after connection error / disconnect, otherwise the stream
         // would not be polled after the connection drops. in our case, we want to clear the
@@ -1011,10 +1031,10 @@ impl proto_persist_pub_sub_server::ProtoPersistPubSub for PersistGrpcPubSubServe
                         Some(proto_pub_sub_message::Message::PushDiff(req)) => {
                             let shard_id = req.shard_id.parse().expect("valid shard id");
                             let diff = VersionedData {
-                                seqno: req.seqno.into_rust().expect("WIP"),
+                                seqno: req.seqno.into_rust().expect("valid seqno"),
                                 data: req.diff.clone(),
                             };
-                            if dynamic_cfg.pubsub_push_diff_enabled() {
+                            if PUBSUB_PUSH_DIFF_ENABLED.get(&cfg) {
                                 connection.push_diff(&shard_id, &diff);
                             }
                         }
@@ -1298,13 +1318,13 @@ mod grpc {
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_stream::StreamExt;
 
-    use crate::cfg::{PersistConfig, PersistParameters};
+    use crate::cfg::PersistConfig;
     use crate::internal::service::proto_pub_sub_message::Message;
     use crate::internal::service::ProtoPubSubMessage;
     use crate::metrics::Metrics;
     use crate::rpc::{
         GrpcPubSubClient, PersistGrpcPubSubServer, PersistPubSubClient, PersistPubSubClientConfig,
-        PubSubState,
+        PubSubState, PUBSUB_CLIENT_ENABLED,
     };
     use crate::ShardId;
 
@@ -1328,6 +1348,7 @@ mod grpc {
     // closely model an actual disconnect.
 
     #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // error: unsupported operation: can't call foreign function `socket` on OS `linux`
     fn grpc_server() {
         let metrics = Arc::new(Metrics::new(
             &test_persist_config(),
@@ -1386,6 +1407,7 @@ mod grpc {
     }
 
     #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // error: unsupported operation: can't call foreign function `socket` on OS `linux`
     fn grpc_client_sender_reconnects() {
         let metrics = Arc::new(Metrics::new(
             &test_persist_config(),
@@ -1466,6 +1488,7 @@ mod grpc {
     }
 
     #[mz_ore::test(tokio::test(flavor = "multi_thread"))]
+    #[cfg_attr(miri, ignore)] // error: unsupported operation: can't call foreign function `socket` on OS `linux`
     async fn grpc_client_sender_subscription_tokens() {
         let metrics = Arc::new(Metrics::new(
             &test_persist_config(),
@@ -1540,6 +1563,7 @@ mod grpc {
     }
 
     #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // error: unsupported operation: can't call foreign function `socket` on OS `linux`
     fn grpc_client_receiver() {
         let metrics = Arc::new(Metrics::new(
             &PersistConfig::new_for_tests(),
@@ -1661,6 +1685,7 @@ mod grpc {
         )
     }
 
+    #[allow(clippy::unused_async)]
     async fn spawn_server(tcp_listener_stream: TcpListenerStream) -> Arc<PubSubState> {
         let server = PersistGrpcPubSubServer::new(&test_persist_config(), &MetricsRegistry::new());
         let server_state = Arc::clone(&server.state);
@@ -1704,9 +1729,7 @@ mod grpc {
     fn test_persist_config() -> PersistConfig {
         let mut cfg = PersistConfig::new_for_tests();
         cfg.pubsub_reconnect_backoff = Duration::ZERO;
-        let mut params = PersistParameters::default();
-        params.pubsub_client_enabled = Some(true);
-        params.apply(&cfg);
+        cfg.set_config(&PUBSUB_CLIENT_ENABLED, true);
         cfg
     }
 }

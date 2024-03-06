@@ -7,9 +7,6 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
-ALTER SYSTEM SET enable_format_json = true
-
 # Verify behavior of FORMAT JSON
 
 $ kafka-create-topic topic=data partitions=1
@@ -17,9 +14,16 @@ $ kafka-ingest format=bytes topic=data
 {"a":"b","c":"d"}
 
 > CREATE CONNECTION kafka_conn
-  TO KAFKA (BROKER '${testdrive.kafka-addr}');
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
+
+! CREATE SOURCE data
+  IN CLUSTER ${arg.single-replica-cluster}
+  FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
+  FORMAT JSON ARRAY;
+contains:JSON ARRAY format in sources not yet supported
 
 > CREATE SOURCE data
+  IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
   FORMAT JSON;
 

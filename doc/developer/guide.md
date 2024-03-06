@@ -16,6 +16,7 @@ you'll need a working C and C++ toolchain. You'll also need to install:
 * The [CMake] build system
 * libclang
 * PostgreSQL
+* lld (on Linux, or set a custom `RUSTFLAGS`)
 
 On macOS, if you install [Homebrew], you'll be guided through the process of
 installing Apple's developer tools, which includes a C compiler and libclang.
@@ -29,7 +30,7 @@ On Debian-based Linux variants, it's even easier:
 
 ```shell
 sudo apt update
-sudo apt install build-essential cmake postgresql-client libclang-dev
+sudo apt install build-essential cmake postgresql-client libclang-dev lld
 ```
 
 On other platforms, you'll have to figure out how to get these tools yourself.
@@ -71,6 +72,32 @@ If you can successfully connect to CockroachDB with either
 `psql postgres://root@localhost:26257` or `cockroach sql --insecure`, you're
 all set.
 
+### Python
+
+Materialize's build and test infrastructure is largely written in [Python];
+running our integration tests, in particular, requires a local Python
+environment. Most of this should be taken care of by the `bin/pyactivate`
+script, which constructs a local virtual environment and keeps necessary
+dependencies up to date.
+
+We support, as a minimum version, the default Python provided in the [most
+recent Ubuntu LTS release](https://wiki.ubuntu.com/Releases). As of October 2023
+this is Python 3.10, provided in Ubuntu "Jammy Jellyfish". Earlier versions may
+work but are not supported. Our recommended installation methods are:
+
+- macOS: [Homebrew](https://brew.sh)
+- Linux: System package manager if possible, or [community package repositories](https://launchpad.net/~deadsnakes/+archive/ubuntu/ppa) if necessary
+- Windows: [Microsoft App Store](https://apps.microsoft.com/detail/python-3-11/9NRWMJP3717K?hl=en-US&gl=US)
+- Cross-platform: [Nix] [flake](../../misc/nix)
+
+If none of the above work well for you, these are a few other methods that have
+worked for us in the past, but are not formally supported:
+
+- [pyenv](https://github.com/pyenv/pyenv)
+- [asdf](https://asdf-vm.com/)
+- [Pixi](https://github.com/prefix-dev/pixi)
+- [Conda](https://docs.conda.io/en/latest/)
+
 ### Confluent Platform
 
 The [Confluent Platform] bundles [Apache ZooKeeper] and [Apache Kafka] with
@@ -84,6 +111,7 @@ and can be fully exercised by SQL logic tests, we recommend not installing the
 Confluent Platform, as it is a rather heavy dependency. Most Materialize
 employees, or other major contributors, will probably need to run the full test
 suite and should therefore install the Confluent Platform.
+
 
 #### All platforms
 
@@ -172,6 +200,24 @@ cd materialize
 bin/environmentd [--release] [<environmentd arg>...]
 ```
 
+### WebAssembly / WASM
+
+Some crates are compiled to WebAssembly and published to npm. This is
+accomplished through `wasm-pack`. Install it by running:
+
+```shell
+cargo install wasm-pack
+```
+
+WASM builds can then be initiated through
+
+```shell
+./bin/wasm-build <path/to/crate>
+```
+
+WASM crates reside in `misc/wasm/` Cargo workspace, and should be kept out of
+the main Cargo workspace to avoid cache invalidation issues.
+
 ## Running Confluent Platform
 
 As mentioned above, **Confluent Platform is only required need to test Kafka
@@ -257,6 +303,13 @@ We use the following tools to perform automatic code style checks:
 
 See the [style guide](style.md) for additional recommendations on code style.
 
+### Required Tools
+Linting requires the following tools and Cargo packages to be installed:
+* buf ([installation guide](https://buf.build/docs/installation))
+* cargo-about (`cargo install cargo-about`)
+* cargo-hakari (`cargo install cargo-hakari`)
+* cargo-deplint (`cargo install cargo-deplint`)
+
 ## Submitting and reviewing changes
 
 See [Developer guide: submitting and reviewing changes](guide-changes.md).
@@ -280,6 +333,7 @@ This repository has the following basic structure:
       [mzbuild](mzbuild.md).
     * **`misc/nix`** contains an experimental [Nix] configuration for
       developing Materialize.
+    * **`misc/wasm`** contains the Rust crates that are published to NPM as WebAssembly.
     * **`misc/www`** contains the source code for <https://dev.materialize.com>.
   * **`src`** contains the primary Rust crates that comprise Materialize.
   * **`test`** contains test suites, which are described in
@@ -360,6 +414,37 @@ acceptable for:
     to clone the entire Materialize repository would be a large barrier to
     entry. Changes to Materialize very rarely require changes in rust-dec, so
     maintaining the two separately does not introduce much overhead.
+
+## Dependency management and auditing
+
+We use the Mozilla-developed native Rust cargo-vet tool for dependency auditing
+to help ensure the security and reliability of external dependencies. Cargo-vet
+allows developers to audit their dependencies by checking for known security
+vulnerabilities, licensing issues, and overall health of the dependencies, which
+include factors like maintenance status, version stability, and community trust.
+
+For a developer, the basic workflow with cargo-vet starts with integrating it
+into their Rust development process. After installing cargo-vet locally, the
+developer runs it against their project’s Cargo.toml and Cargo.lock files.
+Cargo-vet will then analyze the list of dependencies and output a report
+detailing the status of each dependency.
+
+All crates currently in use have been added to the audited list, but CI will
+fail on PRs with new unaudited dependencies (or after 'cargo update'). Complete
+information on using cargo-vet are available in the book at
+https://mozilla.github.io/cargo-vet/how-it-works.html but in summary:
+
+  * cargo vet inspect some-crate
+  * cargo vet certify some-crate
+
+The 'certify' step will record an entry in the audits.toml file certifying the crate has been reviewed and is appropriate to use. Example:
+
+```toml
+[[audits.aws-sdk-s3]]
+who = "Matt Arthur <matthewleearthur@gmail.com>"
+criteria = "safe-to-deploy"
+version = "0.26.0"
+```
 
 ## Developer tools
 
@@ -489,3 +574,5 @@ source /path/to/materialize/misc/completions/zsh/*
 [rustfmt]: https://github.com/rust-lang/rustfmt
 [rustup]: https://www.rust-lang.org/tools/install
 [sqlparser]: https://github.com/MaterializeInc/sqlparser
+[Python]: https://www.python.org
+[Nix]: https://nixos.wiki/wiki/Flakes

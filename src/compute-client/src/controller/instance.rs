@@ -9,37 +9,49 @@
 
 //! A controller for a compute instance.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Debug;
 use std::num::NonZeroI64;
+use std::time::Instant;
 
+use chrono::{DateTime, Duration, DurationRound, Utc};
 use differential_dataflow::lattice::Lattice;
 use futures::stream::FuturesUnordered;
 use futures::{future, StreamExt};
 use mz_build_info::BuildInfo;
-use mz_cluster_client::client::ClusterStartupEpoch;
+use mz_cluster_client::client::{ClusterStartupEpoch, TimelyConfig};
+use mz_compute_types::dataflows::DataflowDescription;
+use mz_compute_types::plan::NodeId;
+use mz_compute_types::sinks::{ComputeSinkConnection, ComputeSinkDesc, PersistSinkConnection};
+use mz_compute_types::sources::SourceInstanceDesc;
 use mz_expr::RowSetFinishing;
 use mz_ore::cast::CastFrom;
 use mz_ore::tracing::OpenTelemetryContext;
-use mz_repr::{GlobalId, Row};
-use mz_storage_client::controller::{ReadPolicy, StorageController};
+use mz_repr::{Datum, Diff, GlobalId, Row, TimestampManipulation};
+use mz_storage_client::controller::{IntrospectionType, StorageController};
+use mz_storage_types::read_policy::ReadPolicy;
 use thiserror::Error;
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
 use timely::PartialOrder;
 use uuid::Uuid;
 
 use crate::controller::error::CollectionMissing;
-use crate::controller::replica::{Replica, ReplicaConfig};
-use crate::controller::{CollectionState, ComputeControllerResponse, ReplicaId};
+use crate::controller::replica::{ReplicaClient, ReplicaConfig};
+use crate::controller::{
+    CollectionState, ComputeControllerResponse, IntrospectionUpdates, ReplicaId,
+};
 use crate::logging::LogVariant;
-use crate::metrics::InstanceMetrics;
-use crate::metrics::UIntGauge;
-use crate::protocol::command::{ComputeCommand, ComputeParameters, Peek};
+use crate::metrics::{InstanceMetrics, ReplicaMetrics};
+use crate::metrics::{ReplicaCollectionMetrics, UIntGauge};
+use crate::protocol::command::{
+    ComputeCommand, ComputeParameters, InstanceConfig, Peek, PeekTarget,
+};
 use crate::protocol::history::ComputeCommandHistory;
-use crate::protocol::response::{ComputeResponse, PeekResponse, SubscribeBatch, SubscribeResponse};
+use crate::protocol::response::{
+    ComputeResponse, CopyToResponse, OperatorHydrationStatus, PeekResponse, StatusResponse,
+    SubscribeBatch, SubscribeResponse,
+};
 use crate::service::{ComputeClient, ComputeGrpcClient};
-use crate::types::dataflows::DataflowDescription;
-use crate::types::sinks::{ComputeSinkConnection, ComputeSinkDesc, PersistSinkConnection};
-use crate::types::sources::SourceInstanceDesc;
 
 #[derive(Error, Debug)]
 #[error("replica exists already: {0}")]
@@ -57,6 +69,10 @@ pub(super) enum DataflowCreationError {
     MissingAsOf,
     #[error("dataflow has an as_of not beyond the since of collection: {0}")]
     SinceViolation(GlobalId),
+    #[error("subscribe dataflow has an empty as_of")]
+    EmptyAsOfForSubscribe,
+    #[error("copy to dataflow has an empty as_of")]
+    EmptyAsOfForCopyTo,
 }
 
 impl From<CollectionMissing> for DataflowCreationError {
@@ -82,6 +98,20 @@ impl From<CollectionMissing> for PeekError {
 }
 
 #[derive(Error, Debug)]
+pub(super) enum ReadPolicyError {
+    #[error("collection does not exist: {0}")]
+    CollectionMissing(GlobalId),
+    #[error("collection is write-only: {0}")]
+    WriteOnlyCollection(GlobalId),
+}
+
+impl From<CollectionMissing> for ReadPolicyError {
+    fn from(error: CollectionMissing) -> Self {
+        Self::CollectionMissing(error.0)
+    }
+}
+
+#[derive(Error, Debug)]
 pub(super) enum SubscribeTargetError {
     #[error("subscribe does not exist: {0}")]
     SubscribeMissing(GlobalId),
@@ -99,21 +129,14 @@ pub(super) struct Instance<T> {
     /// Whether instance initialization has been completed.
     initialized: bool,
     /// The replicas of this compute instance.
-    replicas: BTreeMap<ReplicaId, Replica<T>>,
+    replicas: BTreeMap<ReplicaId, ReplicaState<T>>,
     /// Currently installed compute collections.
     ///
     /// New entries are added for all collections exported from dataflows created through
-    /// [`ActiveInstance::create_dataflows`].
+    /// [`ActiveInstance::create_dataflow`].
     ///
-    /// Entries are removed when two conditions are fulfilled:
-    ///
-    ///  * The collection's read frontier has advanced to the empty frontier, implying that
-    ///    [`ActiveInstance::drop_collections`] was called.
-    ///  * All replicas have reported the empty frontier for the collection, implying that they
-    ///    have stopped reading from the collection's inputs.
-    ///
-    /// Only if both these conditions hold is dropping a collection's state, and the associated
-    /// read holds on its inputs, sound.
+    /// Entries are removed by [`Instance::cleanup_collections`]. See that method's documentation
+    /// about the conditions for removing collection state.
     collections: BTreeMap<GlobalId, CollectionState<T>>,
     /// IDs of log sources maintained by this compute instance.
     log_sources: BTreeMap<LogVariant, GlobalId>,
@@ -129,7 +152,7 @@ pub(super) struct Instance<T> {
     /// Currently in-progress subscribes.
     ///
     /// New entries are added for all subscribes exported from dataflows created through
-    /// [`ActiveInstance::create_dataflows`].
+    /// [`ActiveInstance::create_dataflow`].
     ///
     /// The entry for a subscribe is removed once at least one replica has reported the subscribe
     /// to have advanced to the empty frontier or to have been dropped, implying that no further
@@ -140,21 +163,34 @@ pub(super) struct Instance<T> {
     /// on the subscribe's input. `subscribes` is only used to track which updates have been
     /// emitted, to decide if new ones should be emitted or suppressed.
     subscribes: BTreeMap<GlobalId, ActiveSubscribe<T>>,
+    /// Tracks all in-progress COPY TOs.
+    ///
+    /// New entries are added for all s3 oneshot sinks (corresponding to a COPY TO) exported from
+    /// dataflows created through [`ActiveInstance::create_dataflow`].
+    ///
+    /// The entry for a copy to is removed once at least one replica has finished
+    /// or the exporting collection is dropped.
+    copy_tos: BTreeSet<GlobalId>,
     /// The command history, used when introducing new replicas or restarting existing replicas.
     history: ComputeCommandHistory<UIntGauge, T>,
-    /// IDs of replicas that have failed and require rehydration.
-    failed_replicas: BTreeSet<ReplicaId>,
-    /// Ready compute controller responses to be delivered.
-    pub ready_responses: VecDeque<ComputeControllerResponse<T>>,
+    /// Sender for responses to be delivered.
+    response_tx: crossbeam_channel::Sender<ComputeControllerResponse<T>>,
+    /// Sender for introspection updates to be recorded.
+    introspection_tx: crossbeam_channel::Sender<IntrospectionUpdates>,
     /// A number that increases with each restart of `environmentd`.
     envd_epoch: NonZeroI64,
     /// Numbers that increase with each restart of a replica.
     replica_epochs: BTreeMap<ReplicaId, u64>,
     /// The registry the controller uses to report metrics.
     metrics: InstanceMetrics,
+    /// Whether to aggressively downgrade read holds for sink dataflows.
+    ///
+    /// This flag exists to derisk the rollout of the aggressive downgrading approach.
+    /// TODO(teskje): Remove this after a couple weeks.
+    enable_aggressive_readhold_downgrades: bool,
 }
 
-impl<T> Instance<T> {
+impl<T: Timestamp> Instance<T> {
     /// Acquire a handle to the collection state associated with `id`.
     pub fn collection(&self, id: GlobalId) -> Result<&CollectionState<T>, CollectionMissing> {
         self.collections.get(&id).ok_or(CollectionMissing(id))
@@ -168,8 +204,131 @@ impl<T> Instance<T> {
         self.collections.get_mut(&id).ok_or(CollectionMissing(id))
     }
 
+    /// Acquire a handle to the collection state associated with `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identified collection does not exist.
+    pub fn expect_collection(&self, id: GlobalId) -> &CollectionState<T> {
+        self.collections.get(&id).expect("collection must exist")
+    }
+
+    /// Acquire a mutable handle to the collection state associated with `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identified collection does not exist.
+    fn expect_collection_mut(&mut self, id: GlobalId) -> &mut CollectionState<T> {
+        self.collections
+            .get_mut(&id)
+            .expect("collection must exist")
+    }
+
     pub fn collections_iter(&self) -> impl Iterator<Item = (&GlobalId, &CollectionState<T>)> {
         self.collections.iter()
+    }
+
+    /// Add a collection to the instance state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a collection with the same ID exists already.
+    fn add_collection(
+        &mut self,
+        id: GlobalId,
+        as_of: Antichain<T>,
+        storage_dependencies: Vec<GlobalId>,
+        compute_dependencies: Vec<GlobalId>,
+        write_only: bool,
+    ) {
+        // Add global collection state.
+        let mut state =
+            CollectionState::new(as_of.clone(), storage_dependencies, compute_dependencies);
+        // If the collection is write-only, clear its read policy to reflect that.
+        if write_only && self.enable_aggressive_readhold_downgrades {
+            state.read_policy = None;
+        }
+
+        if let Some(previous) = self.collections.insert(id, state) {
+            panic!("attempt to add a collection with existing ID {id} (previous={previous:?}");
+        }
+
+        // Add per-replica collection state.
+        for replica in self.replicas.values_mut() {
+            replica.add_collection(id, as_of.clone());
+        }
+
+        // Update introspection.
+        self.report_dependency_updates(id, 1);
+    }
+
+    fn remove_collection(&mut self, id: GlobalId) {
+        // Update introspection.
+        self.report_dependency_updates(id, -1);
+
+        // Remove per-replica collection state.
+        for replica in self.replicas.values_mut() {
+            replica.remove_collection(id);
+        }
+
+        // Remove global collection state.
+        self.collections.remove(&id);
+    }
+
+    fn add_replica_state(
+        &mut self,
+        id: ReplicaId,
+        client: ReplicaClient<T>,
+        config: ReplicaConfig,
+    ) {
+        let metrics = self.metrics.for_replica(id);
+        let mut replica =
+            ReplicaState::new(id, client, config, metrics, self.introspection_tx.clone());
+
+        // Add per-replica collection state.
+        for (collection_id, collection) in &self.collections {
+            let as_of = collection.read_frontier().to_owned();
+            replica.add_collection(*collection_id, as_of);
+        }
+
+        self.replicas.insert(id, replica);
+    }
+
+    fn remove_replica_state(&mut self, id: ReplicaId) -> Option<ReplicaState<T>> {
+        let Some(replica) = self.replicas.remove(&id) else {
+            return None;
+        };
+
+        if let Some(time) = replica.last_heartbeat {
+            let row = Row::pack_slice(&[
+                Datum::String(&id.to_string()),
+                Datum::TimestampTz(time.try_into().expect("must fit")),
+            ]);
+            self.deliver_introspection_updates(
+                IntrospectionType::ComputeReplicaHeartbeats,
+                vec![(row, -1)],
+            );
+        }
+
+        Some(replica)
+    }
+
+    /// Enqueue the given response for delivery to the controller clients.
+    fn deliver_response(&mut self, response: ComputeControllerResponse<T>) {
+        self.response_tx
+            .send(response)
+            .expect("global controller never drops");
+    }
+
+    /// Enqueue the given introspection updates for recording.
+    fn deliver_introspection_updates(
+        &mut self,
+        type_: IntrospectionType,
+        updates: Vec<(Row, Diff)>,
+    ) {
+        self.introspection_tx
+            .send((type_, updates))
+            .expect("global controller never drops");
     }
 
     /// Acquire an [`ActiveInstance`] by providing a storage controller.
@@ -183,14 +342,6 @@ impl<T> Instance<T> {
         }
     }
 
-    /// Return whether this instance has any processing work scheduled.
-    pub fn wants_processing(&self) -> bool {
-        // Do we need to rehydrate failed replicas?
-        !self.failed_replicas.is_empty()
-        // Do we have responses ready to deliver?
-        || !self.ready_responses.is_empty()
-    }
-
     /// Returns whether the identified replica exists.
     pub fn replica_exists(&self, id: ReplicaId) -> bool {
         self.replicas.contains_key(&id)
@@ -199,6 +350,20 @@ impl<T> Instance<T> {
     /// Returns the ids of all replicas of this instance.
     pub fn replica_ids(&self) -> impl Iterator<Item = ReplicaId> + '_ {
         self.replicas.keys().copied()
+    }
+
+    /// Return the IDs of pending peeks targeting the specified replica.
+    fn peeks_targeting(
+        &self,
+        replica_id: ReplicaId,
+    ) -> impl Iterator<Item = (Uuid, &PendingPeek<T>)> {
+        self.peeks.iter().filter_map(move |(uuid, peek)| {
+            if peek.target_replica == Some(replica_id) {
+                Some((*uuid, peek))
+            } else {
+                None
+            }
+        })
     }
 
     /// Return the IDs of in-progress subscribes targeting the specified replica.
@@ -217,7 +382,7 @@ impl<T> Instance<T> {
     ///
     /// This method is invoked by `ActiveComputeController::process`, which we expect to
     /// be periodically called during normal operation.
-    pub(super) fn refresh_state_metrics(&self) {
+    fn refresh_state_metrics(&self) {
         self.metrics
             .replica_count
             .set(u64::cast_from(self.replicas.len()));
@@ -230,6 +395,140 @@ impl<T> Instance<T> {
         self.metrics
             .subscribe_count
             .set(u64::cast_from(self.subscribes.len()));
+        self.metrics
+            .copy_to_count
+            .set(u64::cast_from(self.copy_tos.len()));
+    }
+
+    /// Report updates (inserts or retractions) to the identified collection's dependencies.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identified collection does not exist.
+    fn report_dependency_updates(&mut self, id: GlobalId, diff: i64) {
+        let collection = self.expect_collection(id);
+        let dependencies = collection.dependency_ids();
+
+        let updates = dependencies
+            .map(|dependency_id| {
+                let row = Row::pack_slice(&[
+                    Datum::String(&id.to_string()),
+                    Datum::String(&dependency_id.to_string()),
+                ]);
+                (row, diff)
+            })
+            .collect();
+
+        self.deliver_introspection_updates(IntrospectionType::ComputeDependencies, updates);
+    }
+
+    /// Update the tracked hydration status for the given collection and replica according to an
+    /// observed frontier update.
+    fn update_hydration_status(
+        &mut self,
+        id: GlobalId,
+        replica_id: ReplicaId,
+        frontier: &Antichain<T>,
+    ) {
+        let Some(replica) = self.replicas.get_mut(&replica_id) else {
+            tracing::error!(
+                %id, %replica_id, frontier = ?frontier.elements(),
+                "frontier update for an unknown replica"
+            );
+            return;
+        };
+        let Some(collection) = replica.collections.get_mut(&id) else {
+            tracing::error!(
+                %id, %replica_id, frontier = ?frontier.elements(),
+                "frontier update for an unknown collection"
+            );
+            return;
+        };
+
+        // We may have already reported successful hydration before, in which case we have nothing
+        // left to do.
+        if collection.hydrated() {
+            return;
+        }
+
+        // If the observed frontier is greater than the collection's as-of, the collection has
+        // produced some output and is therefore hydrated now.
+        if PartialOrder::less_than(&collection.as_of, frontier) {
+            collection.set_hydrated();
+        }
+    }
+
+    /// Update the tracked hydration status for an operator according to a received status update.
+    fn update_operator_hydration_status(
+        &mut self,
+        replica_id: ReplicaId,
+        status: OperatorHydrationStatus,
+    ) {
+        let Some(replica) = self.replicas.get_mut(&replica_id) else {
+            tracing::error!(
+                %replica_id, ?status,
+                "status update for an unknown replica"
+            );
+            return;
+        };
+        let Some(collection) = replica.collections.get_mut(&status.collection_id) else {
+            tracing::error!(
+                %replica_id, ?status,
+                "status update for an unknown collection"
+            );
+            return;
+        };
+
+        collection.hydration_state.operator_hydrated(
+            status.lir_id,
+            status.worker_id,
+            status.hydrated,
+        );
+    }
+
+    /// Clean up collection state that is not needed anymore.
+    ///
+    /// Three conditions need to be true before we can remove state for a collection:
+    ///
+    ///  1. A client must have explicitly dropped the collection. If that is not the case, clients
+    ///     can still reasonably assume that the controller knows about the collection and can
+    ///     answer queries about it.
+    ///  2. There must be no outstanding read capabilities on the collection. As long as someone
+    ///     still holds read capabilities on a collection, we need to keep it around to be able
+    ///     to properly handle downgrading of said capabilities.
+    ///  3. All replica write frontiers for the collection must have advanced to the empty
+    ///     frontier. Advancement to the empty frontier signals that replicas are done computing
+    ///     the collection and that they won't send more `ComputeResponse`s for it. As long as we
+    ///     might receive responses for a collection we want to keep it around to be able to
+    ///     validate and handle these responses.
+    fn cleanup_collections(&mut self) {
+        let to_remove: Vec<_> = self
+            .collections_iter()
+            .filter(|(_id, collection)| {
+                collection.dropped
+                    && collection.read_frontier().is_empty()
+                    && collection
+                        .replica_write_frontiers
+                        .values()
+                        .all(|frontier| frontier.is_empty())
+            })
+            .map(|(id, _collection)| *id)
+            .collect();
+
+        for id in to_remove {
+            self.remove_collection(id);
+        }
+    }
+
+    /// List compute collections that depend on the given collection.
+    pub fn collection_reverse_dependencies(&self, id: GlobalId) -> impl Iterator<Item = &GlobalId> {
+        self.collections_iter().filter_map(move |(id2, state)| {
+            if state.compute_dependencies.contains(&id) {
+                Some(id2)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -243,6 +542,9 @@ where
         arranged_logs: BTreeMap<LogVariant, GlobalId>,
         envd_epoch: NonZeroI64,
         metrics: InstanceMetrics,
+        response_tx: crossbeam_channel::Sender<ComputeControllerResponse<T>>,
+        introspection_tx: crossbeam_channel::Sender<IntrospectionUpdates>,
+        enable_aggressive_readhold_downgrades: bool,
     ) -> Self {
         let collections = arranged_logs
             .iter()
@@ -261,21 +563,25 @@ where
             log_sources: arranged_logs,
             peeks: Default::default(),
             subscribes: Default::default(),
+            copy_tos: Default::default(),
             history,
-            failed_replicas: Default::default(),
-            ready_responses: Default::default(),
+            response_tx,
+            introspection_tx,
             envd_epoch,
             replica_epochs: Default::default(),
             metrics,
+            enable_aggressive_readhold_downgrades,
         };
 
         instance.send(ComputeCommand::CreateTimely {
-            config: Default::default(),
+            config: TimelyConfig::default(),
             epoch: ClusterStartupEpoch::new(envd_epoch, 0),
         });
 
         let dummy_logging_config = Default::default();
-        instance.send(ComputeCommand::CreateInstance(dummy_logging_config));
+        instance.send(ComputeCommand::CreateInstance(InstanceConfig {
+            logging: dummy_logging_config,
+        }));
 
         instance
     }
@@ -302,24 +608,32 @@ where
     /// # Panics
     ///
     /// Panics if the compute instance still has active replicas.
-    pub fn drop(self) {
+    /// Panics if the compute instance still has collections installed.
+    pub fn drop(mut self) {
+        // Collections might have been dropped but not cleaned up yet.
+        self.cleanup_collections();
+
         assert!(
             self.replicas.is_empty(),
             "cannot drop instances with provisioned replicas"
         );
+        assert!(
+            self.collections.values().all(|c| c.log_collection),
+            "cannot drop instances with installed collections"
+        );
     }
 
     /// Sends a command to all replicas of this instance.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[mz_ore::instrument(level = "debug")]
     pub fn send(&mut self, cmd: ComputeCommand<T>) {
         // Record the command so that new replicas can be brought up to speed.
-        self.history.push(cmd.clone(), &self.peeks);
+        self.history.push(cmd.clone());
 
         // Clone the command for each active replica.
-        for (id, replica) in self.replicas.iter_mut() {
+        for replica in self.replicas.values_mut() {
             // If sending the command fails, the replica requires rehydration.
-            if replica.send(cmd.clone()).is_err() {
-                self.failed_replicas.insert(*id);
+            if replica.client.send(cmd.clone()).is_err() {
+                replica.failed = true;
             }
         }
     }
@@ -336,7 +650,7 @@ where
         let response = self
             .replicas
             .iter_mut()
-            .map(|(id, replica)| async { (*id, replica.recv().await) })
+            .map(|(id, replica)| async { (*id, replica.client.recv().await) })
             .collect::<FuturesUnordered<_>>()
             .next()
             .await;
@@ -349,14 +663,55 @@ where
             }
             Some((replica_id, None)) => {
                 // A replica has failed and requires rehydration.
-                self.failed_replicas.insert(replica_id);
+                let replica = self.replicas.get_mut(&replica_id).unwrap();
+                replica.failed = true;
                 Err(replica_id)
             }
             Some((replica_id, Some(response))) => {
                 // A replica has produced a response. Return it.
+                self.register_replica_heartbeat(replica_id);
                 Ok((replica_id, response))
             }
         }
+    }
+
+    /// Register a heartbeat from the given replica.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the specified replica does not exist.
+    fn register_replica_heartbeat(&mut self, replica_id: ReplicaId) {
+        let replica = self
+            .replicas
+            .get_mut(&replica_id)
+            .expect("replica must exist");
+
+        let now = Utc::now()
+            .duration_trunc(Duration::seconds(60))
+            .expect("cannot fail");
+
+        let mut updates = Vec::new();
+        if let Some(old) = replica.last_heartbeat {
+            if old == now {
+                return; // nothing new to report
+            }
+
+            let retraction = Row::pack_slice(&[
+                Datum::String(&replica_id.to_string()),
+                Datum::TimestampTz(old.try_into().expect("must fit")),
+            ]);
+            updates.push((retraction, -1));
+        }
+
+        replica.last_heartbeat = Some(now);
+
+        let insertion = Row::pack_slice(&[
+            Datum::String(&replica_id.to_string()),
+            Datum::TimestampTz(now.try_into().expect("must fit")),
+        ]);
+        updates.push((insertion, 1));
+
+        self.deliver_introspection_updates(IntrospectionType::ComputeReplicaHeartbeats, updates);
     }
 
     /// Assign a target replica to the identified subscribe.
@@ -412,9 +767,8 @@ where
         config.logging.index_logs = self.compute.log_sources.clone();
         let log_ids: BTreeSet<_> = config.logging.index_logs.values().collect();
 
-        // Initialize frontier tracking for the new replica
-        // and clean up any dropped collections that we can
-        let mut updates = Vec::new();
+        // Initialize frontier tracking for the new replica.
+        let mut updates = BTreeMap::new();
         for (compute_id, collection) in &mut self.compute.collections {
             // Skip log collections not maintained by this replica.
             if collection.log_collection && !log_ids.contains(compute_id) {
@@ -422,27 +776,27 @@ where
             }
 
             let read_frontier = collection.read_frontier();
-            updates.push((*compute_id, read_frontier.to_owned()));
+            updates.insert(*compute_id, read_frontier.to_owned());
         }
-        self.update_write_frontiers(id, &updates);
+        self.update_replica_write_frontiers(id, &updates);
 
         let replica_epoch = self.compute.replica_epochs.entry(id).or_default();
         *replica_epoch += 1;
-        let replica = Replica::spawn(
+        let metrics = self.compute.metrics.for_replica(id);
+        let client = ReplicaClient::spawn(
             id,
             self.compute.build_info,
-            config,
+            config.clone(),
             ClusterStartupEpoch::new(self.compute.envd_epoch, *replica_epoch),
-            self.compute.metrics.for_replica(id),
+            metrics.clone(),
         );
 
         // Take this opportunity to clean up the history we should present.
-        self.compute.history.retain_peeks(&self.compute.peeks);
         self.compute.history.reduce();
 
         // Replay the commands at the client, creating new dataflow identifiers.
         for command in self.compute.history.iter() {
-            if replica.send(command.clone()).is_err() {
+            if client.send(command.clone()).is_err() {
                 // We swallow the error here. On the next send, we will fail again, and
                 // restart the connection as well as this rehydration.
                 tracing::warn!("Replica {:?} connection terminated during hydration", id);
@@ -451,34 +805,19 @@ where
         }
 
         // Add replica to tracked state.
-        self.compute.replicas.insert(id, replica);
-        for peek in self.compute.peeks.values_mut() {
-            peek.unfinished.insert(id);
-        }
+        self.compute.add_replica_state(id, client, config);
+
         Ok(())
     }
 
     /// Remove an existing instance replica, by ID.
     pub fn remove_replica(&mut self, id: ReplicaId) -> Result<(), ReplicaMissing> {
         self.compute
-            .replicas
-            .remove(&id)
+            .remove_replica_state(id)
             .ok_or(ReplicaMissing(id))?;
 
-        self.compute.failed_replicas.remove(&id);
-
         // Remove frontier tracking for this replica.
-        self.remove_write_frontiers(id);
-
-        // Removing a replica might implicitly finish peeks.
-        let mut peeks_to_remove = BTreeSet::new();
-        for (uuid, peek) in &mut self.compute.peeks {
-            peek.unfinished.remove(&id);
-            if peek.is_finished() {
-                peeks_to_remove.insert(*uuid);
-            }
-        }
-        self.remove_peeks(&peeks_to_remove);
+        self.remove_replica_write_frontiers(id);
 
         // Subscribes targeting this replica either won't be served anymore (if the replica is
         // dropped) or might produce inconsistent output (if the target collection is an
@@ -488,14 +827,33 @@ where
             let subscribe = self.compute.subscribes.remove(&subscribe_id).unwrap();
             let response = ComputeControllerResponse::SubscribeResponse(
                 subscribe_id,
-                SubscribeResponse::Batch(SubscribeBatch {
+                SubscribeBatch {
                     lower: subscribe.frontier.clone(),
                     upper: subscribe.frontier,
                     updates: Err("target replica failed or was dropped".into()),
-                }),
+                },
             );
-            self.compute.ready_responses.push_back(response);
+            self.compute.deliver_response(response);
         }
+
+        // Peeks targeting this replica might not be served anymore (if the replica is dropped).
+        // If the replica has failed it might come back and respond to the peek later, but it still
+        // seems like a good idea to cancel the peek to inform the caller about the failure. This
+        // is consistent with how we handle targeted subscribes above.
+        let mut peek_responses = Vec::new();
+        let mut to_drop = Vec::new();
+        for (uuid, peek) in self.compute.peeks_targeting(id) {
+            peek_responses.push(ComputeControllerResponse::PeekResponse(
+                uuid,
+                PeekResponse::Error("target replica failed or was dropped".into()),
+                peek.otel_ctx.clone(),
+            ));
+            to_drop.push(uuid);
+        }
+        for response in peek_responses {
+            self.compute.deliver_response(response);
+        }
+        to_drop.into_iter().for_each(|uuid| self.remove_peek(uuid));
 
         Ok(())
     }
@@ -517,177 +875,236 @@ where
     }
 
     /// Rehydrate any failed replicas of this instance.
-    pub fn rehydrate_failed_replicas(&mut self) {
-        let failed_replicas = self.compute.failed_replicas.clone();
+    fn rehydrate_failed_replicas(&mut self) {
+        let replicas = self.compute.replicas.iter();
+        let failed_replicas: Vec<_> = replicas
+            .filter_map(|(id, replica)| replica.failed.then_some(*id))
+            .collect();
+
         for replica_id in failed_replicas {
             self.rehydrate_replica(replica_id);
-            self.compute.failed_replicas.remove(&replica_id);
         }
     }
 
     /// Create the described dataflows and initializes state for their output.
-    pub fn create_dataflows(
+    pub fn create_dataflow(
         &mut self,
-        dataflows: Vec<DataflowDescription<crate::plan::Plan<T>, (), T>>,
+        dataflow: DataflowDescription<mz_compute_types::plan::Plan<T>, (), T>,
     ) -> Result<(), DataflowCreationError> {
-        // Validate dataflows as having inputs whose `since` is less or equal to the dataflow's `as_of`.
+        // Simple sanity checks around `as_of`
+        let as_of = dataflow
+            .as_of
+            .as_ref()
+            .ok_or(DataflowCreationError::MissingAsOf)?;
+        if as_of.is_empty() && dataflow.subscribe_ids().next().is_some() {
+            return Err(DataflowCreationError::EmptyAsOfForSubscribe);
+        }
+        if as_of.is_empty() && dataflow.copy_to_ids().next().is_some() {
+            return Err(DataflowCreationError::EmptyAsOfForCopyTo);
+        }
+
+        // Validate the dataflow as having inputs whose `since` is less or equal to the dataflow's `as_of`.
         // Start tracking frontiers for each dataflow, using its `as_of` for each index and sink.
-        for dataflow in dataflows.iter() {
-            let as_of = dataflow
-                .as_of
-                .as_ref()
-                .ok_or(DataflowCreationError::MissingAsOf)?;
 
-            // Record all transitive dependencies of the outputs.
-            let mut storage_dependencies = Vec::new();
-            let mut compute_dependencies = Vec::new();
+        // When we initialize per-replica write frontiers (and thereby the per-replica read
+        // capabilities), we cannot use the `as_of` because of reconciliation: Existing
+        // slow replicas might be reading from the inputs at times before the `as_of` and we
+        // would rather not crash them by allowing their inputs to compact too far. So instead
+        // we initialize the per-replica write frontiers with the smallest possible value that
+        // is a valid read capability for all inputs, which is the join of all input `since`s.
+        let mut replica_write_frontier = Antichain::from_elem(T::minimum());
 
-            // Validate sources have `since.less_equal(as_of)`.
-            for source_id in dataflow.source_imports.keys() {
-                let since = &self
-                    .storage_controller
-                    .collection(*source_id)
-                    .map_err(|_| DataflowCreationError::CollectionMissing(*source_id))?
-                    .read_capabilities
-                    .frontier();
-                if !(timely::order::PartialOrder::less_equal(since, &as_of.borrow())) {
-                    Err(DataflowCreationError::SinceViolation(*source_id))?;
-                }
+        // Record all transitive dependencies of the outputs.
+        let mut storage_dependencies = Vec::new();
+        let mut compute_dependencies = Vec::new();
 
-                storage_dependencies.push(*source_id);
+        // Validate sources have `since.less_equal(as_of)`.
+        for source_id in dataflow.source_imports.keys() {
+            let since = &self
+                .storage_controller
+                .collection(*source_id)
+                .map_err(|_| DataflowCreationError::CollectionMissing(*source_id))?
+                .read_capabilities
+                .frontier();
+            if !(timely::order::PartialOrder::less_equal(since, &as_of.borrow())) {
+                Err(DataflowCreationError::SinceViolation(*source_id))?;
             }
 
-            // Validate indexes have `since.less_equal(as_of)`.
-            // TODO(mcsherry): Instead, return an error from the constructing method.
-            for index_id in dataflow.index_imports.keys() {
-                let collection = self.compute.collection(*index_id)?;
-                let since = collection.read_capabilities.frontier();
-                if !(timely::order::PartialOrder::less_equal(&since, &as_of.borrow())) {
-                    Err(DataflowCreationError::SinceViolation(*index_id))?;
-                } else {
-                    compute_dependencies.push(*index_id);
-                }
-            }
-
-            // Canonicalize dependencies.
-            // Probably redundant based on key structure, but doing for sanity.
-            storage_dependencies.sort();
-            storage_dependencies.dedup();
-            compute_dependencies.sort();
-            compute_dependencies.dedup();
-
-            // We will bump the internals of each input by the number of dependents (outputs).
-            let outputs = dataflow.sink_exports.len() + dataflow.index_exports.len();
-            let mut changes = ChangeBatch::new();
-            for time in as_of.iter() {
-                // TODO(benesch): fix this dangerous use of `as`.
-                #[allow(clippy::as_conversions)]
-                changes.update(time.clone(), outputs as i64);
-            }
-            // Update storage read capabilities for inputs.
-            let mut storage_read_updates = storage_dependencies
-                .iter()
-                .map(|id| (*id, changes.clone()))
-                .collect();
-            self.storage_controller
-                .update_read_capabilities(&mut storage_read_updates);
-            // Update compute read capabilities for inputs.
-            let mut compute_read_updates = compute_dependencies
-                .iter()
-                .map(|id| (*id, changes.clone()))
-                .collect();
-            self.update_read_capabilities(&mut compute_read_updates);
-
-            // Install collection state for each of the exports.
-            let mut updates = Vec::new();
-            for export_id in dataflow.export_ids() {
-                self.compute.collections.insert(
-                    export_id,
-                    CollectionState::new(
-                        as_of.clone(),
-                        storage_dependencies.clone(),
-                        compute_dependencies.clone(),
-                    ),
-                );
-                updates.push((export_id, as_of.clone()));
-            }
-            // Initialize tracking of replica frontiers.
-            let replica_ids: Vec<_> = self.compute.replica_ids().collect();
-            for replica_id in replica_ids {
-                self.update_write_frontiers(replica_id, &updates);
-            }
-
-            // Initialize tracking of subscribes.
-            for subscribe_id in dataflow.subscribe_ids() {
-                self.compute
-                    .subscribes
-                    .insert(subscribe_id, ActiveSubscribe::new());
-            }
+            storage_dependencies.push(*source_id);
+            replica_write_frontier.join_assign(&since.to_owned());
         }
 
-        // Here we augment all imported sources and all exported sinks with with the appropriate
+        // Validate indexes have `since.less_equal(as_of)`.
+        // TODO(mcsherry): Instead, return an error from the constructing method.
+        for index_id in dataflow.index_imports.keys() {
+            let collection = self.compute.collection(*index_id)?;
+            let since = collection.read_capabilities.frontier();
+            if !(timely::order::PartialOrder::less_equal(&since, &as_of.borrow())) {
+                Err(DataflowCreationError::SinceViolation(*index_id))?;
+            }
+
+            compute_dependencies.push(*index_id);
+            replica_write_frontier.join_assign(&since.to_owned());
+        }
+
+        // If the `as_of` is empty, we are not going to create a dataflow, so don't install any read
+        // holds.
+        if as_of.is_empty() {
+            replica_write_frontier = Antichain::new();
+        }
+
+        // Canonicalize dependencies.
+        // Probably redundant based on key structure, but doing for sanity.
+        storage_dependencies.sort();
+        storage_dependencies.dedup();
+        compute_dependencies.sort();
+        compute_dependencies.dedup();
+
+        // We will bump the internals of each input by the number of dependents (outputs).
+        let outputs = dataflow.sink_exports.len() + dataflow.index_exports.len();
+        let mut changes = ChangeBatch::new();
+        for time in as_of.iter() {
+            // TODO(benesch): fix this dangerous use of `as`.
+            #[allow(clippy::as_conversions)]
+            changes.update(time.clone(), outputs as i64);
+        }
+        // Update storage read capabilities for inputs.
+        let mut storage_read_updates = storage_dependencies
+            .iter()
+            .map(|id| (*id, changes.clone()))
+            .collect();
+        self.storage_controller
+            .update_read_capabilities(&mut storage_read_updates);
+        // Update compute read capabilities for inputs.
+        let compute_read_updates = compute_dependencies
+            .iter()
+            .map(|id| (*id, changes.clone()))
+            .collect();
+        self.update_read_capabilities(compute_read_updates);
+
+        // Install collection state for each of the exports.
+        let mut updates = BTreeMap::new();
+        for export_id in dataflow.export_ids() {
+            let write_only = dataflow.sink_exports.contains_key(&export_id);
+            self.compute.add_collection(
+                export_id,
+                as_of.clone(),
+                storage_dependencies.clone(),
+                compute_dependencies.clone(),
+                write_only,
+            );
+            updates.insert(export_id, replica_write_frontier.clone());
+        }
+        // Initialize tracking of replica frontiers.
+        let replica_ids: Vec<_> = self.compute.replica_ids().collect();
+        for replica_id in replica_ids {
+            self.update_replica_write_frontiers(replica_id, &updates);
+        }
+
+        // Initialize tracking of subscribes.
+        for subscribe_id in dataflow.subscribe_ids() {
+            self.compute
+                .subscribes
+                .insert(subscribe_id, ActiveSubscribe::new());
+        }
+
+        // Initialize tracking of copy tos.
+        for copy_to_id in dataflow.copy_to_ids() {
+            self.compute.copy_tos.insert(copy_to_id);
+        }
+
+        // Here we augment all imported sources and all exported sinks with the appropriate
         // storage metadata needed by the compute instance.
-        let mut augmented_dataflows = Vec::with_capacity(dataflows.len());
-        for d in dataflows {
-            let mut source_imports = BTreeMap::new();
-            for (id, (si, monotonic)) in d.source_imports {
-                let collection = self
-                    .storage_controller
-                    .collection(id)
-                    .map_err(|_| DataflowCreationError::CollectionMissing(id))?;
-                let desc = SourceInstanceDesc {
-                    storage_metadata: collection.collection_metadata.clone(),
-                    arguments: si.arguments,
-                    typ: collection.description.desc.typ().clone(),
-                };
-                source_imports.insert(id, (desc, monotonic));
-            }
-
-            let mut sink_exports = BTreeMap::new();
-            for (id, se) in d.sink_exports {
-                let connection = match se.connection {
-                    ComputeSinkConnection::Persist(conn) => {
-                        let metadata = self
-                            .storage_controller
-                            .collection(id)
-                            .map_err(|_| DataflowCreationError::CollectionMissing(id))?
-                            .collection_metadata
-                            .clone();
-                        let conn = PersistSinkConnection {
-                            value_desc: conn.value_desc,
-                            storage_metadata: metadata,
-                        };
-                        ComputeSinkConnection::Persist(conn)
-                    }
-                    ComputeSinkConnection::Subscribe(conn) => {
-                        ComputeSinkConnection::Subscribe(conn)
-                    }
-                };
-                let desc = ComputeSinkDesc {
-                    from: se.from,
-                    from_desc: se.from_desc,
-                    connection,
-                    with_snapshot: se.with_snapshot,
-                    up_to: se.up_to,
-                };
-                sink_exports.insert(id, desc);
-            }
-
-            augmented_dataflows.push(DataflowDescription {
-                source_imports,
-                sink_exports,
-                // The rest of the fields are identical
-                index_imports: d.index_imports,
-                objects_to_build: d.objects_to_build,
-                index_exports: d.index_exports,
-                as_of: d.as_of,
-                until: d.until,
-                debug_name: d.debug_name,
-            });
+        let mut source_imports = BTreeMap::new();
+        for (id, (si, monotonic)) in dataflow.source_imports {
+            let collection = self
+                .storage_controller
+                .collection(id)
+                .map_err(|_| DataflowCreationError::CollectionMissing(id))?;
+            let desc = SourceInstanceDesc {
+                storage_metadata: collection.collection_metadata.clone(),
+                arguments: si.arguments,
+                typ: collection.description.desc.typ().clone(),
+            };
+            source_imports.insert(id, (desc, monotonic));
         }
 
-        self.compute
-            .send(ComputeCommand::CreateDataflows(augmented_dataflows));
+        let mut sink_exports = BTreeMap::new();
+        for (id, se) in dataflow.sink_exports {
+            let connection = match se.connection {
+                ComputeSinkConnection::Persist(conn) => {
+                    let metadata = self
+                        .storage_controller
+                        .collection(id)
+                        .map_err(|_| DataflowCreationError::CollectionMissing(id))?
+                        .collection_metadata
+                        .clone();
+                    let conn = PersistSinkConnection {
+                        value_desc: conn.value_desc,
+                        storage_metadata: metadata,
+                    };
+                    ComputeSinkConnection::Persist(conn)
+                }
+                ComputeSinkConnection::Subscribe(conn) => ComputeSinkConnection::Subscribe(conn),
+                ComputeSinkConnection::CopyToS3Oneshot(conn) => {
+                    ComputeSinkConnection::CopyToS3Oneshot(conn)
+                }
+            };
+            let desc = ComputeSinkDesc {
+                from: se.from,
+                from_desc: se.from_desc,
+                connection,
+                with_snapshot: se.with_snapshot,
+                up_to: se.up_to,
+                non_null_assertions: se.non_null_assertions,
+                refresh_schedule: se.refresh_schedule,
+            };
+            sink_exports.insert(id, desc);
+        }
+
+        let augmented_dataflow = DataflowDescription {
+            source_imports,
+            sink_exports,
+            // The rest of the fields are identical
+            index_imports: dataflow.index_imports,
+            objects_to_build: dataflow.objects_to_build,
+            index_exports: dataflow.index_exports,
+            as_of: dataflow.as_of.clone(),
+            until: dataflow.until,
+            debug_name: dataflow.debug_name,
+        };
+
+        if augmented_dataflow.is_transient() {
+            tracing::debug!(
+                name = %augmented_dataflow.debug_name,
+                import_ids = %augmented_dataflow.display_import_ids(),
+                export_ids = %augmented_dataflow.display_export_ids(),
+                as_of = ?augmented_dataflow.as_of.as_ref().unwrap().elements(),
+                until = ?augmented_dataflow.until.elements(),
+                "creating dataflow",
+            );
+        } else {
+            tracing::info!(
+                name = %augmented_dataflow.debug_name,
+                import_ids = %augmented_dataflow.display_import_ids(),
+                export_ids = %augmented_dataflow.display_export_ids(),
+                as_of = ?augmented_dataflow.as_of.as_ref().unwrap().elements(),
+                until = ?augmented_dataflow.until.elements(),
+                "creating dataflow",
+            );
+        }
+
+        // Skip the actual dataflow creation for an empty `as_of`. (Happens e.g. for the
+        // bootstrapping of a REFRESH AT mat view that is past its last refresh.)
+        if as_of.is_empty() {
+            tracing::info!(
+                name = %augmented_dataflow.debug_name,
+                "not sending `CreateDataflow`, because of empty `as_of`",
+            );
+        } else {
+            self.compute
+                .send(ComputeCommand::CreateDataflow(augmented_dataflow));
+        }
 
         Ok(())
     }
@@ -695,17 +1112,40 @@ where
     /// Drops the read capability for the given collections and allows their resources to be
     /// reclaimed.
     pub fn drop_collections(&mut self, ids: Vec<GlobalId>) -> Result<(), CollectionMissing> {
-        // Validate that the ids exist.
-        self.validate_ids(ids.iter().cloned())?;
+        let mut read_capability_updates = BTreeMap::new();
 
-        let policies = ids
-            .into_iter()
-            .map(|id| (id, ReadPolicy::ValidFrom(Antichain::new())));
-        self.set_read_policy(policies.collect())
+        for id in &ids {
+            let collection = self.compute.collection_mut(*id)?;
+
+            // Mark the collection as dropped to allow it to be removed from the controller state.
+            collection.dropped = true;
+
+            // Drop the implied and warmup read capabilities to announce that clients are not
+            // interested in the collection anymore.
+            let implied_capability = std::mem::take(&mut collection.implied_capability);
+            let warmup_capability = std::mem::take(&mut collection.warmup_capability);
+            let mut update = ChangeBatch::new();
+            update.extend(implied_capability.iter().map(|t| (t.clone(), -1)));
+            update.extend(warmup_capability.iter().map(|t| (t.clone(), -1)));
+            read_capability_updates.insert(*id, update);
+
+            // If the collection is a subscribe, stop tracking it. This ensures that the controller
+            // ceases to produce `SubscribeResponse`s for this subscribe.
+            self.compute.subscribes.remove(id);
+            // If the collection is a copy to, stop tracking it. This ensures that the controller
+            // ceases to produce `CopyToResponse`s` for this copy to.
+            self.compute.copy_tos.remove(id);
+        }
+
+        if !read_capability_updates.is_empty() {
+            self.update_read_capabilities(read_capability_updates);
+        }
+
+        Ok(())
     }
 
     /// Initiate a peek request for the contents of `id` at `timestamp`.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[mz_ore::instrument(level = "debug")]
     pub fn peek(
         &mut self,
         id: GlobalId,
@@ -715,10 +1155,19 @@ where
         finishing: RowSetFinishing,
         map_filter_project: mz_expr::SafeMfpPlan,
         target_replica: Option<ReplicaId>,
+        peek_target: PeekTarget,
     ) -> Result<(), PeekError> {
-        let since = self.compute.collection(id)?.read_capabilities.frontier();
+        let since = match &peek_target {
+            PeekTarget::Index { .. } => self.compute.collection(id)?.read_capabilities.frontier(),
+            PeekTarget::Persist { .. } => self
+                .storage_controller
+                .collection(id)
+                .map_err(|_| PeekError::CollectionMissing(id))?
+                .implied_capability
+                .borrow(),
+        };
         if !since.less_equal(&timestamp) {
-            Err(PeekError::SinceViolation(id))?;
+            return Err(PeekError::SinceViolation(id));
         }
 
         if let Some(target) = target_replica {
@@ -730,24 +1179,27 @@ where
         // Install a compaction hold on `id` at `timestamp`.
         let mut updates = BTreeMap::new();
         updates.insert(id, ChangeBatch::new_from(timestamp.clone(), 1));
-        self.update_read_capabilities(&mut updates);
+        match &peek_target {
+            PeekTarget::Index { .. } => self.update_read_capabilities(updates),
+            PeekTarget::Persist { .. } => self
+                .storage_controller
+                .update_read_capabilities(&mut updates),
+        };
 
-        let unfinished = self.compute.replica_ids().collect();
         let otel_ctx = OpenTelemetryContext::obtain();
         self.compute.peeks.insert(
             uuid,
             PendingPeek {
-                target: id,
+                target: peek_target.clone(),
                 time: timestamp.clone(),
-                unfinished,
                 target_replica,
                 // TODO(guswynn): can we just hold the `tracing::Span` here instead?
-                otel_ctx: Some(otel_ctx.clone()),
+                otel_ctx: otel_ctx.clone(),
+                requested_at: Instant::now(),
             },
         );
 
         self.compute.send(ComputeCommand::Peek(Peek {
-            id,
             literal_constraints,
             uuid,
             timestamp,
@@ -756,37 +1208,35 @@ where
             // Obtain an `OpenTelemetryContext` from the thread-local tracing
             // tree to forward it on to the compute worker.
             otel_ctx,
+            target: peek_target,
         }));
 
         Ok(())
     }
 
-    /// Cancels existing peek requests.
-    pub fn cancel_peeks(&mut self, uuids: BTreeSet<Uuid>) {
-        // Enqueue the response to the cancelation.
-        for uuid in &uuids {
-            let otel_ctx = self
-                .compute
-                .peeks
-                .get_mut(uuid)
-                // Canceled peeks should not be further responded to.
-                .map(|pending| pending.otel_ctx.take())
-                .unwrap_or_else(|| {
-                    tracing::warn!("did not find pending peek for {}", uuid);
-                    None
-                });
-            if let Some(ctx) = otel_ctx {
-                self.compute
-                    .ready_responses
-                    .push_back(ComputeControllerResponse::PeekResponse(
-                        *uuid,
-                        PeekResponse::Canceled,
-                        ctx,
-                    ));
-            }
-        }
+    /// Cancels an existing peek request.
+    pub fn cancel_peek(&mut self, uuid: Uuid) {
+        let Some(peek) = self.compute.peeks.get_mut(&uuid) else {
+            tracing::warn!("did not find pending peek for {uuid}");
+            return;
+        };
 
-        self.compute.send(ComputeCommand::CancelPeeks { uuids });
+        let response = PeekResponse::Canceled;
+        let duration = peek.requested_at.elapsed();
+        self.compute
+            .metrics
+            .observe_peek_response(&response, duration);
+
+        // Enqueue the response to the cancellation.
+        let otel_ctx = peek.otel_ctx.clone();
+        self.compute
+            .deliver_response(ComputeControllerResponse::PeekResponse(
+                uuid, response, otel_ctx,
+            ));
+
+        // Remove the peek.
+        // This will also propagate the cancellation to the replicas.
+        self.remove_peek(uuid);
     }
 
     /// Assigns a read policy to specific identifiers.
@@ -797,41 +1247,42 @@ where
     /// capability is already ahead of it.
     ///
     /// Identifiers not present in `policies` retain their existing read policies.
-    #[tracing::instrument(level = "debug", skip(self))]
+    ///
+    /// It is an error to attempt to set a read policy for a collection that is not readable in the
+    /// context of compute. At this time, only indexes are readable compute collections.
+    #[mz_ore::instrument(level = "debug")]
     pub fn set_read_policy(
         &mut self,
         policies: Vec<(GlobalId, ReadPolicy<T>)>,
-    ) -> Result<(), CollectionMissing> {
-        let mut read_capability_changes = BTreeMap::default();
-        for (id, policy) in policies.into_iter() {
-            let collection = self.compute.collection_mut(id)?;
-            let mut new_read_capability = policy.frontier(collection.write_frontier.borrow());
+    ) -> Result<(), ReadPolicyError> {
+        // Do error checking upfront, to avoid introducing inconsistencies between a collection's
+        // `implied_capability` and `read_capabilities`.
+        for (id, _policy) in &policies {
+            let collection = self.compute.collection(*id)?;
+            if collection.read_policy.is_none() {
+                return Err(ReadPolicyError::WriteOnlyCollection(*id));
+            }
+        }
 
-            if timely::order::PartialOrder::less_equal(
-                &collection.implied_capability,
-                &new_read_capability,
-            ) {
-                let mut update = ChangeBatch::new();
-                update.extend(new_read_capability.iter().map(|time| (time.clone(), 1)));
-                std::mem::swap(&mut collection.implied_capability, &mut new_read_capability);
-                update.extend(new_read_capability.iter().map(|time| (time.clone(), -1)));
-                if !update.is_empty() {
-                    read_capability_changes.insert(id, update);
-                }
+        let mut read_capability_changes = BTreeMap::default();
+        for (id, new_policy) in policies {
+            let collection = self.compute.expect_collection_mut(id);
+
+            let old_capability = &collection.implied_capability;
+            let new_capability = new_policy.frontier(collection.write_frontier.borrow());
+            if PartialOrder::less_than(old_capability, &new_capability) {
+                let entry = read_capability_changes
+                    .entry(id)
+                    .or_insert_with(ChangeBatch::new);
+                entry.extend(old_capability.iter().map(|t| (t.clone(), -1)));
+                entry.extend(new_capability.iter().map(|t| (t.clone(), 1)));
+                collection.implied_capability = new_capability;
             }
 
-            collection.read_policy = policy;
+            collection.read_policy = Some(new_policy);
         }
         if !read_capability_changes.is_empty() {
-            self.update_read_capabilities(&mut read_capability_changes);
-        }
-        Ok(())
-    }
-
-    /// Validate that a collection exists for all identifiers, and error if any do not.
-    fn validate_ids(&self, ids: impl Iterator<Item = GlobalId>) -> Result<(), CollectionMissing> {
-        for id in ids {
-            self.compute.collection(id)?;
+            self.update_read_capabilities(read_capability_changes);
         }
         Ok(())
     }
@@ -842,26 +1293,36 @@ where
     ///
     /// Panics if any of the `updates` references an absent collection.
     /// Panics if any of the `updates` regresses an existing write frontier.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[mz_ore::instrument(level = "debug")]
     fn update_write_frontiers(
         &mut self,
         replica_id: ReplicaId,
-        updates: &[(GlobalId, Antichain<T>)],
+        updates: &BTreeMap<GlobalId, Antichain<T>>,
     ) {
-        let mut advanced_collections = Vec::new();
-        let mut compute_read_capability_changes = BTreeMap::default();
-        let mut storage_read_capability_changes = BTreeMap::default();
-        let mut dropped_collection_ids = Vec::new();
-        for (id, new_upper) in updates.iter() {
-            let collection = self
-                .compute
-                .collection_mut(*id)
-                .expect("reference to absent collection");
+        // Apply advancements of replica frontiers.
+        self.update_replica_write_frontiers(replica_id, updates);
 
-            if PartialOrder::less_than(&collection.write_frontier, new_upper) {
-                advanced_collections.push(*id);
-                collection.write_frontier = new_upper.clone();
-            }
+        // Apply advancements of global collection frontiers.
+        self.maybe_update_global_write_frontiers(updates);
+    }
+
+    /// Apply replica write frontier updates.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the `updates` references an absent collection.
+    /// Panics if any of the `updates` regresses an existing replica write frontier.
+    #[mz_ore::instrument(level = "debug")]
+    fn update_replica_write_frontiers(
+        &mut self,
+        replica_id: ReplicaId,
+        updates: &BTreeMap<GlobalId, Antichain<T>>,
+    ) {
+        // Compute and apply read hold downgrades on storage dependencies that result from
+        // replica frontier advancements.
+        let mut storage_read_capability_changes = BTreeMap::default();
+        for (id, new_upper) in updates {
+            let collection = self.compute.expect_collection_mut(*id);
 
             let old_upper = collection
                 .replica_write_frontiers
@@ -871,32 +1332,12 @@ where
             if let Some(old) = &old_upper {
                 assert!(
                     PartialOrder::less_equal(old, new_upper),
-                    "Frontier regression: {old:?} -> {new_upper:?}, \
+                    "replica frontier regression: {old:?} -> {new_upper:?}, \
                      collection={id}, replica={replica_id}",
                 );
             }
 
-            if new_upper.is_empty() {
-                dropped_collection_ids.push(*id);
-            }
-
-            let mut new_read_capability = collection
-                .read_policy
-                .frontier(collection.write_frontier.borrow());
-            if timely::order::PartialOrder::less_equal(
-                &collection.implied_capability,
-                &new_read_capability,
-            ) {
-                let mut update = ChangeBatch::new();
-                update.extend(new_read_capability.iter().map(|time| (time.clone(), 1)));
-                std::mem::swap(&mut collection.implied_capability, &mut new_read_capability);
-                update.extend(new_read_capability.iter().map(|time| (time.clone(), -1)));
-                if !update.is_empty() {
-                    compute_read_capability_changes.insert(*id, update);
-                }
-            }
-
-            // Update read holds on storage dependencies.
+            // Update per-replica read holds on storage dependencies.
             for storage_id in &collection.storage_dependencies {
                 let update = storage_read_capability_changes
                     .entry(*storage_id)
@@ -907,51 +1348,31 @@ where
                 update.extend(new_upper.iter().map(|time| (time.clone(), 1)));
             }
         }
-        if !compute_read_capability_changes.is_empty() {
-            self.update_read_capabilities(&mut compute_read_capability_changes);
-        }
+
+        // Prune empty changes. We might end up with empty changes for dependencies that have been
+        // dropped already, which is fine but might be confusing if we reported them.
+        storage_read_capability_changes.retain(|_key, update| !update.is_empty());
+
         if !storage_read_capability_changes.is_empty() {
             self.storage_controller
                 .update_read_capabilities(&mut storage_read_capability_changes);
         }
-
-        // Tell the storage controller about new write frontiers for storage
-        // collections that are advanced by compute sinks.
-        // TODO(teskje): The storage controller should have a task to directly
-        // keep track of the frontiers of storage collections, instead of
-        // relying on others for that information.
-        let storage_updates: Vec<_> = advanced_collections
-            .into_iter()
-            .filter(|id| self.storage_controller.collection(*id).is_ok())
-            .map(|id| {
-                let collection = self.compute.collection(id).unwrap();
-                (id, collection.write_frontier.clone())
-            })
-            .collect();
-        self.storage_controller
-            .update_write_frontiers(&storage_updates);
-
-        if !dropped_collection_ids.is_empty() {
-            self.update_dropped_collections(dropped_collection_ids);
-        }
     }
 
     /// Remove frontier tracking state for the given replica.
-    #[tracing::instrument(level = "debug", skip(self))]
-    fn remove_write_frontiers(&mut self, replica_id: ReplicaId) {
+    #[mz_ore::instrument(level = "debug")]
+    fn remove_replica_write_frontiers(&mut self, replica_id: ReplicaId) {
         let mut storage_read_capability_changes = BTreeMap::default();
-        let mut dropped_collection_ids = Vec::new();
-        for (id, collection) in self.compute.collections.iter_mut() {
+        for collection in self.compute.collections.values_mut() {
             let last_upper = collection.replica_write_frontiers.remove(&replica_id);
+            let Some(frontier) = last_upper else { continue };
 
-            if let Some(frontier) = last_upper {
-                dropped_collection_ids.push(*id);
-
+            if !frontier.is_empty() {
                 // Update read holds on storage dependencies.
                 for storage_id in &collection.storage_dependencies {
                     let update = storage_read_capability_changes
                         .entry(*storage_id)
-                        .or_insert_with(|| ChangeBatch::new());
+                        .or_insert_with(ChangeBatch::new);
                     update.extend(frontier.iter().map(|time| (time.clone(), -1)));
                 }
             }
@@ -960,97 +1381,175 @@ where
             self.storage_controller
                 .update_read_capabilities(&mut storage_read_capability_changes);
         }
-        if !dropped_collection_ids.is_empty() {
-            self.update_dropped_collections(dropped_collection_ids);
-        }
     }
 
-    /// Applies `updates`, propagates consequences through other read capabilities, and sends an appropriate compaction command.
-    #[tracing::instrument(level = "debug", skip(self))]
-    fn update_read_capabilities(&mut self, updates: &mut BTreeMap<GlobalId, ChangeBatch<T>>) {
-        // Locations to record consequences that we need to act on.
-        let mut storage_todo = BTreeMap::default();
-        let mut compute_net = Vec::default();
-        // Repeatedly extract the maximum id, and updates for it.
-        while let Some(key) = updates.keys().rev().next().cloned() {
-            let mut update = updates.remove(&key).unwrap();
-            if let Ok(collection) = self.compute.collection_mut(key) {
-                let changes = collection.read_capabilities.update_iter(update.drain());
-                update.extend(changes);
-                for id in collection.storage_dependencies.iter() {
-                    storage_todo
-                        .entry(*id)
-                        .or_insert_with(ChangeBatch::new)
-                        .extend(update.iter().cloned());
+    /// Apply global write frontier updates.
+    ///
+    /// Frontier regressions are gracefully ignored.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the `updates` references an absent collection.
+    #[mz_ore::instrument(level = "debug")]
+    fn maybe_update_global_write_frontiers(&mut self, updates: &BTreeMap<GlobalId, Antichain<T>>) {
+        // Compute and apply read capability downgrades that result from collection frontier
+        // advancements.
+        let mut read_capability_changes = BTreeMap::new();
+        for (id, new_upper) in updates {
+            let collection = self.compute.expect_collection_mut(*id);
+
+            if !PartialOrder::less_than(&collection.write_frontier, new_upper) {
+                continue; // frontier has not advanced
+            }
+
+            collection.write_frontier = new_upper.clone();
+
+            let old_since = &collection.implied_capability;
+            let new_since = match &collection.read_policy {
+                Some(read_policy) => {
+                    // For readable collections the read frontier is determined by applying the
+                    // client-provided read policy to the write frontier.
+                    read_policy.frontier(new_upper.borrow())
                 }
-                for id in collection.compute_dependencies.iter() {
-                    updates
-                        .entry(*id)
-                        .or_insert_with(ChangeBatch::new)
-                        .extend(update.iter().cloned());
+                None => {
+                    // Write-only collections cannot be read within the context of the compute
+                    // controller, so we can immediately advance their read frontier to the new write
+                    // frontier.
+                    new_upper.clone()
                 }
-                compute_net.push((key, update));
-            } else {
-                // Storage presumably, but verify.
-                if self.storage_controller.collection(key).is_ok() {
-                    storage_todo
-                        .entry(key)
-                        .or_insert_with(ChangeBatch::new)
-                        .extend(update.drain())
-                } else {
-                    tracing::error!(
-                        "found neither compute nor storage collection with id {}",
-                        key
+            };
+
+            if PartialOrder::less_than(old_since, &new_since) {
+                let mut update = ChangeBatch::new();
+                update.extend(old_since.iter().map(|t| (t.clone(), -1)));
+                update.extend(new_since.iter().map(|t| (t.clone(), 1)));
+                read_capability_changes.insert(*id, update);
+                collection.implied_capability = new_since;
+            }
+        }
+        if !read_capability_changes.is_empty() {
+            self.update_read_capabilities(read_capability_changes);
+        }
+
+        // Tell the storage controller about new write frontiers for storage collections that are
+        // advanced by compute sinks.
+        let storage_updates: Vec<_> = updates
+            .iter()
+            .filter_map(|(&id, upper)| {
+                let found = self.storage_controller.collection(id).is_ok();
+                found.then_some((id, upper.clone()))
+            })
+            .collect();
+        self.storage_controller
+            .update_write_frontiers(&storage_updates);
+    }
+
+    /// Applies `updates`, propagates consequences through other read capabilities, and sends
+    /// appropriate compaction commands.
+    #[mz_ore::instrument(level = "debug")]
+    fn update_read_capabilities(&mut self, mut updates: BTreeMap<GlobalId, ChangeBatch<T>>) {
+        // Records storage read capability updates.
+        let mut storage_updates = BTreeMap::default();
+        // Records compute collections with downgraded read frontiers.
+        let mut compute_downgraded = BTreeSet::default();
+
+        // We must not rely on any specific relative ordering of `GlobalId`s.
+        // That said, it is reasonable to assume that collections generally have greater IDs than
+        // their dependencies, so starting with the largest is a useful optimization.
+        while let Some((id, mut update)) = updates.pop_last() {
+            let Some(collection) = self.compute.collections.get_mut(&id) else {
+                tracing::error!(
+                    %id, ?update,
+                    "received read capability update for an unknown collection",
+                );
+                continue;
+            };
+
+            // Sanity check to prevent corrupted `read_capabilities`, which can cause hard-to-debug
+            // issues (usually stuck read frontiers).
+            let read_frontier = collection.read_capabilities.frontier();
+            for (time, diff) in update.iter() {
+                let count = collection.read_capabilities.count_for(time) + diff;
+                if count < 0 {
+                    panic!(
+                        "invalid read capabilities update for collection {id}: negative capability \
+                         (read_capabilities={:?}, update={update:?}",
+                        collection.read_capabilities
+                    );
+                } else if count > 0 && !read_frontier.less_equal(time) {
+                    panic!(
+                        "invalid read capabilities update for collection {id}: frontier regression \
+                         (read_capabilities={:?}, update={update:?}",
+                        collection.read_capabilities
                     );
                 }
             }
+
+            // Apply read capability updates and learn about resulting changes to the read
+            // frontier.
+            let changes = collection.read_capabilities.update_iter(update.drain());
+            update.extend(changes);
+
+            if update.is_empty() {
+                continue; // read frontier did not change
+            }
+
+            compute_downgraded.insert(id);
+
+            // Propagate read frontier updates to dependencies.
+            for dep_id in &collection.compute_dependencies {
+                updates
+                    .entry(*dep_id)
+                    .or_insert_with(ChangeBatch::new)
+                    .extend(update.iter().cloned());
+            }
+            for dep_id in &collection.storage_dependencies {
+                storage_updates
+                    .entry(*dep_id)
+                    .or_insert_with(ChangeBatch::new)
+                    .extend(update.iter().cloned());
+            }
         }
 
-        // Translate our net compute actions into `AllowCompaction` commands
-        // and a list of collections that are potentially ready to be dropped
-        let mut compaction_commands = Vec::new();
-        let mut dropped_collection_ids = Vec::new();
-        for (id, change) in compute_net.iter_mut() {
-            let frontier = self
-                .compute
-                .collection(*id)
-                .expect("existence checked above")
-                .read_frontier();
-            if frontier.is_empty() {
-                dropped_collection_ids.push(*id);
-            }
-            if !change.is_empty() {
-                let frontier = frontier.to_owned();
-                compaction_commands.push((*id, frontier));
-            }
-        }
-        if !compaction_commands.is_empty() {
+        // Produce `AllowCompaction` commands for collections that had read frontier downgrades.
+        for id in compute_downgraded {
+            let collection = self.compute.expect_collection(id);
+            let frontier = collection.read_frontier().to_owned();
             self.compute
-                .send(ComputeCommand::AllowCompaction(compaction_commands));
-        }
-        if !dropped_collection_ids.is_empty() {
-            self.update_dropped_collections(dropped_collection_ids);
+                .send(ComputeCommand::AllowCompaction { id, frontier });
         }
 
-        // We may have storage consequences to process.
-        if !storage_todo.is_empty() {
+        // Report storage read capability updates.
+        if !storage_updates.is_empty() {
             self.storage_controller
-                .update_read_capabilities(&mut storage_todo);
+                .update_read_capabilities(&mut storage_updates);
         }
     }
 
-    /// Removes a registered peek, unblocking compaction that might have waited on it.
-    fn remove_peeks(&mut self, peek_ids: &BTreeSet<Uuid>) {
-        let mut updates = peek_ids
-            .into_iter()
-            .flat_map(|uuid| {
-                self.compute
-                    .peeks
-                    .remove(uuid)
-                    .map(|peek| (peek.target, ChangeBatch::new_from(peek.time, -1)))
-            })
-            .collect();
-        self.update_read_capabilities(&mut updates);
+    /// Removes a registered peek and clean up associated state.
+    ///
+    /// As part of this we:
+    ///  * Emit a `CancelPeek` command to instruct replicas to stop spending resources on this
+    ///    peek, and to allow the `ComputeCommandHistory` to reduce away the corresponding `Peek`
+    ///    command.
+    ///  * Remove the read hold for this peek, unblocking compaction that might have waited on it.
+    fn remove_peek(&mut self, uuid: Uuid) {
+        let Some(peek) = self.compute.peeks.remove(&uuid) else {
+            return;
+        };
+
+        // NOTE: We need to send the `CancelPeek` command _before_ we release the peek's read hold,
+        // to avoid the edge case that caused #16615.
+        self.compute.send(ComputeCommand::CancelPeek { uuid });
+
+        let update = (peek.target.id(), ChangeBatch::new_from(peek.time, -1));
+        let mut updates = [update].into();
+        match &peek.target {
+            PeekTarget::Index { .. } => self.update_read_capabilities(updates),
+            PeekTarget::Persist { .. } => self
+                .storage_controller
+                .update_read_capabilities(&mut updates),
+        }
     }
 
     pub fn handle_response(
@@ -1059,75 +1558,75 @@ where
         replica_id: ReplicaId,
     ) -> Option<ComputeControllerResponse<T>> {
         match response {
-            ComputeResponse::FrontierUppers(list) => {
-                self.handle_frontier_uppers(list, replica_id);
-                None
+            ComputeResponse::FrontierUpper { id, upper } => {
+                self.handle_frontier_upper(id, upper, replica_id)
             }
             ComputeResponse::PeekResponse(uuid, peek_response, otel_ctx) => {
                 self.handle_peek_response(uuid, peek_response, otel_ctx, replica_id)
             }
+            ComputeResponse::CopyToResponse(id, response) => {
+                self.handle_copy_to_response(id, response, replica_id)
+            }
             ComputeResponse::SubscribeResponse(id, response) => {
                 self.handle_subscribe_response(id, response, replica_id)
             }
-        }
-    }
-
-    /// Cleans up collection state, if necessary, in response to drop operations targeted
-    /// at a replica and given collections (via reporting of an empty frontier).
-    fn update_dropped_collections(&mut self, dropped_collection_ids: Vec<GlobalId>) {
-        for id in dropped_collection_ids {
-            // clean up the given collection if read frontier is empty
-            // and all replica frontiers are empty
-            if let Ok(collection) = self.compute.collection(id) {
-                if collection.read_frontier().is_empty()
-                    && collection
-                        .replica_write_frontiers
-                        .values()
-                        .all(|frontier| frontier.is_empty())
-                {
-                    self.compute.collections.remove(&id);
-                }
+            ComputeResponse::Status(response) => {
+                self.handle_status_response(response, replica_id);
+                None
             }
         }
     }
 
-    fn handle_frontier_uppers(
+    /// Handle new frontiers, returning any compute response that needs to
+    /// be sent to the client.
+    fn handle_frontier_upper(
         &mut self,
-        list: Vec<(GlobalId, Antichain<T>)>,
+        id: GlobalId,
+        new_frontier: Antichain<T>,
         replica_id: ReplicaId,
-    ) {
-        // According to the compute protocol, replicas are not allowed to send `FrontierUppers`
+    ) -> Option<ComputeControllerResponse<T>> {
+        // According to the compute protocol, replicas are not allowed to send `FrontierUpper`s
         // that regress frontiers they have reported previously. We still perform a check here,
         // rather than risking the controller becoming confused trying to handle regressions.
-        let mut updates = Vec::with_capacity(list.len());
-        for (id, new_frontier) in list {
-            let Ok(coll) = self.compute.collection(id) else {
+        let Ok(coll) = self.compute.collection(id) else {
+            tracing::warn!(
+                ?replica_id,
+                "Frontier update for unknown collection {id}: {:?}",
+                new_frontier.elements(),
+            );
+            tracing::error!("Replica reported an untracked collection frontier");
+            return None;
+        };
+
+        if let Some(old_frontier) = coll.replica_write_frontiers.get(&replica_id) {
+            if !PartialOrder::less_equal(old_frontier, &new_frontier) {
                 tracing::warn!(
                     ?replica_id,
-                    "Frontier update for unknown collection {id}: {:?}",
+                    "Frontier of collection {id} regressed: {:?} -> {:?}",
+                    old_frontier.elements(),
                     new_frontier.elements(),
                 );
-                tracing::error!("Replica reported an untracked collection frontier");
-                continue;
-            };
-
-            if let Some(old_frontier) = coll.replica_write_frontiers.get(&replica_id) {
-                if !PartialOrder::less_equal(old_frontier, &new_frontier) {
-                    tracing::warn!(
-                        ?replica_id,
-                        "Frontier of collection {id} regressed: {:?} -> {:?}",
-                        old_frontier.elements(),
-                        new_frontier.elements(),
-                    );
-                    tracing::error!("Replica reported a regressed collection frontier");
-                    continue;
-                }
+                tracing::error!("Replica reported a regressed collection frontier");
+                return None;
             }
-
-            updates.push((id, new_frontier));
         }
 
-        self.update_write_frontiers(replica_id, &updates);
+        let old_global_frontier = coll.write_frontier.clone();
+
+        self.compute
+            .update_hydration_status(id, replica_id, &new_frontier);
+        self.update_write_frontiers(replica_id, &[(id, new_frontier.clone())].into());
+
+        if let Ok(coll) = self.compute.collection(id) {
+            (coll.write_frontier != old_global_frontier).then_some(
+                ComputeControllerResponse::FrontierUpper {
+                    id,
+                    upper: coll.write_frontier.clone(),
+                },
+            )
+        } else {
+            None
+        }
     }
 
     fn handle_peek_response(
@@ -1137,44 +1636,59 @@ where
         otel_ctx: OpenTelemetryContext,
         replica_id: ReplicaId,
     ) -> Option<ComputeControllerResponse<T>> {
-        let peek = match self.compute.peeks.get_mut(&uuid) {
-            Some(peek) => peek,
-            None => {
-                tracing::warn!("did not find pending peek for {}", uuid);
-                return None;
-            }
-        };
+        // We might not be tracking this peek anymore, because we have served a response already or
+        // because it was canceled. If this is the case, we ignore the response.
+        let peek = self.compute.peeks.get(&uuid)?;
 
-        // Forward the peek response, if we didn't already forward a response
-        // to this peek previously. If the peek is targeting a replica, only
-        // forward the response from that replica.
-        // TODO: we could collect the other responses to assert equivalence?
-        // Trades resources (memory) for reassurances; idk which is best.
-        //
-        // NOTE: we use the `otel_ctx` from the response, not the
-        // pending peek, because we currently want the parent
-        // to be whatever the compute worker did with this peek. We
-        // still `take` the pending peek's `otel_ctx` to mark it as
-        // served.
-        //
-        // Additionally, we just use the `otel_ctx` from the first worker to
-        // respond.
-        let replica_targeted = peek.target_replica.unwrap_or(replica_id) == replica_id;
-        let controller_response = if replica_targeted {
-            peek.otel_ctx
-                .take()
-                .map(|_| ComputeControllerResponse::PeekResponse(uuid, response, otel_ctx))
-        } else {
-            None
-        };
-
-        // Update the per-replica tracking and draw appropriate consequences.
-        peek.unfinished.remove(&replica_id);
-        if peek.is_finished() {
-            self.remove_peeks(&[uuid].into());
+        // If the peek is targeting a replica, ignore responses from other replicas.
+        let target_replica = peek.target_replica.unwrap_or(replica_id);
+        if target_replica != replica_id {
+            return None;
         }
 
-        controller_response
+        let duration = peek.requested_at.elapsed();
+        self.compute
+            .metrics
+            .observe_peek_response(&response, duration);
+
+        self.remove_peek(uuid);
+
+        // NOTE: We use the `otel_ctx` from the response, not the pending peek, because we
+        // currently want the parent to be whatever the compute worker did with this peek.
+        Some(ComputeControllerResponse::PeekResponse(
+            uuid, response, otel_ctx,
+        ))
+    }
+
+    fn handle_copy_to_response(
+        &mut self,
+        sink_id: GlobalId,
+        response: CopyToResponse,
+        replica_id: ReplicaId,
+    ) -> Option<ComputeControllerResponse<T>> {
+        // We might not be tracking this COPY TO because we have already returned a response
+        // from one of the replicas. In that case, we ignore the response.
+        if self.compute.copy_tos.remove(&sink_id) {
+            let result = match response {
+                CopyToResponse::RowCount(count) => Ok(count),
+                CopyToResponse::Error(error) => Err(anyhow::anyhow!(error)),
+                // We should never get here: Replicas only drop copy to collections in response
+                // to the controller allowing them to do so, and when the controller drops a
+                // copy to it also removes it from the list of tracked copy_tos (see
+                // [`Instance::drop_collections`]).
+                CopyToResponse::Dropped => {
+                    tracing::error!(
+                        %sink_id,
+                        %replica_id,
+                        "received `Dropped` response for a tracked copy to",
+                    );
+                    return None;
+                }
+            };
+            Some(ComputeControllerResponse::CopyToResponse(sink_id, result))
+        } else {
+            None
+        }
     }
 
     fn handle_subscribe_response(
@@ -1185,18 +1699,23 @@ where
     ) -> Option<ComputeControllerResponse<T>> {
         if !self.compute.collections.contains_key(&subscribe_id) {
             tracing::warn!(?replica_id, "Response for unknown subscribe {subscribe_id}",);
-            tracing::error!("Replica sent a response for an unknown subscibe");
+            tracing::error!("Replica sent a response for an unknown subscribe");
             return None;
         }
 
-        // Always apply write frontier updates. Even if the subscribe is not tracked anymore, there
-        // might still be replicas reading from its inputs, so we need to track the frontiers until
-        // all replicas have advanced to the empty one.
+        // Always apply replica write frontier updates. Even if the subscribe is not tracked
+        // anymore, there might still be replicas reading from its inputs, so we need to track the
+        // frontiers until all replicas have advanced to the empty one.
         let write_frontier = match &response {
             SubscribeResponse::Batch(batch) => batch.upper.clone(),
             SubscribeResponse::DroppedAt(_) => Antichain::new(),
         };
-        self.update_write_frontiers(replica_id, &[(subscribe_id, write_frontier)]);
+
+        self.compute
+            .update_hydration_status(subscribe_id, replica_id, &write_frontier);
+
+        let write_frontier_updates = [(subscribe_id, write_frontier)].into();
+        self.update_replica_write_frontiers(replica_id, &write_frontier_updates);
 
         // If the subscribe is not tracked, or targets a different replica, there is nothing to do.
         let mut subscribe = self.compute.subscribes.get(&subscribe_id)?.clone();
@@ -1204,6 +1723,13 @@ where
         if !replica_targeted {
             return None;
         }
+
+        // Apply a global frontier update.
+        // If this is a replica-targeted subscribe, it is important that we advance the global
+        // frontier only based on responses from the targeted replica. Otherwise, another replica
+        // could advance to the empty frontier, making us drop the subscribe on the targeted
+        // replica prematurely.
+        self.maybe_update_global_write_frontiers(&write_frontier_updates);
 
         match response {
             SubscribeResponse::Batch(batch) => {
@@ -1228,57 +1754,140 @@ where
                     }
                     Some(ComputeControllerResponse::SubscribeResponse(
                         subscribe_id,
-                        SubscribeResponse::Batch(SubscribeBatch {
+                        SubscribeBatch {
                             lower,
                             upper,
                             updates,
-                        }),
+                        },
                     ))
                 } else {
                     None
                 }
             }
-            SubscribeResponse::DroppedAt(_) => {
-                // This subscribe cannot produce more data. Stop tracking it.
+            SubscribeResponse::DroppedAt(frontier) => {
+                // We should never get here: Replicas only drop subscribe collections in response
+                // to the controller allowing them to do so, and when the controller drops a
+                // subscribe it also removes it from the list of tracked subscribes (see
+                // [`Instance::drop_collections`]).
+                tracing::error!(
+                    %subscribe_id,
+                    %replica_id,
+                    frontier = ?frontier.elements(),
+                    "received `DroppedAt` response for a tracked subscribe",
+                );
                 self.compute.subscribes.remove(&subscribe_id);
-
-                Some(ComputeControllerResponse::SubscribeResponse(
-                    subscribe_id,
-                    SubscribeResponse::DroppedAt(subscribe.frontier),
-                ))
+                None
             }
         }
+    }
+
+    fn handle_status_response(&mut self, response: StatusResponse, replica_id: ReplicaId) {
+        match response {
+            StatusResponse::OperatorHydration(status) => self
+                .compute
+                .update_operator_hydration_status(replica_id, status),
+        }
+    }
+}
+
+impl<'a, T> ActiveInstance<'a, T>
+where
+    T: TimestampManipulation,
+    ComputeGrpcClient: ComputeClient<T>,
+{
+    /// Downgrade the warmup capabilities of collections as much as possible.
+    ///
+    /// The only requirement we have for a collection's warmup capability is that it is for a time
+    /// that is available in all of the collection's inputs. For each input the latest time that is
+    /// the case for is `write_frontier - 1`. So the farthest we can downgrade a collection's
+    /// warmup capability is the minimum of `write_frontier - 1` of all its inputs.
+    ///
+    /// This method expects to be periodically called as part of instance maintenance work.
+    /// We would like to instead update the warmup capabilities synchronously in response to
+    /// frontier updates of dependency collections, but that is not generally possible because we
+    /// don't learn about frontier updates of storage collections synchronously. We could do
+    /// synchronous updates for compute dependencies, but we refrain from doing for simplicity.
+    fn downgrade_warmup_capabilities(&mut self) {
+        let mut new_capabilities = BTreeMap::new();
+        for (id, collection) in &self.compute.collections {
+            // For write-only collections that have advanced to the empty frontier, we can drop the
+            // warmup capability entirely. There is no reason why we would need to hydrate those
+            // collections again, so being able to warm them up is not useful.
+            if collection.read_policy.is_none()
+                && collection.write_frontier.is_empty()
+                && !collection.warmup_capability.is_empty()
+            {
+                new_capabilities.insert(*id, Antichain::new());
+                continue;
+            }
+
+            let compute_frontiers = collection.compute_dependencies.iter().flat_map(|dep_id| {
+                let collection = self.compute.collections.get(dep_id);
+                collection.map(|c| &c.write_frontier)
+            });
+            let storage_frontiers = collection.storage_dependencies.iter().flat_map(|dep_id| {
+                let collection = &self.storage_controller.collection(*dep_id).ok();
+                collection.map(|c| &c.write_frontier)
+            });
+
+            let mut new_capability = Antichain::new();
+            for frontier in compute_frontiers.chain(storage_frontiers) {
+                for time in frontier.iter() {
+                    new_capability.insert(time.step_back().unwrap_or(time.clone()));
+                }
+            }
+
+            if PartialOrder::less_than(&collection.warmup_capability, &new_capability) {
+                new_capabilities.insert(*id, new_capability);
+            }
+        }
+
+        let mut read_capability_changes = BTreeMap::new();
+        for (id, new_capability) in new_capabilities {
+            let collection = self.compute.expect_collection_mut(id);
+            let old_capability = &collection.warmup_capability;
+
+            let mut update = ChangeBatch::new();
+            update.extend(old_capability.iter().map(|t| (t.clone(), -1)));
+            update.extend(new_capability.iter().map(|t| (t.clone(), 1)));
+            read_capability_changes.insert(id, update);
+            collection.warmup_capability = new_capability;
+        }
+
+        if !read_capability_changes.is_empty() {
+            self.update_read_capabilities(read_capability_changes);
+        }
+    }
+
+    /// Process pending maintenance work.
+    ///
+    /// This method is invoked periodically by the global controller.
+    /// It is a good place to perform maintenance work that arises from various controller state
+    /// changes and that cannot conveniently be handled synchronously with those state changes.
+    pub fn maintain(&mut self) {
+        self.rehydrate_failed_replicas();
+        self.downgrade_warmup_capabilities();
+        self.compute.cleanup_collections();
+        self.compute.refresh_state_metrics();
     }
 }
 
 #[derive(Debug)]
 struct PendingPeek<T> {
-    /// ID of the collected targeted by this peek.
-    target: GlobalId,
+    /// Information about the collection targeted by the peek.
+    target: PeekTarget,
     /// The peek time.
     time: T,
-    /// Replicas that have yet to respond to this peek.
-    unfinished: BTreeSet<ReplicaId>,
     /// For replica-targeted peeks, this specifies the replica whose response we should pass on.
     ///
     /// If this value is `None`, we pass on the first response.
     target_replica: Option<ReplicaId>,
     /// The OpenTelemetry context for this peek.
+    otel_ctx: OpenTelemetryContext,
+    /// The time at which the peek was requested.
     ///
-    /// This value is `Some` as long as we have not yet passed a response up the chain, and `None`
-    /// afterwards.
-    otel_ctx: Option<OpenTelemetryContext>,
-}
-
-impl<T> PendingPeek<T> {
-    /// Return whether this peek is finished and can be cleaned up.
-    fn is_finished(&self) -> bool {
-        // If we have not yet emitted a response for the peek, the peek is not finished, even if
-        // the set of replicas we are waiting for is currently empty. It might be that the cluster
-        // has no replicas or all replicas have been temporarily removed for re-hydration. In this
-        // case, we wait for new replicas to be added to eventually serve the peek.
-        self.otel_ctx.is_none() && self.unfinished.is_empty()
-    }
+    /// Used to track peek durations.
+    requested_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -1296,6 +1905,256 @@ impl<T: Timestamp> ActiveSubscribe<T> {
         Self {
             frontier: Antichain::from_elem(Timestamp::minimum()),
             target_replica: None,
+        }
+    }
+}
+
+/// State maintained about individual replicas.
+#[derive(Debug)]
+pub struct ReplicaState<T> {
+    /// The ID of the replica.
+    id: ReplicaId,
+    /// Client for the running replica task.
+    client: ReplicaClient<T>,
+    /// The replica configuration.
+    config: ReplicaConfig,
+    /// Replica metrics.
+    metrics: ReplicaMetrics,
+    /// A channel through which introspection updates are delivered.
+    introspection_tx: crossbeam_channel::Sender<IntrospectionUpdates>,
+    /// Per-replica collection state.
+    collections: BTreeMap<GlobalId, ReplicaCollectionState<T>>,
+    /// Whether the replica has failed and requires rehydration.
+    failed: bool,
+    /// The time of the last reported heartbeat.
+    last_heartbeat: Option<DateTime<Utc>>,
+}
+
+impl<T: Debug> ReplicaState<T> {
+    fn new(
+        id: ReplicaId,
+        client: ReplicaClient<T>,
+        config: ReplicaConfig,
+        metrics: ReplicaMetrics,
+        introspection_tx: crossbeam_channel::Sender<IntrospectionUpdates>,
+    ) -> Self {
+        Self {
+            id,
+            client,
+            config,
+            metrics,
+            introspection_tx,
+            collections: Default::default(),
+            failed: false,
+            last_heartbeat: None,
+        }
+    }
+
+    /// Add a collection to the replica state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a collection with the same ID exists already.
+    fn add_collection(&mut self, id: GlobalId, as_of: Antichain<T>) {
+        let metrics = self.metrics.for_collection(id);
+        let hydration_state = HydrationState::new(self.id, id, self.introspection_tx.clone());
+        let mut state = ReplicaCollectionState {
+            metrics,
+            created_at: Instant::now(),
+            as_of,
+            hydration_state,
+        };
+
+        // We need to consider the edge case where the as-of is the empty frontier. Such an as-of
+        // is not useful for indexes, because they wouldn't be readable. For write-only
+        // collections, an empty as-of means that the collection has been fully written and no new
+        // dataflow needs to be created for it. Consequently, no hydration will happen either.
+        //
+        // Based on this, we could set the hydration flag in two ways:
+        //  * `false`, as in "the dataflow was never created"
+        //  * `true`, as in "the dataflow completed immediately"
+        //
+        // Since hydration is often used as a measure of dataflow progress and we don't want to
+        // give the impression that certain dataflows are somehow stuck when they are not, we go
+        // go with the second interpretation here.
+        if state.as_of.is_empty() {
+            state.set_hydrated();
+        }
+
+        if let Some(previous) = self.collections.insert(id, state) {
+            panic!("attempt to add a collection with existing ID {id} (previous={previous:?}");
+        }
+    }
+
+    /// Remove state for a collection.
+    fn remove_collection(&mut self, id: GlobalId) -> Option<ReplicaCollectionState<T>> {
+        self.collections.remove(&id)
+    }
+}
+
+#[derive(Debug)]
+struct ReplicaCollectionState<T> {
+    /// Metrics tracked for this collection.
+    ///
+    /// If this is `None`, no metrics are collected.
+    metrics: Option<ReplicaCollectionMetrics>,
+    /// Time at which this collection was installed.
+    created_at: Instant,
+    /// As-of frontier with which this collection was installed on the replica.
+    as_of: Antichain<T>,
+    /// Tracks hydration state for this collection.
+    hydration_state: HydrationState,
+}
+
+impl<T> ReplicaCollectionState<T> {
+    /// Returns whether this collection is hydrated.
+    fn hydrated(&self) -> bool {
+        self.hydration_state.hydrated
+    }
+
+    /// Marks the collection as hydrated and updates metrics and introspection accordingly.
+    fn set_hydrated(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            let duration = self.created_at.elapsed().as_secs_f64();
+            metrics.initial_output_duration_seconds.set(duration);
+        }
+
+        self.hydration_state.collection_hydrated();
+    }
+}
+
+/// Maintains both global and operator-level hydration introspection for a given replica and
+/// collection, and ensures that reported introspection data is retracted when the flag is dropped.
+#[derive(Debug)]
+struct HydrationState {
+    /// The ID of the replica.
+    replica_id: ReplicaId,
+    /// The ID of the compute collection.
+    collection_id: GlobalId,
+    /// Whether the collection is hydrated.
+    hydrated: bool,
+    /// Operator-level hydration state.
+    /// (lir_id, worker_id) -> hydrated
+    operators: BTreeMap<(NodeId, usize), bool>,
+    /// A channel through which introspection updates are delivered.
+    introspection_tx: crossbeam_channel::Sender<IntrospectionUpdates>,
+}
+
+impl HydrationState {
+    /// Create a new `HydrationState` and initialize introspection.
+    fn new(
+        replica_id: ReplicaId,
+        collection_id: GlobalId,
+        introspection_tx: crossbeam_channel::Sender<IntrospectionUpdates>,
+    ) -> Self {
+        let self_ = Self {
+            replica_id,
+            collection_id,
+            hydrated: false,
+            operators: Default::default(),
+            introspection_tx,
+        };
+
+        let insertion = self_.row_for_collection();
+        self_.send(
+            IntrospectionType::ComputeHydrationStatus,
+            vec![(insertion, 1)],
+        );
+
+        self_
+    }
+
+    /// Update the collection as hydrated.
+    fn collection_hydrated(&mut self) {
+        if self.hydrated {
+            return; // nothing to do
+        }
+
+        let retraction = self.row_for_collection();
+        self.hydrated = true;
+        let insertion = self.row_for_collection();
+
+        self.send(
+            IntrospectionType::ComputeHydrationStatus,
+            vec![(retraction, -1), (insertion, 1)],
+        );
+    }
+
+    /// Update the given (lir_id, worker_id) pair as hydrated.
+    fn operator_hydrated(&mut self, lir_id: NodeId, worker_id: usize, hydrated: bool) {
+        let retraction = self.row_for_operator(lir_id, worker_id);
+        self.operators.insert((lir_id, worker_id), hydrated);
+        let insertion = self.row_for_operator(lir_id, worker_id);
+
+        if retraction == insertion {
+            return; // no change
+        }
+
+        let updates = retraction
+            .map(|r| (r, -1))
+            .into_iter()
+            .chain(insertion.map(|r| (r, 1)))
+            .collect();
+        self.send(IntrospectionType::ComputeOperatorHydrationStatus, updates);
+    }
+
+    /// Return a `Row` reflecting the current collection hydration status.
+    fn row_for_collection(&self) -> Row {
+        Row::pack_slice(&[
+            Datum::String(&self.collection_id.to_string()),
+            Datum::String(&self.replica_id.to_string()),
+            Datum::from(self.hydrated),
+        ])
+    }
+
+    /// Return a `Row` reflecting the current hydration status of the identified operator.
+    ///
+    /// Returns `None` if the identified operator is not tracked.
+    fn row_for_operator(&self, lir_id: NodeId, worker_id: usize) -> Option<Row> {
+        self.operators.get(&(lir_id, worker_id)).map(|hydrated| {
+            Row::pack_slice(&[
+                Datum::String(&self.collection_id.to_string()),
+                Datum::UInt64(lir_id),
+                Datum::String(&self.replica_id.to_string()),
+                Datum::UInt64(u64::cast_from(worker_id)),
+                Datum::from(*hydrated),
+            ])
+        })
+    }
+
+    fn send(&self, introspection_type: IntrospectionType, updates: Vec<(Row, Diff)>) {
+        let result = self.introspection_tx.send((introspection_type, updates));
+
+        if result.is_err() {
+            // The global controller holds on to the `introspection_rx`. So when we get here that
+            // probably means that the controller was dropped and the process is shutting down, in
+            // which case we don't care about introspection updates anymore.
+            tracing::info!(
+                ?introspection_type,
+                "discarding introspection update because the receiver disconnected"
+            );
+        }
+    }
+}
+
+impl Drop for HydrationState {
+    fn drop(&mut self) {
+        // Retract collection hydration status.
+        let retraction = self.row_for_collection();
+        self.send(
+            IntrospectionType::ComputeHydrationStatus,
+            vec![(retraction, -1)],
+        );
+
+        // Retract operator-level hydration status.
+        let operators: Vec<_> = self.operators.keys().collect();
+        let updates: Vec<_> = operators
+            .into_iter()
+            .flat_map(|(lir_id, worker_id)| self.row_for_operator(*lir_id, *worker_id))
+            .map(|r| (r, -1))
+            .collect();
+        if !updates.is_empty() {
+            self.send(IntrospectionType::ComputeOperatorHydrationStatus, updates)
         }
     }
 }

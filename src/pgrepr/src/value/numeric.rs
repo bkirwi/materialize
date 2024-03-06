@@ -52,7 +52,7 @@ impl ToSql for Numeric {
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn Error + 'static + Send + Sync>> {
         let mut d = self.0 .0.clone();
-        let scale = u16::from(numeric::get_scale(&d));
+        let scale = u16::try_from(numeric::get_scale(&d))?;
         let is_zero = d.is_zero();
         let is_nan = d.is_nan();
         let is_neg = d.is_negative() && !is_zero;
@@ -241,7 +241,7 @@ impl<'a> FromSql<'a> for Numeric {
 }
 
 #[mz_ore::test]
-#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `epoll_wait` on OS `linux`
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `decContextDefault` on OS `linux`
 fn test_to_from_sql_roundtrip() {
     fn inner(s: &str) {
         let mut cx = numeric::cx_datum();
@@ -285,7 +285,7 @@ fn test_to_from_sql_roundtrip() {
 
     // Test infinity, which is a valid value in aggregations over numeric
     let mut cx = numeric::cx_datum();
-    let v = vec![
+    let v = [
         cx.parse("-999999999999999999999999999999999999999")
             .unwrap(),
         cx.parse("-999999999999999999999999999999999999999")

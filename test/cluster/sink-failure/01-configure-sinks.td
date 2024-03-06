@@ -8,7 +8,7 @@
 # by the Apache License, Version 2.0.
 
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
-ALTER SYSTEM SET enable_unmanaged_cluster_replicas = true
+ALTER SYSTEM SET enable_unorchestrated_cluster_replicas = true
 
 > DROP SOURCE IF EXISTS mz_source CASCADE;
 > DROP SECRET IF EXISTS pgpass CASCADE;
@@ -24,7 +24,7 @@ ALTER SYSTEM SET enable_unmanaged_cluster_replicas = true
   )
 
 > CREATE CONNECTION kafka_conn
-  TO KAFKA (BROKER '${testdrive.kafka-addr}');
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > CREATE CONNECTION IF NOT EXISTS csr_conn TO CONFLUENT SCHEMA REGISTRY (
     URL '${testdrive.schema-registry-url}'

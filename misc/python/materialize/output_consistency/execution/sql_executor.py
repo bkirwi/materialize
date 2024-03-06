@@ -6,8 +6,11 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
-from typing import Any, Sequence, Union
+from collections import deque
+from collections.abc import Sequence
+from typing import Any
 
+import dateutil  # type: ignore
 from pg8000 import Connection
 from pg8000.dbapi import ProgrammingError
 from pg8000.exceptions import DatabaseError, InterfaceError
@@ -28,6 +31,12 @@ class SqlExecutionError(Exception):
 class SqlExecutor:
     """Base class of `PgWireDatabaseSqlExecutor` and `DryRunSqlExecutor`"""
 
+    def __init__(
+        self,
+        name: str,
+    ):
+        self.name = name
+
     def __str__(self) -> str:
         return self.__class__.__name__
 
@@ -46,6 +55,9 @@ class SqlExecutor:
     def query(self, sql: str) -> Sequence[Sequence[Any]]:
         raise NotImplementedError
 
+    def query_version(self) -> str:
+        raise NotImplementedError
+
 
 class PgWireDatabaseSqlExecutor(SqlExecutor):
     def __init__(
@@ -53,16 +65,16 @@ class PgWireDatabaseSqlExecutor(SqlExecutor):
         connection: Connection,
         use_autocommit: bool,
         output_printer: OutputPrinter,
+        name: str,
     ):
+        super().__init__(name)
         connection.autocommit = use_autocommit
         self.cursor = connection.cursor()
         self.output_printer = output_printer
+        self.last_statements = deque[str](maxlen=5)
 
     def ddl(self, sql: str) -> None:
-        try:
-            self.cursor.execute(sql)
-        except (ProgrammingError, DatabaseError) as err:
-            raise SqlExecutionError(self._extract_message_from_error(err))
+        self._execute_with_cursor(sql)
 
     def begin_tx(self, isolation_level: str) -> None:
         self._execute_with_cursor(f"BEGIN ISOLATION LEVEL {isolation_level};")
@@ -80,27 +92,43 @@ class PgWireDatabaseSqlExecutor(SqlExecutor):
         except (ProgrammingError, DatabaseError) as err:
             raise SqlExecutionError(self._extract_message_from_error(err))
 
+    def query_version(self) -> str:
+        return self.query("SELECT version();")[0][0]
+
     def _execute_with_cursor(self, sql: str) -> None:
         try:
+            self.last_statements.append(sql)
             self.cursor.execute(sql)
         except (ProgrammingError, DatabaseError) as err:
             raise SqlExecutionError(self._extract_message_from_error(err))
+        except dateutil.parser._parser.ParserError as err:  # type: ignore
+            raise SqlExecutionError(err.args[0])
         except ValueError as err:
             self.output_printer.print_error(f"Query with value error is: {sql}")
             raise err
         except InterfaceError:
             print("A network error occurred! Aborting!")
+            # The current or one of previous queries might have broken the database.
+            last_statements_desc = self.last_statements.copy()
+            last_statements_desc.reverse()
+            statements_str = "\n".join(
+                f"  {statement}" for statement in last_statements_desc
+            )
+            print(
+                f"Last {len(last_statements_desc)} queries in descending order:\n{statements_str}"
+            )
             exit(1)
         except Exception:
             self.output_printer.print_error(f"Query with unexpected error is: {sql}")
             raise
 
     def _extract_message_from_error(
-        self, error: Union[ProgrammingError, DatabaseError]
+        self, error: ProgrammingError | DatabaseError
     ) -> str:
         error_args = error.args[0]
-        message = error_args.get("M")
-        details = error_args.get("H")
+
+        message = error_args.get("M") if "M" in error_args else str(error_args)
+        details = error_args.get("H") if "H" in error_args else None
 
         if details is None:
             return f"{message}"
@@ -108,8 +136,23 @@ class PgWireDatabaseSqlExecutor(SqlExecutor):
             return f"{message} ({details})"
 
 
+class MzDatabaseSqlExecutor(PgWireDatabaseSqlExecutor):
+    def __init__(
+        self,
+        connection: Connection,
+        use_autocommit: bool,
+        output_printer: OutputPrinter,
+        name: str,
+    ):
+        super().__init__(connection, use_autocommit, output_printer, name)
+
+    def query_version(self) -> str:
+        return self.query("SELECT mz_version();")[0][0]
+
+
 class DryRunSqlExecutor(SqlExecutor):
-    def __init__(self, output_printer: OutputPrinter):
+    def __init__(self, output_printer: OutputPrinter, name: str):
+        super().__init__(name)
         self.output_printer = output_printer
 
     def consume_sql(self, sql: str) -> None:
@@ -131,15 +174,25 @@ class DryRunSqlExecutor(SqlExecutor):
         self.consume_sql(sql)
         return []
 
+    def query_version(self) -> str:
+        return "(dry-run)"
+
 
 def create_sql_executor(
     config: ConsistencyTestConfiguration,
     connection: Connection,
     output_printer: OutputPrinter,
+    name: str,
+    is_mz: bool = True,
 ) -> SqlExecutor:
     if config.dry_run:
-        return DryRunSqlExecutor(output_printer)
-    else:
-        return PgWireDatabaseSqlExecutor(
-            connection, config.use_autocommit, output_printer
+        return DryRunSqlExecutor(output_printer, name)
+
+    if is_mz:
+        return MzDatabaseSqlExecutor(
+            connection, config.use_autocommit, output_printer, name
         )
+
+    return PgWireDatabaseSqlExecutor(
+        connection, config.use_autocommit, output_printer, name
+    )

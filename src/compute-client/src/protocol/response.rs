@@ -11,12 +11,15 @@
 
 use std::num::NonZeroUsize;
 
+use mz_compute_types::plan::NodeId;
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_proto::{any_uuid, IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
 use mz_repr::{Diff, GlobalId, Row};
+use mz_storage_client::client::ProtoTrace;
 use mz_timely_util::progress::any_antichain;
 use proptest::prelude::{any, Arbitrary, Just};
 use proptest::strategy::{BoxedStrategy, Strategy, Union};
+use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 use timely::progress::frontier::Antichain;
 use uuid::Uuid;
@@ -34,17 +37,16 @@ include!(concat!(
 /// [`ComputeCommand`]: super::command::ComputeCommand
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ComputeResponse<T = mz_repr::Timestamp> {
-    /// `FrontierUppers` announces the advancement of the upper frontiers of the specified compute
-    /// collections. The response contains a mapping of collection IDs to their new upper
-    /// frontiers.
+    /// `FrontierUpper` announces the advancement of the upper frontier of the specified compute
+    /// collection. The response contain a collection ID and that collection's new upper frontier.
     ///
-    /// Upon receiving a `FrontierUppers` response, the controller may assume that the replica has
-    /// finished computing the given collections up to at least the given frontiers. It may also
-    /// assume that the replica has finished reading from the collections’ inputs up to those
-    /// frontiers.
+    /// Upon receiving a `FrontierUpper` response, the controller may assume that the replica has
+    /// finished computing the given collection up to at least the given frontier. It may also
+    /// assume that the replica has finished reading from the collection’s inputs up to that
+    /// frontier.
     ///
-    /// Replicas must send `FrontierUppers` responses for compute collections that are indexes or
-    /// storage sinks. Replicas must not send `FrontierUppers` responses for subscribes.
+    /// Replicas must send `FrontierUpper` responses for compute collections that are indexes or
+    /// storage sinks. Replicas must not send `FrontierUpper` responses for subscribes.
     ///
     /// Replicas must never report regressing frontiers. Specifically:
     ///
@@ -53,7 +55,7 @@ pub enum ComputeResponse<T = mz_repr::Timestamp> {
     ///   * Subsequent reported frontiers for a collection must not be less than any frontier
     ///     reported previously for the same collection.
     ///
-    /// Replicas must send a `FrontierUppers` response reporting advancement to the empty frontier
+    /// Replicas must send a `FrontierUpper` response reporting advancement to the empty frontier
     /// for a collection in two cases:
     ///
     ///   * The collection has advanced to the empty frontier (e.g. because its inputs have advanced
@@ -64,32 +66,37 @@ pub enum ComputeResponse<T = mz_repr::Timestamp> {
     /// Once a collection was reported to have been advanced to the empty upper frontier:
     ///
     ///   * It must no longer read from its inputs.
-    ///   * The replica must not send further `FrontierUppers` responses for that collection.
+    ///   * The replica must not send further `FrontierUpper` responses for that collection.
     ///
-    /// The replica must not send `FrontierUppers` responses for collections that have not
-    /// been created previously by a [`CreateDataflows` command] or by a [`CreateInstance`
+    /// The replica must not send `FrontierUpper` responses for collections that have not
+    /// been created previously by a [`CreateDataflow` command] or by a [`CreateInstance`
     /// command].
     ///
     /// [`AllowCompaction` command]: super::command::ComputeCommand::AllowCompaction
-    /// [`CreateDataflows` command]: super::command::ComputeCommand::CreateDataflows
+    /// [`CreateDataflow` command]: super::command::ComputeCommand::CreateDataflow
     /// [`CreateInstance` command]: super::command::ComputeCommand::CreateInstance
     /// [#16275]: https://github.com/MaterializeInc/materialize/issues/16275
-    FrontierUppers(Vec<(GlobalId, Antichain<T>)>),
+    FrontierUpper {
+        /// TODO(#25239): Add documentation.
+        id: GlobalId,
+        /// TODO(#25239): Add documentation.
+        upper: Antichain<T>,
+    },
 
     /// `PeekResponse` reports the result of a previous [`Peek` command]. The peek is identified by
     /// a `Uuid` that matches the command's [`Peek::uuid`].
     ///
     /// The replica must send exactly one `PeekResponse` for every [`Peek` command] it received.
     ///
-    /// If the replica did not receive a [`CancelPeeks` command] for a peek, it must not send a
-    /// [`Canceled`] response for that peek. If the replica did receive a [`CancelPeeks` command]
+    /// If the replica did not receive a [`CancelPeek` command] for a peek, it must not send a
+    /// [`Canceled`] response for that peek. If the replica did receive a [`CancelPeek` command]
     /// for a peek, it may send any of the three [`PeekResponse`] variants.
     ///
     /// The replica must not send `PeekResponse`s for peek IDs that were not previously specified
     /// in a [`Peek` command].
     ///
     /// [`Peek` command]: super::command::ComputeCommand::Peek
-    /// [`CancelPeeks` command]: super::command::ComputeCommand::CancelPeeks
+    /// [`CancelPeek` command]: super::command::ComputeCommand::CancelPeek
     /// [`Peek::uuid`]: super::command::Peek::uuid
     /// [`Canceled`]: PeekResponse::Canceled
     PeekResponse(Uuid, PeekResponse, OpenTelemetryContext),
@@ -97,7 +104,7 @@ pub enum ComputeResponse<T = mz_repr::Timestamp> {
     /// `SubscribeResponse` reports the results emitted by an active subscribe over some time
     /// interval.
     ///
-    /// For each subscribe that was installed by a previous [`CreateDataflows` command], the
+    /// For each subscribe that was installed by a previous [`CreateDataflow` command], the
     /// replica must emit [`Batch`] responses that cover the entire time interval from the
     /// minimum time until the subscribe advances to the empty frontier or is
     /// dropped. The time intervals of consecutive [`Batch`]es must be increasing, contiguous,
@@ -120,13 +127,38 @@ pub enum ComputeResponse<T = mz_repr::Timestamp> {
     ///   * The replica must not send further `SubscribeResponse`s for that subscribe.
     ///
     /// The replica must not send `SubscribeResponse`s for subscribes that have not been
-    /// created previously by a [`CreateDataflows` command].
+    /// created previously by a [`CreateDataflow` command].
     ///
     /// [`Batch`]: SubscribeResponse::Batch
     /// [`DroppedAt`]: SubscribeResponse::DroppedAt
-    /// [`CreateDataflows` command]: super::command::ComputeCommand::CreateDataflows
+    /// [`CreateDataflow` command]: super::command::ComputeCommand::CreateDataflow
     /// [`AllowCompaction` command]: super::command::ComputeCommand::AllowCompaction
     SubscribeResponse(GlobalId, SubscribeResponse<T>),
+
+    /// `CopyToResponse` reports the completion of an S3-oneshot sink.
+    ///
+    /// The replica must send exactly one `CopyToResponse` for every S3-oneshot sink previously
+    /// created by a [`CreateDataflow` command].
+    ///
+    /// The replica must not send `CopyToResponse`s for S3-oneshot sinks that were not previously
+    /// created by a [`CreateDataflow` command].
+    ///
+    /// [`CreateDataflow` command]: super::command::ComputeCommand::CreateDataflow
+    CopyToResponse(GlobalId, CopyToResponse),
+
+    /// `Status` reports status updates from replicas to the controller.
+    ///
+    /// `Status` responses are a way for replicas to stream back introspection data that the
+    /// controller can then announce to its clients. They have no effect on the lifecycles of
+    /// compute collections. Correct operation of the Compute layer must not rely on `Status`
+    /// responses being sent or received.
+    ///
+    /// `Status` responses that are specific to collections must only be sent for collections that
+    /// (a) have previously been created by a [`CreateDataflow` command] and (b) have not yet
+    /// been reported to have advanced to the empty frontier.
+    ///
+    /// [`CreateDataflow` command]: super::command::ComputeCommand::CreateDataflow
+    Status(StatusResponse),
 }
 
 impl RustType<ProtoComputeResponse> for ComputeResponse<mz_repr::Timestamp> {
@@ -135,7 +167,10 @@ impl RustType<ProtoComputeResponse> for ComputeResponse<mz_repr::Timestamp> {
         use proto_compute_response::*;
         ProtoComputeResponse {
             kind: Some(match self {
-                ComputeResponse::FrontierUppers(traces) => FrontierUppers(traces.into_proto()),
+                ComputeResponse::FrontierUpper { id, upper } => FrontierUpper(ProtoTrace {
+                    id: Some(id.into_proto()),
+                    upper: Some(upper.into_proto()),
+                }),
                 ComputeResponse::PeekResponse(id, resp, otel_ctx) => {
                     PeekResponse(ProtoPeekResponseKind {
                         id: Some(id.into_proto()),
@@ -149,6 +184,13 @@ impl RustType<ProtoComputeResponse> for ComputeResponse<mz_repr::Timestamp> {
                         resp: Some(resp.into_proto()),
                     })
                 }
+                ComputeResponse::CopyToResponse(id, resp) => {
+                    CopyToResponse(ProtoCopyToResponseKind {
+                        id: Some(id.into_proto()),
+                        resp: Some(resp.into_proto()),
+                    })
+                }
+                ComputeResponse::Status(resp) => Status(resp.into_proto()),
             }),
         }
     }
@@ -156,9 +198,10 @@ impl RustType<ProtoComputeResponse> for ComputeResponse<mz_repr::Timestamp> {
     fn from_proto(proto: ProtoComputeResponse) -> Result<Self, TryFromProtoError> {
         use proto_compute_response::Kind::*;
         match proto.kind {
-            Some(FrontierUppers(traces)) => {
-                Ok(ComputeResponse::FrontierUppers(traces.into_rust()?))
-            }
+            Some(FrontierUpper(trace)) => Ok(ComputeResponse::FrontierUpper {
+                id: trace.id.into_rust_if_some("ProtoTrace::id")?,
+                upper: trace.upper.into_rust_if_some("ProtoTrace::upper")?,
+            }),
             Some(PeekResponse(resp)) => Ok(ComputeResponse::PeekResponse(
                 resp.id.into_rust_if_some("ProtoPeekResponseKind::id")?,
                 resp.resp.into_rust_if_some("ProtoPeekResponseKind::resp")?,
@@ -170,6 +213,12 @@ impl RustType<ProtoComputeResponse> for ComputeResponse<mz_repr::Timestamp> {
                 resp.resp
                     .into_rust_if_some("ProtoSubscribeResponseKind::resp")?,
             )),
+            Some(CopyToResponse(resp)) => Ok(ComputeResponse::CopyToResponse(
+                resp.id.into_rust_if_some("ProtoCopyToResponseKind::id")?,
+                resp.resp
+                    .into_rust_if_some("ProtoCopyToResponseKind::resp")?,
+            )),
+            Some(Status(resp)) => Ok(ComputeResponse::Status(resp.into_rust()?)),
             None => Err(TryFromProtoError::missing_field(
                 "ProtoComputeResponse::kind",
             )),
@@ -183,8 +232,8 @@ impl Arbitrary for ComputeResponse<mz_repr::Timestamp> {
 
     fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
         Union::new(vec![
-            proptest::collection::vec((any::<GlobalId>(), any_antichain()), 1..4)
-                .prop_map(ComputeResponse::FrontierUppers)
+            (any::<GlobalId>(), any_antichain())
+                .prop_map(|(id, upper)| ComputeResponse::FrontierUpper { id, upper })
                 .boxed(),
             (any_uuid(), any::<PeekResponse>())
                 .prop_map(|(id, resp)| {
@@ -193,6 +242,9 @@ impl Arbitrary for ComputeResponse<mz_repr::Timestamp> {
                 .boxed(),
             (any::<GlobalId>(), any::<SubscribeResponse>())
                 .prop_map(|(id, resp)| ComputeResponse::SubscribeResponse(id, resp))
+                .boxed(),
+            any::<StatusResponse>()
+                .prop_map(ComputeResponse::Status)
                 .boxed(),
         ])
     }
@@ -213,6 +265,7 @@ pub enum PeekResponse {
 }
 
 impl PeekResponse {
+    /// TODO(#25239): Add documentation.
     pub fn unwrap_rows(self) -> Vec<(Row, NonZeroUsize)> {
         match self {
             PeekResponse::Rows(rows) => rows,
@@ -286,6 +339,42 @@ impl Arbitrary for PeekResponse {
     }
 }
 
+/// Various responses that can be communicated after a COPY TO command.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CopyToResponse {
+    /// Returned number of rows for a successful COPY TO.
+    RowCount(u64),
+    /// Error of an unsuccessful COPY TO.
+    Error(String),
+    /// The COPY TO sink dataflow was dropped.
+    Dropped,
+}
+
+impl RustType<ProtoCopyToResponse> for CopyToResponse {
+    fn into_proto(&self) -> ProtoCopyToResponse {
+        use proto_copy_to_response::Kind::*;
+        ProtoCopyToResponse {
+            kind: Some(match self {
+                CopyToResponse::RowCount(rows) => Rows(*rows),
+                CopyToResponse::Error(error) => Error(error.clone()),
+                CopyToResponse::Dropped => Dropped(()),
+            }),
+        }
+    }
+
+    fn from_proto(proto: ProtoCopyToResponse) -> Result<Self, TryFromProtoError> {
+        use proto_copy_to_response::Kind::*;
+        match proto.kind {
+            Some(Rows(rows)) => Ok(CopyToResponse::RowCount(rows)),
+            Some(Error(error)) => Ok(CopyToResponse::Error(error)),
+            Some(Dropped(())) => Ok(CopyToResponse::Dropped),
+            None => Err(TryFromProtoError::missing_field(
+                "ProtoCopyToResponse::kind",
+            )),
+        }
+    }
+}
+
 /// Various responses that can be communicated about the progress of a SUBSCRIBE command.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SubscribeResponse<T = mz_repr::Timestamp> {
@@ -347,7 +436,7 @@ impl Arbitrary for SubscribeResponse<mz_repr::Timestamp> {
 
 /// A batch of updates for the interval `[lower, upper)`.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SubscribeBatch<T> {
+pub struct SubscribeBatch<T = mz_repr::Timestamp> {
     /// The lower frontier of the batch of updates.
     pub lower: Antichain<T>,
     /// The upper frontier of the batch of updates.
@@ -458,6 +547,72 @@ impl Arbitrary for SubscribeBatch<mz_repr::Timestamp> {
                 updates: Ok(updates),
             })
             .boxed()
+    }
+}
+
+/// Status updates replicas can report to the controller.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Arbitrary)]
+pub enum StatusResponse {
+    /// Reports the hydration status of dataflow operators.
+    OperatorHydration(OperatorHydrationStatus),
+}
+
+impl RustType<ProtoStatusResponse> for StatusResponse {
+    fn into_proto(&self) -> ProtoStatusResponse {
+        use proto_status_response::Kind;
+
+        let kind = match self {
+            Self::OperatorHydration(status) => Kind::OperatorHydration(status.into_proto()),
+        };
+        ProtoStatusResponse { kind: Some(kind) }
+    }
+
+    fn from_proto(proto: ProtoStatusResponse) -> Result<Self, TryFromProtoError> {
+        use proto_status_response::Kind;
+
+        match proto.kind {
+            Some(Kind::OperatorHydration(status)) => {
+                Ok(Self::OperatorHydration(status.into_rust()?))
+            }
+            None => Err(TryFromProtoError::missing_field(
+                "ProtoStatusResponse::kind",
+            )),
+        }
+    }
+}
+
+/// An update about the hydration status of a set of dataflow operators.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Arbitrary)]
+pub struct OperatorHydrationStatus {
+    /// The ID of the compute collection exported by the dataflow.
+    pub collection_id: GlobalId,
+    /// The ID of the LIR node for which the hydration status changed.
+    pub lir_id: NodeId,
+    /// The ID of the worker for which the hydration status changed.
+    pub worker_id: usize,
+    /// Whether the node is hydrated on the worker.
+    pub hydrated: bool,
+}
+
+impl RustType<ProtoOperatorHydrationStatus> for OperatorHydrationStatus {
+    fn into_proto(&self) -> ProtoOperatorHydrationStatus {
+        ProtoOperatorHydrationStatus {
+            collection_id: Some(self.collection_id.into_proto()),
+            lir_id: self.lir_id.into_proto(),
+            worker_id: self.worker_id.into_proto(),
+            hydrated: self.hydrated.into_proto(),
+        }
+    }
+
+    fn from_proto(proto: ProtoOperatorHydrationStatus) -> Result<Self, TryFromProtoError> {
+        Ok(Self {
+            collection_id: proto
+                .collection_id
+                .into_rust_if_some("ProtoOperatorHydrationStatus::collection_id")?,
+            lir_id: proto.lir_id.into_rust()?,
+            worker_id: proto.worker_id.into_rust()?,
+            hydrated: proto.hydrated.into_rust()?,
+        })
     }
 }
 

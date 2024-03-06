@@ -6,9 +6,11 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
-from typing import List
 
+from materialize.mz_version import MzVersion
 from materialize.output_consistency.data_type.data_type_category import DataTypeCategory
+from materialize.output_consistency.enum.enum_constant import EnumConstant
+from materialize.output_consistency.expression.expression import Expression
 from materialize.output_consistency.expression.expression_characteristics import (
     ExpressionCharacteristics,
 )
@@ -46,7 +48,9 @@ from materialize.output_consistency.operation.operation import (
     OperationRelevance,
 )
 
-TEXT_OPERATION_TYPES: List[DbOperationOrFunction] = []
+TEXT_OPERATION_TYPES: list[DbOperationOrFunction] = []
+
+TAG_REGEX = "regex"
 
 TEXT_OPERATION_TYPES.append(
     DbOperation(
@@ -62,6 +66,7 @@ TEXT_OPERATION_TYPES.append(
         "$ ~ $",
         [TextOperationParam(), REGEX_PARAM],
         BooleanReturnTypeSpec(),
+        tags={TAG_REGEX},
     )
 )
 
@@ -71,6 +76,7 @@ TEXT_OPERATION_TYPES.append(
         "$ ~* $",
         [TextOperationParam(), REGEX_PARAM],
         BooleanReturnTypeSpec(),
+        tags={TAG_REGEX},
     )
 )
 
@@ -87,6 +93,42 @@ TEXT_OPERATION_TYPES.append(
 TEXT_OPERATION_TYPES.append(
     DbOperation(
         "$ !~* $",
+        [TextOperationParam(), REGEX_PARAM],
+        BooleanReturnTypeSpec(),
+    )
+)
+
+# Matches LIKE pattern case sensitively, using SQL LIKE matching
+TEXT_OPERATION_TYPES.append(
+    DbOperation(
+        "$ ~~ $",
+        [TextOperationParam(), REGEX_PARAM],
+        BooleanReturnTypeSpec(),
+    )
+)
+
+# Matches LIKE pattern case insensitively (ILIKE), using SQL LIKE matching
+TEXT_OPERATION_TYPES.append(
+    DbOperation(
+        "$ ~~* $",
+        [TextOperationParam(), REGEX_PARAM],
+        BooleanReturnTypeSpec(),
+    )
+)
+
+# Does not match LIKE pattern case sensitively, using SQL LIKE matching
+TEXT_OPERATION_TYPES.append(
+    DbOperation(
+        "$ !~~ $",
+        [TextOperationParam(), REGEX_PARAM],
+        BooleanReturnTypeSpec(),
+    )
+)
+
+#  Does not match LIKE pattern case insensitively (ILIKE), using SQL LIKE matching
+TEXT_OPERATION_TYPES.append(
+    DbOperation(
+        "$ !~~* $",
         [TextOperationParam(), REGEX_PARAM],
         BooleanReturnTypeSpec(),
     )
@@ -126,21 +168,27 @@ TEXT_OPERATION_TYPES.append(
     )
 )
 
-TEXT_OPERATION_TYPES.append(
-    DbFunction(
-        "chr",
-        [
-            MaxSignedInt4OperationParam(
-                incompatibilities={
-                    ExpressionCharacteristics.NULL,
-                    ExpressionCharacteristics.MAX_VALUE,
-                    ExpressionCharacteristics.ZERO,
-                }
-            )
-        ],
-        TextReturnTypeSpec(),
-    )
+chr_function = DbFunction(
+    "chr",
+    [
+        MaxSignedInt4OperationParam(
+            incompatibilities={
+                ExpressionCharacteristics.NULL,
+                ExpressionCharacteristics.MAX_VALUE,
+                ExpressionCharacteristics.ZERO,
+            }
+        )
+    ],
+    TextReturnTypeSpec(),
 )
+# may introduce a usage of a new line or a backslash
+chr_function.added_characteristics.add(
+    ExpressionCharacteristics.TEXT_WITH_SPECIAL_SPACE_CHARS
+)
+chr_function.added_characteristics.add(
+    ExpressionCharacteristics.TEXT_WITH_BACKSLASH_CHAR
+)
+TEXT_OPERATION_TYPES.append(chr_function)
 
 TEXT_OPERATION_TYPES.append(
     DbFunction(
@@ -166,18 +214,33 @@ TEXT_OPERATION_TYPES.append(
     )
 )
 
-TEXT_OPERATION_TYPES.append(
-    DbFunction(
-        "lpad",
-        [
-            TextOperationParam(),
-            # do not use an arbitrary integer to avoid long durations
-            REPETITIONS_PARAM,
-            TextOperationParam(optional=True),
-        ],
-        TextReturnTypeSpec(),
-    )
-)
+
+class LpadFunction(DbFunction):
+    def __init__(self):
+        super().__init__(
+            "lpad",
+            [
+                TextOperationParam(),
+                # do not use an arbitrary integer to avoid long durations
+                REPETITIONS_PARAM,
+                TextOperationParam(optional=True),
+            ],
+            TextReturnTypeSpec(),
+        )
+
+    def derive_characteristics(
+        self, args: list[Expression]
+    ) -> set[ExpressionCharacteristics]:
+        length_arg = args[1]
+        if isinstance(length_arg, EnumConstant) and length_arg.value == "0":
+            return {
+                ExpressionCharacteristics.TEXT_EMPTY
+            } | super().derive_characteristics(args)
+
+        return super().derive_characteristics(args)
+
+
+TEXT_OPERATION_TYPES.append(LpadFunction())
 
 TEXT_OPERATION_TYPES.append(
     DbFunction(
@@ -202,6 +265,7 @@ TEXT_OPERATION_TYPES.append(
         [TextOperationParam(), BooleanOperationParam(optional=True)],
         ArrayReturnTypeSpec(DataTypeCategory.TEXT),
         relevance=OperationRelevance.LOW,
+        is_enabled=False,
     )
 )
 
@@ -218,6 +282,25 @@ TEXT_OPERATION_TYPES.append(
         "regexp_match",
         [TextOperationParam(), REGEX_PARAM, REGEX_FLAG_PARAM],
         ArrayReturnTypeSpec(DataTypeCategory.TEXT),
+        tags={TAG_REGEX},
+    )
+)
+
+TEXT_OPERATION_TYPES.append(
+    DbFunction(
+        "regexp_replace",
+        [TextOperationParam(), REGEX_PARAM, TextOperationParam()],
+        ArrayReturnTypeSpec(DataTypeCategory.TEXT),
+        tags={TAG_REGEX},
+    )
+)
+
+TEXT_OPERATION_TYPES.append(
+    DbFunction(
+        "regexp_split_to_array",
+        [TextOperationParam(), REGEX_PARAM, REGEX_FLAG_PARAM],
+        ArrayReturnTypeSpec(DataTypeCategory.ARRAY),
+        tags={TAG_REGEX},
     )
 )
 
@@ -306,5 +389,15 @@ TEXT_OPERATION_TYPES.append(
         "upper",
         [TextOperationParam()],
         TextReturnTypeSpec(),
+    )
+)
+
+TEXT_OPERATION_TYPES.append(
+    DbFunction(
+        "constant_time_eq",
+        [TextOperationParam(), TextOperationParam()],
+        BooleanReturnTypeSpec(),
+        is_pg_compatible=False,
+        since_mz_version=MzVersion.parse_mz("v0.77.0"),
     )
 )

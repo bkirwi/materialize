@@ -14,7 +14,7 @@ set -euo pipefail
 . misc/shlib/shlib.bash
 
 mzcompose() {
-    bin/ci-builder run stable bin/mzcompose --find "$BUILDKITE_PLUGIN_MZCOMPOSE_COMPOSITION" "$@"
+    stdbuf --output=L --error=L bin/ci-builder run stable bin/mzcompose --find "$BUILDKITE_PLUGIN_MZCOMPOSE_COMPOSITION" "$@"
 }
 
 service=${BUILDKITE_PLUGIN_MZCOMPOSE_RUN:-default}
@@ -25,14 +25,13 @@ if read_list BUILDKITE_PLUGIN_MZCOMPOSE_ARGS; then
     done
 fi
 
-sar -q 60 > sar.log &
-
 date +"%Y-%m-%d %H:%M:%S" > step_start_timestamp
 
 # Sometimes build cancellations prevent us from properly cleaning up the last
 # Docker Compose run, which can leave old containers or volumes around that will
 # interfere with this build.
 ci_collapsed_heading ":docker: Purging containers and volumes from previous builds"
+sudo systemctl restart docker
 mzcompose --mz-quiet kill
 mzcompose --mz-quiet rm --force -v
 mzcompose --mz-quiet down --volumes
@@ -43,9 +42,19 @@ fi
 
 ci_collapsed_heading ":docker: Purging all existing docker containers and volumes, regardless of origin"
 docker ps --all --quiet | xargs --no-run-if-empty docker rm --force --volumes
+rm -f services.log
 
 ci_collapsed_heading ":docker: Rebuilding non-mzbuild containers"
 mzcompose --mz-quiet build
+
+# Clean up cores here so that just killed processes' core files are ignored
+cores="$HOME"/cores
+rm -rf "$cores" parallel-workload-queries.log parallel-workload-queries.log.zst
+mkdir -m 777 "$cores"
+# Max 128 characters, so don't use $PWD which will make it too long
+sudo sysctl -w kernel.core_pattern="|/usr/bin/env tee $cores/core.%E.%t"
+echo -n "Core pattern: "
+cat /proc/sys/kernel/core_pattern
 
 # Start dependencies under a different heading so that the main heading is less
 # noisy. But not if the service is actually a workflow, in which case it will
@@ -61,13 +70,62 @@ if [ -n "${CI_COVERAGE_ENABLED:-}" ]; then
     mkdir -p coverage/
     chmod 777 coverage/
     # Not all tests contain all of these containers:
-    mzcompose cp sqllogictest:/usr/local/bin/sqllogictest coverage/ || true
-    mzcompose cp sqllogictest:/usr/local/bin/clusterd coverage/ || true
-    mzcompose cp materialized:/usr/local/bin/environmentd coverage/ || true
-    mzcompose cp materialized:/usr/local/bin/clusterd coverage/ || true
-    mzcompose cp testdrive:/usr/local/bin/testdrive coverage/ || true
+    mzcompose --mz-quiet cp sqllogictest:/usr/local/bin/sqllogictest coverage/ || true
+    mzcompose --mz-quiet cp sqllogictest:/usr/local/bin/clusterd coverage/ || true
+    mzcompose --mz-quiet cp materialized:/usr/local/bin/environmentd coverage/ || true
+    mzcompose --mz-quiet cp materialized:/usr/local/bin/clusterd coverage/ || true
+    mzcompose --mz-quiet cp testdrive:/usr/local/bin/testdrive coverage/ || true
+    mzcompose --mz-quiet cp balancerd:/usr/local/bin/balancerd coverage/ || true
 fi
 
-ci_uncollapsed_heading ":docker: Running \`mzcompose run ${run_args[*]}\`"
+upload_artifact() {
+    cservice="$1"
+    artifact="$2"
+    # For materialized
+    if mzcompose --mz-quiet exec "$cservice" curl --silent http://127.0.0.1:6878/prof/heap > "$artifact" 2> /dev/null; then
+        if [ -s "$artifact" ]; then
+            buildkite-agent artifact upload --log-level error "$artifact"
+            i=0
+            while read -r socket; do
+                artifact_socket=$(echo "$artifact" | sed -e "s#prof/#prof/clusterd$i-#")
+                if mzcompose --mz-quiet exec "$cservice" curl --silent --unix-socket "$socket" http:/prof/heap > "$artifact_socket" 2> /dev/null; then
+                    if [ -s "$artifact_socket" ]; then
+                        buildkite-agent artifact upload --log-level error "$artifact_socket"
+                    fi
+                fi
+                ((i++))
+            done <<< "$(mzcompose --mz-quiet exec "$cservice" ps aux | grep "/usr/local/bin/clusterd" | grep -v grep | sed -e "s/.* --internal-http-listen-addr=\(\/tmp\/[^ ]*\) .*/\1/" 2> /dev/null)"
+        else
+            # For clusterd
+            if mzcompose --mz-quiet exec "$cservice" curl --silent http://127.0.0.1:6878/heap > "$artifact" 2> /dev/null; then
+                if [ -s "$artifact" ]; then
+                    # shellcheck disable=SC2034
+                    artifact_uuid=$(buildkite-agent artifact upload --log-level info "$artifact" | grep "Uploading artifact" | sed -e "s/Uploading artifact \([^ ]*\) .*/\1/")
+                fi
+            fi
+        fi
+    fi
+}
+
+if is_truthy "${CI_HEAP_PROFILES:-}"; then
+    rm -rf prof
+    mkdir prof
+    (while true; do
+        sleep 10
+        for cservice in $(mzcompose --mz-quiet ps --services 2> /dev/null); do
+            artifact=$(date "+prof/$cservice-%Y-%m-%d_%H:%M:%S.pb.gz")
+            upload_artifact "$cservice" "$artifact" &
+        done
+    done
+    ) &
+fi
+
+ci_uncollapsed_heading ":docker: Running \`bin/mzcompose --find $BUILDKITE_PLUGIN_MZCOMPOSE_COMPOSITION run ${run_args[*]}\`"
 
 mzcompose run "${run_args[@]}" |& tee run.log
+RESULT=$?
+if [ "$RESULT" != "0" ]; then
+    # Give the logs some time to log panics, otherwise they might be missing later
+    sleep 10
+fi
+exit $RESULT

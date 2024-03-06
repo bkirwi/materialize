@@ -47,7 +47,7 @@ CREATE PUBLICATION mz_source FOR ALL TABLES;
 > CREATE SCHEMA another;
 > CREATE SOURCE another.mz_source
   FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
-  FOR ALL TABLES;
+  FOR TABLES (t1, t2);
 
 > SELECT * FROM another.t1;
 1
@@ -73,4 +73,15 @@ contains: unknown
 
 # table2 gets created in mentioned bar because it does have a prefix
 > SELECT * FROM bar.table2;
+5
+
+> CREATE SCHEMA baz;
+> CREATE SOURCE baz.mz_source
+  FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
+  FOR SCHEMAS (public);
+
+> SELECT * FROM baz.t1;
+1
+
+> SELECT * FROM baz.t2;
 5

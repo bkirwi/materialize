@@ -13,7 +13,9 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+use dynfmt::{Format, SimpleCurlyFormat};
 use itertools::Itertools;
+use mz_expr::func::{CastArrayToJsonb, CastListToJsonb};
 use mz_expr::{func, VariadicFunc};
 use mz_repr::{ColumnName, ColumnType, Datum, RelationType, ScalarBaseType, ScalarType};
 use once_cell::sync::Lazy;
@@ -29,6 +31,22 @@ fn sql_impl_cast(expr: &'static str) -> CastTemplate {
     let invoke = crate::func::sql_impl(expr);
     CastTemplate::new(move |ecx, _ccx, from_type, _to_type| {
         let mut out = invoke(ecx.qcx, vec![from_type.clone()]).ok()?;
+        Some(move |e| {
+            out.splice_parameters(&[e], 0);
+            out
+        })
+    })
+}
+
+fn sql_impl_cast_per_context(casts: &[(CastContext, &'static str)]) -> CastTemplate {
+    let casts: BTreeMap<CastContext, _> = casts
+        .iter()
+        .map(|(ccx, expr)| (ccx.clone(), crate::func::sql_impl(expr)))
+        .collect();
+    CastTemplate::new(move |ecx, ccx, from_type, _to_type| {
+        let invoke = &casts[&ccx];
+        let r = invoke(ecx.qcx, vec![from_type.clone()]);
+        let mut out = r.ok()?;
         Some(move |e| {
             out.splice_parameters(&[e], 0);
             out
@@ -90,8 +108,141 @@ impl<const N: usize> From<[UnaryFunc; N]> for CastTemplate {
     }
 }
 
+/// STRING to REG*
+///
+/// A reg* type represents a specific type of object by oid.
+///
+/// Casting from a string to a reg*:
+/// - Accepts a string that looks like an OID and converts the value to the
+///   specified reg* type. This is available in all cases except explicitly
+///   casting text values to regclass (e.g. `SELECT '2'::text::regclass`)
+/// - Resolves non-OID-appearing strings to objects. If this string resolves to
+///   more than one OID (e.g. functions), it errors.
+///
+/// The below code provides a template to accomplish this for various reg*
+/// types. Arguments in order are:
+/// - 0: type catalog name this is casting to
+/// - 1: the category of this reg for the error message
+/// - 2: Whether or not to permit passing through numeric values as OIDs
+const STRING_REG_CAST_TEMPLATE: &str = "
+(SELECT
+CASE
+    WHEN $1 IS NULL THEN NULL
+-- Handle OID-like input, if available via {2}
+    WHEN {2} AND pg_catalog.substring($1, 1, 1) BETWEEN '0' AND '9' THEN
+        $1::pg_catalog.oid::pg_catalog.{0}
+    ELSE (
+    -- String case; look up that the item exists
+        SELECT o.oid
+        FROM mz_unsafe.mz_error_if_null(
+            (
+                -- We need to ensure a distinct here in the case of e.g. functions,
+                -- where multiple items share a GlobalId.
+                SELECT DISTINCT id AS name_id
+                FROM mz_internal.mz_resolve_object_name('{0}', $1)
+            ),
+            -- TODO: Support the correct error code for does not exist (42883).
+            '{1} \"' || $1 || '\" does not exist'
+        ) AS i (name_id),
+        -- Lateral lets us error separately from DNE case
+        LATERAL (
+            SELECT
+                CASE
+            -- Handle too many OIDs
+                WHEN mz_catalog.list_length(mz_catalog.list_agg(oid)) > 1 THEN
+                    mz_unsafe.mz_error_if_null(
+                        NULL::pg_catalog.{0},
+                        'more than one {1} named \"' || $1 || '\"'
+                    )
+            -- Resolve object name's OID if we know there is only one
+                ELSE
+                    CAST(mz_catalog.list_agg(oid)[1] AS pg_catalog.{0})
+                END
+            FROM mz_catalog.mz_objects
+            WHERE id = name_id
+            GROUP BY id
+        ) AS o (oid)
+    )
+END)";
+
+static STRING_TO_REGCLASS_EXPLICIT: Lazy<String> = Lazy::new(|| {
+    SimpleCurlyFormat
+        .format(STRING_REG_CAST_TEMPLATE, ["regclass", "relation", "false"])
+        .unwrap()
+        .to_string()
+});
+
+static STRING_TO_REGCLASS_COERCED: Lazy<String> = Lazy::new(|| {
+    SimpleCurlyFormat
+        .format(STRING_REG_CAST_TEMPLATE, ["regclass", "relation", "true"])
+        .unwrap()
+        .to_string()
+});
+
+static STRING_TO_REGPROC: Lazy<String> = Lazy::new(|| {
+    SimpleCurlyFormat
+        .format(STRING_REG_CAST_TEMPLATE, ["regproc", "function", "true"])
+        .unwrap()
+        .to_string()
+});
+
+static STRING_TO_REGTYPE: Lazy<String> = Lazy::new(|| {
+    SimpleCurlyFormat
+        .format(STRING_REG_CAST_TEMPLATE, ["regtype", "type", "true"])
+        .unwrap()
+        .to_string()
+});
+
+const REG_STRING_CAST_TEMPLATE: &str = "(
+SELECT
+    COALESCE(mz_internal.mz_global_id_to_name(o.id), CAST($1 AS pg_catalog.oid)::pg_catalog.text)
+    AS text
+FROM
+  (
+        SELECT
+          (
+            SELECT DISTINCT id
+            FROM
+              mz_catalog.mz_objects AS o
+                JOIN
+                  mz_internal.mz_object_oid_alias AS a
+                  ON o.type = a.object_type
+            WHERE
+              oid = CAST($1 AS pg_catalog.oid)
+                AND
+              a.oid_alias = '{0}'
+          )
+      )
+      AS o
+)";
+
+static REGCLASS_TO_STRING: Lazy<String> = Lazy::new(|| {
+    SimpleCurlyFormat
+        .format(REG_STRING_CAST_TEMPLATE, ["regclass"])
+        .unwrap()
+        .to_string()
+});
+
+static REGPROC_TO_STRING: Lazy<String> = Lazy::new(|| {
+    SimpleCurlyFormat
+        .format(REG_STRING_CAST_TEMPLATE, ["regproc"])
+        .unwrap()
+        .to_string()
+});
+
+static REGTYPE_TO_STRING: Lazy<String> = Lazy::new(|| {
+    SimpleCurlyFormat
+        .format(REG_STRING_CAST_TEMPLATE, ["regtype"])
+        .unwrap()
+        .to_string()
+});
+
 /// Describes the context of a cast.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+///
+/// n.b. this type derived `Ord, PartialOrd` and the ordering of these values
+/// has semantics meaning; casts are only permitted when the caller's cast
+/// context is geq the ccx we store, which is the minimum required context.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum CastContext {
     /// Implicit casts are "no-brainer" casts that apply automatically in
     /// expressions. They are typically lossless, such as `ScalarType::Int32` to
@@ -105,6 +256,12 @@ pub enum CastContext {
     /// casting `ScalarType::Json` to `ScalarType::Int32`, and therefore they do
     /// not happen unless explicitly requested by the user with a cast operator.
     Explicit,
+    /// Coerced casts permit different behavior when a type is coerced from a
+    /// string literal vs. a value of type `pg_catalog::text`.
+    ///
+    /// The only call site that should pass this value in to this module is
+    /// string coercion.
+    Coerced,
 }
 
 /// The implementation of a cast.
@@ -287,39 +444,21 @@ static VALID_CASTS: Lazy<BTreeMap<(ScalarBaseType, ScalarBaseType), CastImpl>> =
         (Oid, Int32) => Assignment: CastOidToInt32(func::CastOidToInt32),
         (Oid, Int64) => Assignment: CastOidToInt32(func::CastOidToInt32),
         (Oid, String) => Explicit: CastOidToString(func::CastOidToString),
-        (Oid, RegClass) => Assignment: CastOidToRegClass(func::CastOidToRegClass),
-        (Oid, RegProc) => Assignment: CastOidToRegProc(func::CastOidToRegProc),
-        (Oid, RegType) => Assignment: CastOidToRegType(func::CastOidToRegType),
+        (Oid, RegClass) => Implicit: CastOidToRegClass(func::CastOidToRegClass),
+        (Oid, RegProc) => Implicit: CastOidToRegProc(func::CastOidToRegProc),
+        (Oid, RegType) => Implicit: CastOidToRegType(func::CastOidToRegType),
 
         // REGCLASS
         (RegClass, Oid) => Implicit: CastRegClassToOid(func::CastRegClassToOid),
-        (RegClass, String) => Explicit: sql_impl_cast("(
-                SELECT COALESCE(t.name, v.x::pg_catalog.text)
-                FROM (
-                    VALUES ($1::pg_catalog.oid)) AS v(x)
-                    LEFT JOIN mz_catalog.mz_objects AS t
-                    ON t.oid = v.x
-            )"),
+        (RegClass, String) => Explicit: sql_impl_cast(&REGCLASS_TO_STRING),
 
         // REGPROC
         (RegProc, Oid) => Implicit: CastRegProcToOid(func::CastRegProcToOid),
-        (RegProc, String) => Explicit: sql_impl_cast("(
-                SELECT COALESCE(t.name, v.x::pg_catalog.text)
-                FROM (
-                    VALUES ($1::pg_catalog.oid)) AS v(x)
-                    LEFT JOIN mz_catalog.mz_functions AS t
-                    ON t.oid = v.x
-            )"),
+        (RegProc, String) => Explicit: sql_impl_cast(&REGPROC_TO_STRING),
 
         // REGTYPE
         (RegType, Oid) => Implicit: CastRegTypeToOid(func::CastRegTypeToOid),
-        (RegType, String) => Explicit: sql_impl_cast("(
-                SELECT COALESCE(t.name, v.x::pg_catalog.text)
-                FROM (
-                    VALUES ($1::pg_catalog.oid)) AS v(x)
-                    LEFT JOIN mz_catalog.mz_types AS t
-                    ON t.oid = v.x
-            )"),
+        (RegType, String) => Explicit: sql_impl_cast(&REGTYPE_TO_STRING),
 
         // FLOAT32
         (Float32, Int16) => Assignment: CastFloat32ToInt16(func::CastFloat32ToInt16),
@@ -350,8 +489,14 @@ static VALID_CASTS: Lazy<BTreeMap<(ScalarBaseType, ScalarBaseType), CastImpl>> =
         (Float64, String) => Assignment: CastFloat64ToString(func::CastFloat64ToString),
 
         // DATE
-        (Date, Timestamp) => Implicit: CastDateToTimestamp(func::CastDateToTimestamp),
-        (Date, TimestampTz) => Implicit: CastDateToTimestampTz(func::CastDateToTimestampTz),
+        (Date, Timestamp) => Implicit: CastTemplate::new(|_ecx, _ccx, _from_type, to_type| {
+            let p = to_type.unwrap_timestamp_precision();
+            Some(move |e: HirScalarExpr| e.call_unary(CastDateToTimestamp(func::CastDateToTimestamp(p))))
+        }),
+        (Date, TimestampTz) => Implicit: CastTemplate::new(|_ecx, _ccx, _from_type, to_type| {
+            let p = to_type.unwrap_timestamp_precision();
+            Some(move |e: HirScalarExpr| e.call_unary(CastDateToTimestampTz(func::CastDateToTimestampTz(p))))
+        }),
         (Date, String) => Assignment: CastDateToString(func::CastDateToString),
 
         // TIME
@@ -360,13 +505,31 @@ static VALID_CASTS: Lazy<BTreeMap<(ScalarBaseType, ScalarBaseType), CastImpl>> =
 
         // TIMESTAMP
         (Timestamp, Date) => Assignment: CastTimestampToDate(func::CastTimestampToDate),
-        (Timestamp, TimestampTz) => Implicit: CastTimestampToTimestampTz(func::CastTimestampToTimestampTz),
+        (Timestamp, TimestampTz) => Implicit: CastTemplate::new(|_ecx, _ccx, from_type, to_type| {
+            let from = from_type.unwrap_timestamp_precision();
+            let to = to_type.unwrap_timestamp_precision();
+            Some(move |e: HirScalarExpr| e.call_unary(CastTimestampToTimestampTz(func::CastTimestampToTimestampTz{from, to})))
+        }),
+        (Timestamp, Timestamp) => Assignment: CastTemplate::new(|_ecx, _ccx, from_type, to_type| {
+            let from = from_type.unwrap_timestamp_precision();
+            let to = to_type.unwrap_timestamp_precision();
+            Some(move |e: HirScalarExpr| e.call_unary(AdjustTimestampPrecision(func::AdjustTimestampPrecision{from, to})))
+        }),
         (Timestamp, Time) => Assignment: CastTimestampToTime(func::CastTimestampToTime),
         (Timestamp, String) => Assignment: CastTimestampToString(func::CastTimestampToString),
 
         // TIMESTAMPTZ
         (TimestampTz, Date) => Assignment: CastTimestampTzToDate(func::CastTimestampTzToDate),
-        (TimestampTz, Timestamp) => Assignment: CastTimestampTzToTimestamp(func::CastTimestampTzToTimestamp),
+        (TimestampTz, Timestamp) => Assignment: CastTemplate::new(|_ecx, _ccx, from_type, to_type| {
+            let from = from_type.unwrap_timestamp_precision();
+            let to = to_type.unwrap_timestamp_precision();
+            Some(move |e: HirScalarExpr| e.call_unary(CastTimestampTzToTimestamp(func::CastTimestampTzToTimestamp{from, to})))
+        }),
+        (TimestampTz, TimestampTz) => Assignment: CastTemplate::new(|_ecx, _ccx, from_type, to_type| {
+            let from = from_type.unwrap_timestamp_precision();
+            let to = to_type.unwrap_timestamp_precision();
+            Some(move |e: HirScalarExpr| e.call_unary(AdjustTimestampTzPrecision(func::AdjustTimestampTzPrecision{from, to})))
+        }),
         (TimestampTz, Time) => Assignment: CastTimestampTzToTime(func::CastTimestampTzToTime),
         (TimestampTz, String) => Assignment: CastTimestampTzToString(func::CastTimestampTzToString),
 
@@ -393,53 +556,16 @@ static VALID_CASTS: Lazy<BTreeMap<(ScalarBaseType, ScalarBaseType), CastImpl>> =
         // in the corresponding mz_catalog table and expects exactly one object to match it.
         // You can also specify (in postgres) a string that's a valid
         // int4 and it'll happily cast it (without verifying that the int4 matches
-        // an object oid). To support this, use a SQL expression that checks if
-        // the input might be a valid int4 with a regex, otherwise try to lookup in
-        // the table. CASE will return NULL if the subquery returns zero results,
-        // so use mz_error_if_null to coerce that into an error. This is hacky and
-        // incomplete in a few ways, but gets us close enough to making drivers happy.
+        // an object oid).
         // TODO: Support the correct error code for does not exist (42883).
-        // TODO: Support qualified names.
-        // TODO: This should take into account the search path when looking for an object.
-        (String, RegClass) => Explicit: sql_impl_cast("(
-                SELECT
-                    CASE
-                    WHEN $1 IS NULL THEN NULL
-                    WHEN $1 ~ '^\\d+$' THEN $1::pg_catalog.oid::pg_catalog.regclass
-                    ELSE (
-                        mz_internal.mz_error_if_null(
-                            (SELECT oid::pg_catalog.regclass FROM mz_catalog.mz_objects WHERE name = $1),
-                            'object \"' || $1 || '\" does not exist'
-                        )
-                    )
-                    END
-            )"),
-        (String, RegProc) => Explicit: sql_impl_cast("(
-                SELECT
-                    CASE
-                    WHEN $1 IS NULL THEN NULL
-                    WHEN $1 ~ '^\\d+$' THEN $1::pg_catalog.oid::pg_catalog.regproc
-                    ELSE (
-                        mz_internal.mz_error_if_null(
-                            (SELECT oid::pg_catalog.regproc FROM mz_catalog.mz_functions WHERE name = $1),
-                            'function \"' || $1 || '\" does not exist'
-                        )
-                    )
-                    END
-            )"),
-        (String, RegType) => Explicit: sql_impl_cast("(
-                SELECT
-                    CASE
-                    WHEN $1 IS NULL THEN NULL
-                    WHEN $1 ~ '^\\d+$' THEN $1::pg_catalog.oid::pg_catalog.regtype
-                    ELSE (
-                        mz_internal.mz_error_if_null(
-                            (SELECT oid::pg_catalog.regtype FROM mz_catalog.mz_types WHERE name = $1),
-                            'type \"' || $1 || '\" does not exist'
-                        )
-                    )
-                    END
-            )"),
+        (String, RegClass) => Explicit: sql_impl_cast_per_context(
+            &[
+                (CastContext::Explicit, &STRING_TO_REGCLASS_EXPLICIT),
+                (CastContext::Coerced, &STRING_TO_REGCLASS_COERCED)
+            ]
+        ),
+        (String, RegProc) => Explicit: sql_impl_cast(&STRING_TO_REGPROC),
+        (String, RegType) => Explicit: sql_impl_cast(&STRING_TO_REGTYPE),
 
         (String, Float32) => Explicit: CastStringToFloat32(func::CastStringToFloat32),
         (String, Float64) => Explicit: CastStringToFloat64(func::CastStringToFloat64),
@@ -449,8 +575,14 @@ static VALID_CASTS: Lazy<BTreeMap<(ScalarBaseType, ScalarBaseType), CastImpl>> =
         }),
         (String, Date) => Explicit: CastStringToDate(func::CastStringToDate),
         (String, Time) => Explicit: CastStringToTime(func::CastStringToTime),
-        (String, Timestamp) => Explicit: CastStringToTimestamp(func::CastStringToTimestamp),
-        (String, TimestampTz) => Explicit: CastStringToTimestampTz(func::CastStringToTimestampTz),
+        (String, Timestamp) => Explicit: CastTemplate::new(|_ecx, _ccx, _from_type, to_type| {
+            let p = to_type.unwrap_timestamp_precision();
+            Some(move |e: HirScalarExpr| e.call_unary(CastStringToTimestamp(func::CastStringToTimestamp(p))))
+        }),
+        (String, TimestampTz) => Explicit: CastTemplate::new(|_ecx, _ccx, _from_type, to_type| {
+            let p = to_type.unwrap_timestamp_precision();
+            Some(move |e: HirScalarExpr| e.call_unary(CastStringToTimestampTz(func::CastStringToTimestampTz(p))))
+        }),
         (String, Interval) => Explicit: CastStringToInterval(func::CastStringToInterval),
         (String, Bytes) => Explicit: CastStringToBytes(func::CastStringToBytes),
         (String, Jsonb) => Explicit: CastStringToJsonb(func::CastStringToJsonb),
@@ -525,11 +657,27 @@ static VALID_CASTS: Lazy<BTreeMap<(ScalarBaseType, ScalarBaseType), CastImpl>> =
         }),
         (VarChar, PgLegacyChar) => Assignment: CastStringToPgLegacyChar(func::CastStringToPgLegacyChar),
 
-        //PG LEGACY CHAR
+        // PG LEGACY CHAR
         (PgLegacyChar, String) => Implicit: CastPgLegacyCharToString(func::CastPgLegacyCharToString),
         (PgLegacyChar, Char) => Assignment: CastPgLegacyCharToChar(func::CastPgLegacyCharToChar),
         (PgLegacyChar, VarChar) => Assignment: CastPgLegacyCharToVarChar(func::CastPgLegacyCharToVarChar),
         (PgLegacyChar, Int32) => Explicit: CastPgLegacyCharToInt32(func::CastPgLegacyCharToInt32),
+
+        // PG LEGACY NAME
+        // Under the hood VarChars and Name's are just Strings, so we can re-use existing methods
+        // on Strings and VarChars instead of defining new ones.
+        (PgLegacyName, String) => Implicit: CastVarCharToString(func::CastVarCharToString),
+        (PgLegacyName, Char) => Assignment: CastTemplate::new(|_ecx, ccx, _from_type, to_type| {
+            let length = to_type.unwrap_char_length();
+            Some(move |e: HirScalarExpr| e.call_unary(CastStringToChar(func::CastStringToChar {length, fail_on_len: ccx != CastContext::Explicit})))
+        }),
+        (PgLegacyName, VarChar) => Assignment: CastTemplate::new(|_ecx, ccx, _from_type, to_type| {
+            let length = to_type.unwrap_varchar_max_length();
+            Some(move |e: HirScalarExpr| e.call_unary(CastStringToVarChar(func::CastStringToVarChar {length, fail_on_len: ccx != CastContext::Explicit})))
+        }),
+        (String, PgLegacyName) => Implicit: CastStringToPgLegacyName(func::CastStringToPgLegacyName),
+        (Char, PgLegacyName) => Implicit: CastStringToPgLegacyName(func::CastStringToPgLegacyName),
+        (VarChar, PgLegacyName) => Implicit: CastStringToPgLegacyName(func::CastStringToPgLegacyName),
 
         // RECORD
         (Record, String) => Assignment: CastTemplate::new(|_ecx, _ccx, from_type, _to_type| {
@@ -629,7 +777,7 @@ static VALID_CASTS: Lazy<BTreeMap<(ScalarBaseType, ScalarBaseType), CastImpl>> =
             let scale = to_type.unwrap_numeric_max_scale();
             Some(move |e: HirScalarExpr| match scale {
                 None => e,
-                Some(scale) => e.call_unary(UnaryFunc::RescaleNumeric(func::RescaleNumeric(scale))),
+                Some(scale) => e.call_unary(UnaryFunc::AdjustNumericScale(func::AdjustNumericScale(scale))),
             })
         }),
         (Numeric, Float32) => Implicit: CastNumericToFloat32(func::CastNumericToFloat32),
@@ -664,6 +812,46 @@ static VALID_CASTS: Lazy<BTreeMap<(ScalarBaseType, ScalarBaseType), CastImpl>> =
                     (SELECT mz_internal.mz_aclitem_grantor($1) AS grantor_role_id)
                 LEFT JOIN mz_roles AS grantee_role ON grantee_role_id = grantee_role.id
                 LEFT JOIN mz_roles AS grantor_role ON grantor_role_id = grantor_role.id
+            )"),
+        (MzAclItem, AclItem) => Explicit: sql_impl_cast("(
+                SELECT makeaclitem(
+                    (CASE mz_internal.mz_aclitem_grantee($1)
+                        WHEN 'p' THEN 0
+                        ELSE (SELECT oid FROM mz_roles WHERE id = mz_internal.mz_aclitem_grantee($1))
+                    END),
+                    (SELECT oid FROM mz_roles WHERE id = mz_internal.mz_aclitem_grantor($1)),
+                    (SELECT array_to_string(mz_internal.mz_format_privileges(mz_internal.mz_aclitem_privileges($1)), ',')),
+                    -- GRANT OPTION isn't implemented so we hardcode false.
+                    false
+                )
+            )"),
+
+        // AclItem
+        (AclItem, String) => Explicit: sql_impl_cast("(
+                SELECT
+                    (CASE grantee_oid
+                        WHEN 0 THEN ''
+                        ELSE COALESCE(grantee_role.name, grantee_oid::text)
+                    END)
+                    || '='
+                    || mz_internal.aclitem_privileges($1)
+                    || '/'
+                    || COALESCE(grantor_role.name, grantor_oid::text)
+                FROM
+                    (SELECT mz_internal.aclitem_grantee($1) AS grantee_oid),
+                    (SELECT mz_internal.aclitem_grantor($1) AS grantor_oid)
+                LEFT JOIN mz_roles AS grantee_role ON grantee_oid = grantee_role.oid
+                LEFT JOIN mz_roles AS grantor_role ON grantor_oid = grantor_role.oid
+            )"),
+        (AclItem, MzAclItem) => Explicit: sql_impl_cast("(
+                SELECT mz_internal.make_mz_aclitem(
+                    (CASE mz_internal.aclitem_grantee($1)
+                        WHEN 0 THEN 'p'
+                        ELSE (SELECT id FROM mz_roles WHERE oid = mz_internal.aclitem_grantee($1))
+                    END),
+                    (SELECT id FROM mz_roles WHERE oid = mz_internal.aclitem_grantor($1)),
+                    (SELECT array_to_string(mz_internal.mz_format_privileges(mz_internal.aclitem_privileges($1)), ','))
+                )
             )")
     }
 });
@@ -683,11 +871,10 @@ fn get_cast(
     }
 
     let imp = VALID_CASTS.get(&(from.into(), to.into()))?;
-    let template = match (ccx, imp.context) {
-        (Explicit, Implicit) | (Explicit, Assignment) | (Explicit, Explicit) => Some(&imp.template),
-        (Assignment, Implicit) | (Assignment, Assignment) => Some(&imp.template),
-        (Implicit, Implicit) => Some(&imp.template),
-        _ => None,
+    let template = if ccx >= imp.context {
+        Some(&imp.template)
+    } else {
+        None
     };
     template.and_then(|template| (template.0)(ecx, ccx, from, to))
 }
@@ -744,6 +931,46 @@ pub fn to_jsonb(ecx: &ExprContext, expr: HirScalarExpr) -> HirScalarExpr {
                 func: VariadicFunc::JsonbBuildObject,
                 exprs,
             }
+        }
+        ref ty @ List {
+            ref element_type, ..
+        }
+        | ref ty @ Array(ref element_type) => {
+            // Construct a new expression context with one column whose type
+            // is the container's element type.
+            let qcx = QueryContext::root(ecx.qcx.scx, ecx.qcx.lifetime);
+            let ecx = ExprContext {
+                qcx: &qcx,
+                name: "to_jsonb",
+                scope: &Scope::empty(),
+                relation_type: &RelationType::new(vec![element_type.clone().nullable(true)]),
+                allow_aggregates: false,
+                allow_subqueries: false,
+                allow_parameters: false,
+                allow_windows: false,
+            };
+
+            // Create an element-casting expression by calling `to_jsonb` on
+            // an expression that references the first column in a row.
+            let cast_element = to_jsonb(&ecx, HirScalarExpr::column(0));
+            let cast_element = cast_element
+                .lower_uncorrelated()
+                .expect("to_jsonb does not produce correlated expressions on uncorrelated input");
+
+            // The `Cast{Array|List}ToJsonb` functions take the element-casting
+            // expression as an argument and evaluate the expression against
+            // each element of the container at runtime.
+            let func = match ty {
+                List { .. } => UnaryFunc::CastListToJsonb(CastListToJsonb {
+                    cast_element: Box::new(cast_element),
+                }),
+                Array { .. } => UnaryFunc::CastArrayToJsonb(CastArrayToJsonb {
+                    cast_element: Box::new(cast_element),
+                }),
+                _ => unreachable!("validated above"),
+            };
+
+            expr.call_unary(func)
         }
         _ => to_string(ecx, expr).call_unary(UnaryFunc::CastJsonbOrNullToJsonb(
             func::CastJsonbOrNullToJsonb,
@@ -843,7 +1070,7 @@ pub fn plan_coerce<'a>(
             // (with either implicit or explicit semantics) via a separate call
             // to `plan_cast`.
             let coerce_to_base = &coerce_to.without_modifiers();
-            plan_cast(ecx, CastContext::Explicit, lit, coerce_to_base)?
+            plan_cast(ecx, CastContext::Coerced, lit, coerce_to_base)?
         }
 
         LiteralRecord(exprs) => {

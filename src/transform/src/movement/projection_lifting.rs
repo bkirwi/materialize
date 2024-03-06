@@ -15,10 +15,10 @@ use std::collections::BTreeMap;
 use std::mem;
 
 use itertools::zip_eq;
-use mz_expr::{Id, MirRelationExpr, RECURSION_LIMIT};
+use mz_expr::{AccessStrategy, Id, MirRelationExpr, RECURSION_LIMIT};
 use mz_ore::stack::{CheckedRecursion, RecursionGuard};
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Hoist projections through operators.
 #[derive(Debug)]
@@ -41,16 +41,15 @@ impl CheckedRecursion for ProjectionLifting {
 }
 
 impl crate::Transform for ProjectionLifting {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "projection_lifting")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         let result = self.action(relation, &mut BTreeMap::new());
         mz_repr::explain::trace_plan(&*relation);
@@ -69,11 +68,16 @@ impl ProjectionLifting {
         self.checked_recur(|_| {
             match relation {
                 MirRelationExpr::Constant { .. } => Ok(()),
-                MirRelationExpr::Get { id, .. } => {
+                MirRelationExpr::Get {
+                    id,
+                    typ: _,
+                    access_strategy: _,
+                } => {
                     if let Some((typ, columns)) = gets.get(id) {
                         *relation = MirRelationExpr::Get {
                             id: *id,
                             typ: typ.clone(),
+                            access_strategy: AccessStrategy::UnknownOrLocal, // (we are not copying it over)
                         }
                         .project(columns.clone());
                     }
@@ -99,7 +103,7 @@ impl ProjectionLifting {
                     limits: _,
                     body,
                 } => {
-                    let recursive_ids = MirRelationExpr::recursive_ids(ids, values)?;
+                    let recursive_ids = MirRelationExpr::recursive_ids(ids, values);
 
                     for (local_id, value) in zip_eq(ids.iter(), values.iter_mut()) {
                         self.action(value, gets)?;
@@ -289,6 +293,9 @@ impl ProjectionLifting {
                         }
                         for key in order_key.iter_mut() {
                             key.column = outputs[key.column];
+                        }
+                        if let Some(limit) = limit.as_mut() {
+                            limit.permute(outputs);
                         }
                         *relation = inner
                             .take_dangerous()

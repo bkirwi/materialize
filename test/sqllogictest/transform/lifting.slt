@@ -19,7 +19,7 @@ create table t (
 )
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 (select null::int, 1, 2)
 union all
 (select a, b, 2 from t)
@@ -29,15 +29,15 @@ union all
 Explained Query:
   Map (2) // { arity: 3 }
     Union // { arity: 2 }
-      Get materialize.public.t // { arity: 2 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
       Constant // { arity: 2 }
         - (null, 1)
 
 EOF
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 (select null::int, 1, 2, 3)
 union all
 (select a, b, 2, 3 from t)
@@ -47,15 +47,15 @@ union all
 Explained Query:
   Map (2, 3) // { arity: 4 }
     Union // { arity: 2 }
-      Get materialize.public.t // { arity: 2 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
       Constant // { arity: 2 }
         - (null, 1)
 
 EOF
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 (select null::int, 1, 2)
 union all
 (select a, b, 2 from t)
@@ -65,9 +65,9 @@ union all
 Explained Query:
   Union // { arity: 3 }
     Map (2) // { arity: 3 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
     Map (3) // { arity: 3 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
     Constant // { arity: 3 }
       - (null, 1, 2)
 
@@ -75,16 +75,16 @@ EOF
 
 # Group key literal lifting
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select a, b from t where a = 1 group by a, b
 ----
 Explained Query:
   Project (#1, #0) // { arity: 2 }
     Map (1) // { arity: 2 }
-      Distinct group_by=[#0] // { arity: 1 }
+      Distinct project=[#0] // { arity: 1 }
         Project (#1) // { arity: 1 }
           Filter (#0 = 1) // { arity: 2 }
-            Get materialize.public.t // { arity: 2 }
+            ReadStorage materialize.public.t // { arity: 2 }
 
 Source materialize.public.t
   filter=((#0 = 1))
@@ -92,15 +92,15 @@ Source materialize.public.t
 EOF
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select a, b from t where b = 1 group by a, b
 ----
 Explained Query:
   Map (1) // { arity: 2 }
-    Distinct group_by=[#0] // { arity: 1 }
+    Distinct project=[#0] // { arity: 1 }
       Project (#0) // { arity: 1 }
         Filter (#1 = 1) // { arity: 2 }
-          Get materialize.public.t // { arity: 2 }
+          ReadStorage materialize.public.t // { arity: 2 }
 
 Source materialize.public.t
   filter=((#1 = 1))
@@ -110,7 +110,7 @@ EOF
 
 # Permute literals in Map operator so they can be lifted
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select * from (select 1, a+1 from t), t;
 ----
 Explained Query:
@@ -122,14 +122,14 @@ Explained Query:
         ArrangeBy keys=[[]] // { arity: 1 }
           Project (#2) // { arity: 1 }
             Map ((#0 + 1)) // { arity: 3 }
-              Get materialize.public.t // { arity: 2 }
+              ReadStorage materialize.public.t // { arity: 2 }
         ArrangeBy keys=[[]] // { arity: 2 }
-          Get materialize.public.t // { arity: 2 }
+          ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select * from (select b+1, 2, 1, a+1 from t), t;
 ----
 Explained Query:
@@ -141,14 +141,14 @@ Explained Query:
         ArrangeBy keys=[[]] // { arity: 2 }
           Project (#2, #3) // { arity: 2 }
             Map ((#1 + 1), (#0 + 1)) // { arity: 4 }
-              Get materialize.public.t // { arity: 2 }
+              ReadStorage materialize.public.t // { arity: 2 }
         ArrangeBy keys=[[]] // { arity: 2 }
-          Get materialize.public.t // { arity: 2 }
+          ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select * from (select 3, b+1, 2, a+2, 1, a+1 from t), t;
 ----
 Explained Query:
@@ -160,37 +160,37 @@ Explained Query:
         ArrangeBy keys=[[]] // { arity: 3 }
           Project (#2..=#4) // { arity: 3 }
             Map ((#1 + 1), (#0 + 2), (#0 + 1)) // { arity: 5 }
-              Get materialize.public.t // { arity: 2 }
+              ReadStorage materialize.public.t // { arity: 2 }
         ArrangeBy keys=[[]] // { arity: 2 }
-          Get materialize.public.t // { arity: 2 }
+          ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select a+1 from (select 1 as a, b from t);
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
     Map (2) // { arity: 3 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select z+1 from (select 2 as y, a, 1 as z, b from t);
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
     Map (2) // { arity: 3 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 # Extract common values in all rows in Constant operator
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select c1, c1 + a from (select 1 as c1, x as c2, 3 as c3 from generate_series(1, 3) as x union all select 1, x, 3 from generate_series(5, 8) as x), t;
 ----
 Explained Query:
@@ -204,12 +204,12 @@ Explained Query:
             - (() x 7)
         ArrangeBy keys=[[]] // { arity: 1 }
           Project (#0) // { arity: 1 }
-            Get materialize.public.t // { arity: 2 }
+            ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select * from (select 1 as f1, 2 as f2), generate_series(f1, f2);
 ----
 Explained Query (fast path):
@@ -235,7 +235,7 @@ Explained Query:
             - (4)
         ArrangeBy keys=[[]] // { types: "()" }
           Project () // { types: "()" }
-            Get materialize.public.t // { types: "(integer?, integer?)" }
+            ReadStorage materialize.public.t // { types: "(integer?, integer?)" }
 
 EOF
 
@@ -260,20 +260,20 @@ Explained Query:
             - (4, 5)
         ArrangeBy keys=[[]] // { types: "()" }
           Project () // { types: "()" }
-            Get materialize.public.t // { types: "(integer?, integer?)" }
+            ReadStorage materialize.public.t // { types: "(integer?, integer?)" }
 
 EOF
 
 # Permute the literals around the columns added by FlatMap
 query T multiline
-explain with(arity, join_impls) select * from (select 1 as a from t), generate_series(a+1, 4);
+explain with(arity, join implementations) select * from (select 1 as a from t), generate_series(a+1, 4);
 ----
 Explained Query:
   Project (#1, #0) // { arity: 2 }
     Map (1) // { arity: 2 }
       FlatMap generate_series(2, 4, 1) // { arity: 1 }
         Project () // { arity: 0 }
-          Get materialize.public.t // { arity: 2 }
+          ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
@@ -283,230 +283,230 @@ EOF
 # With literals only
 
 query T multiline
-explain with(arity, join_impls) select 123 from (select 234 from t);
+explain with(arity, join implementations) select 123 from (select 234 from t);
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
     Map (123) // { arity: 3 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select 123 from (select distinct 234 from t);
+explain with(arity, join implementations) select 123 from (select distinct 234 from t);
 ----
 Explained Query:
   Map (123) // { arity: 1 }
-    Distinct // { arity: 0 }
+    Distinct project=[] // { arity: 0 }
       Project () // { arity: 0 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select distinct 123 from (select 234 from t);
+explain with(arity, join implementations) select distinct 123 from (select 234 from t);
 ----
 Explained Query:
   Map (123) // { arity: 1 }
-    Distinct // { arity: 0 }
+    Distinct project=[] // { arity: 0 }
       Project () // { arity: 0 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select distinct 123 from (select distinct 234 from t);
+explain with(arity, join implementations) select distinct 123 from (select distinct 234 from t);
 ----
 Explained Query:
   Map (123) // { arity: 1 }
-    Distinct // { arity: 0 }
+    Distinct project=[] // { arity: 0 }
       Project () // { arity: 0 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 # With a single literal
 
 query T multiline
-explain with(arity, join_impls) select * from (select distinct 123 from t);
+explain with(arity, join implementations) select * from (select distinct 123 from t);
 ----
 Explained Query:
   Map (123) // { arity: 1 }
-    Distinct // { arity: 0 }
+    Distinct project=[] // { arity: 0 }
       Project () // { arity: 0 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select distinct * from (select 123 from t);
+explain with(arity, join implementations) select distinct * from (select 123 from t);
 ----
 Explained Query:
   Map (123) // { arity: 1 }
-    Distinct // { arity: 0 }
+    Distinct project=[] // { arity: 0 }
       Project () // { arity: 0 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 # With a literal in the outer query and a column in the derived table
 
 query T multiline
-explain with(arity, join_impls) select 123 from (select a from t);
+explain with(arity, join implementations) select 123 from (select a from t);
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
     Map (123) // { arity: 3 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select 123 from (select distinct a from t);
+explain with(arity, join implementations) select 123 from (select distinct a from t);
 ----
 Explained Query:
   Project (#1) // { arity: 1 }
     Map (123) // { arity: 2 }
-      Distinct group_by=[#0] // { arity: 1 }
+      Distinct project=[#0] // { arity: 1 }
         Project (#0) // { arity: 1 }
-          Get materialize.public.t // { arity: 2 }
+          ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select distinct 123 from (select a from t);
+explain with(arity, join implementations) select distinct 123 from (select a from t);
 ----
 Explained Query:
   Map (123) // { arity: 1 }
-    Distinct // { arity: 0 }
+    Distinct project=[] // { arity: 0 }
       Project () // { arity: 0 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select distinct 123 from (select distinct a from t);
+explain with(arity, join implementations) select distinct 123 from (select distinct a from t);
 ----
 Explained Query:
   Map (123) // { arity: 1 }
-    Distinct // { arity: 0 }
+    Distinct project=[] // { arity: 0 }
       Project () // { arity: 0 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 # With a literal and a column in the derived table
 
 query T multiline
-explain with(arity, join_impls) select distinct a1.a, a1.literal from (select a, 123 as literal from t) as a1;
+explain with(arity, join implementations) select distinct a1.a, a1.literal from (select a, 123 as literal from t) as a1;
 ----
 Explained Query:
   Map (123) // { arity: 2 }
-    Distinct group_by=[#0] // { arity: 1 }
+    Distinct project=[#0] // { arity: 1 }
       Project (#0) // { arity: 1 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select a1.a, a1.literal from (select distinct a, 123 as literal from t) as a1;
+explain with(arity, join implementations) select a1.a, a1.literal from (select distinct a, 123 as literal from t) as a1;
 ----
 Explained Query:
   Map (123) // { arity: 2 }
-    Distinct group_by=[#0] // { arity: 1 }
+    Distinct project=[#0] // { arity: 1 }
       Project (#0) // { arity: 1 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select a1.a, a1.literal from (select distinct a, 123 as literal from t) as a1;
+explain with(arity, join implementations) select a1.a, a1.literal from (select distinct a, 123 as literal from t) as a1;
 ----
 Explained Query:
   Map (123) // { arity: 2 }
-    Distinct group_by=[#0] // { arity: 1 }
+    Distinct project=[#0] // { arity: 1 }
       Project (#0) // { arity: 1 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select distinct a1.a, a1.literal from (select distinct a, 123 as literal from t) as a1;
+explain with(arity, join implementations) select distinct a1.a, a1.literal from (select distinct a, 123 as literal from t) as a1;
 ----
 Explained Query:
   Map (123) // { arity: 2 }
-    Distinct group_by=[#0] // { arity: 1 }
+    Distinct project=[#0] // { arity: 1 }
       Project (#0) // { arity: 1 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 # With a literal and a column in the outer query
 
 query T multiline
-explain with(arity, join_impls) select distinct a1.a, 123 from (select a from t) as a1;
+explain with(arity, join implementations) select distinct a1.a, 123 from (select a from t) as a1;
 ----
 Explained Query:
   Map (123) // { arity: 2 }
-    Distinct group_by=[#0] // { arity: 1 }
+    Distinct project=[#0] // { arity: 1 }
       Project (#0) // { arity: 1 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select distinct a1.a, 123 from (select distinct a from t) as a1;
+explain with(arity, join implementations) select distinct a1.a, 123 from (select distinct a from t) as a1;
 ----
 Explained Query:
   Map (123) // { arity: 2 }
-    Distinct group_by=[#0] // { arity: 1 }
+    Distinct project=[#0] // { arity: 1 }
       Project (#0) // { arity: 1 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 # With expressions
 query T multiline
-explain with(arity, join_impls) select distinct a1.a+2 from (select distinct a+1 as a, 123 as literal from t) as a1;
+explain with(arity, join implementations) select distinct a1.a+2 from (select distinct a+1 as a, 123 as literal from t) as a1;
 ----
 Explained Query:
-  Distinct group_by=[((#0 + 1) + 2)] // { arity: 1 }
+  Distinct project=[((#0 + 1) + 2)] // { arity: 1 }
     Project (#0) // { arity: 1 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select distinct a1.a, 123 from (select distinct a+1 as a, 234 as literal from t) as a1;
+explain with(arity, join implementations) select distinct a1.a, 123 from (select distinct a+1 as a, 234 as literal from t) as a1;
 ----
 Explained Query:
   Map (123) // { arity: 2 }
-    Distinct group_by=[(#0 + 1)] // { arity: 1 }
+    Distinct project=[(#0 + 1)] // { arity: 1 }
       Project (#0) // { arity: 1 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select distinct a1.a+2, a1.literal from (select distinct a+1 as a, 123 as literal from t) as a1;
+explain with(arity, join implementations) select distinct a1.a+2, a1.literal from (select distinct a+1 as a, 123 as literal from t) as a1;
 ----
 Explained Query:
   Map (123) // { arity: 2 }
-    Distinct group_by=[((#0 + 1) + 2)] // { arity: 1 }
+    Distinct project=[((#0 + 1) + 2)] // { arity: 1 }
       Project (#0) // { arity: 1 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 
 query T multiline
-explain with(arity, join_impls) select distinct a1.a, a1.literal + 1 from (select distinct a, 123 as literal from t) as a1;
+explain with(arity, join implementations) select distinct a1.a, a1.literal + 1 from (select distinct a, 123 as literal from t) as a1;
 ----
 Explained Query:
   Map (124) // { arity: 2 }
-    Distinct group_by=[#0] // { arity: 1 }
+    Distinct project=[#0] // { arity: 1 }
       Project (#0) // { arity: 1 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
@@ -519,26 +519,26 @@ create table t_pk (
 )
 
 query T multiline
-explain with(arity, join_impls) select a1.*, 123 from t_pk as a1, t_pk as a2 WHERE a1.a = a2.a;
+explain with(arity, join implementations) select a1.*, 123 from t_pk as a1, t_pk as a2 WHERE a1.a = a2.a;
 ----
 Explained Query:
   Map (123) // { arity: 3 }
-    Get materialize.public.t_pk // { arity: 2 }
+    ReadStorage materialize.public.t_pk // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select distinct a1.*, 123 from t_pk as a1, t_pk as a2 WHERE a1.a = a2.a;
+explain with(arity, join implementations) select distinct a1.*, 123 from t_pk as a1, t_pk as a2 WHERE a1.a = a2.a;
 ----
 Explained Query:
   Map (123) // { arity: 3 }
-    Get materialize.public.t_pk // { arity: 2 }
+    ReadStorage materialize.public.t_pk // { arity: 2 }
 
 EOF
 
 # Reduce
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select a, b, max(2), count(*) from t where b = 1 group by a, b;
 ----
 Explained Query:
@@ -547,7 +547,7 @@ Explained Query:
       Reduce group_by=[#0] aggregates=[count(*)] // { arity: 2 }
         Project (#0) // { arity: 1 }
           Filter (#1 = 1) // { arity: 2 }
-            Get materialize.public.t // { arity: 2 }
+            ReadStorage materialize.public.t // { arity: 2 }
 
 Source materialize.public.t
   filter=((#1 = 1))
@@ -555,7 +555,7 @@ Source materialize.public.t
 EOF
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select a, b, count(*), max(2) from t where b = 1 group by a, b;
 ----
 Explained Query:
@@ -564,7 +564,7 @@ Explained Query:
       Reduce group_by=[#0] aggregates=[count(*)] // { arity: 2 }
         Project (#0) // { arity: 1 }
           Filter (#1 = 1) // { arity: 2 }
-            Get materialize.public.t // { arity: 2 }
+            ReadStorage materialize.public.t // { arity: 2 }
 
 Source materialize.public.t
   filter=((#1 = 1))
@@ -572,15 +572,15 @@ Source materialize.public.t
 EOF
 
 query T multiline
-explain with(arity, join_impls)
+explain with(arity, join implementations)
 select a, b, min(2), max(3) from t where b = 1 group by a, b;
 ----
 Explained Query:
   Map (1, 2, 3) // { arity: 4 }
-    Distinct group_by=[#0] // { arity: 1 }
+    Distinct project=[#0] // { arity: 1 }
       Project (#0) // { arity: 1 }
         Filter (#1 = 1) // { arity: 2 }
-          Get materialize.public.t // { arity: 2 }
+          ReadStorage materialize.public.t // { arity: 2 }
 
 Source materialize.public.t
   filter=((#1 = 1))
@@ -589,7 +589,7 @@ EOF
 
 # regression tests for #6943
 query T multiline
-explain with(arity, join_impls) select min(1/x) from (select a as y, 0 as x from t);
+explain with(arity, join implementations) select min(1/x) from (select a as y, 0 as x from t);
 ----
 Explained Query:
   Return // { arity: 1 }
@@ -604,14 +604,14 @@ Explained Query:
             - ()
   With
     cte l0 =
-      Distinct // { arity: 0 }
+      Distinct project=[] // { arity: 0 }
         Project () // { arity: 0 }
-          Get materialize.public.t // { arity: 2 }
+          ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select sum(1/x) from (select a as y, 0 as x from t);
+explain with(arity, join implementations) select sum(1/x) from (select a as y, 0 as x from t);
 ----
 Explained Query:
   Return // { arity: 1 }
@@ -626,14 +626,14 @@ Explained Query:
             - ()
   With
     cte l0 =
-      Distinct // { arity: 0 }
+      Distinct project=[] // { arity: 0 }
         Project () // { arity: 0 }
-          Get materialize.public.t // { arity: 2 }
+          ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-explain with(arity, join_impls) select min(a) from t_pk where a between 38 and 195 and a = (select a from t where a = 1308);
+explain with(arity, join implementations) select min(a) from t_pk where a between 38 and 195 and a = (select a from t where a = 1308);
 ----
 Explained Query:
   Return // { arity: 1 }
@@ -656,7 +656,7 @@ Explained Query:
             ArrangeBy keys=[[#0]] // { arity: 1 }
               Project (#0) // { arity: 1 }
                 Filter (#0 <= 195) AND (#0 >= 38) // { arity: 2 }
-                  Get materialize.public.t_pk // { arity: 2 }
+                  ReadStorage materialize.public.t_pk // { arity: 2 }
             ArrangeBy keys=[[#0]] // { arity: 1 }
               Union // { arity: 1 }
                 Project (#0) // { arity: 1 }
@@ -669,7 +669,7 @@ Explained Query:
                           Get l0 // { arity: 2 }
     cte l0 =
       Filter (#0 = 1308) // { arity: 2 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 Source materialize.public.t
   filter=((#0 = 1308))
@@ -679,7 +679,7 @@ Source materialize.public.t_pk
 EOF
 
 query T multiline
-explain with(arity, join_impls) select min(a) from t where a between 38 and 195 and a = (select a from t where a = 1308);
+explain with(arity, join implementations) select min(a) from t where a between 38 and 195 and a = (select a from t where a = 1308);
 ----
 Explained Query:
   Return // { arity: 1 }
@@ -702,7 +702,7 @@ Explained Query:
             ArrangeBy keys=[[#0]] // { arity: 1 }
               Project (#0) // { arity: 1 }
                 Filter (#0 <= 195) AND (#0 >= 38) // { arity: 2 }
-                  Get materialize.public.t // { arity: 2 }
+                  ReadStorage materialize.public.t // { arity: 2 }
             ArrangeBy keys=[[#0]] // { arity: 1 }
               Union // { arity: 1 }
                 Project (#0) // { arity: 1 }
@@ -715,7 +715,7 @@ Explained Query:
                           Get l0 // { arity: 2 }
     cte l0 =
       Filter (#0 = 1308) // { arity: 2 }
-        Get materialize.public.t // { arity: 2 }
+        ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
@@ -756,31 +756,31 @@ statement ok
 create table t1 (f1 double precision, f2 double precision not null);
 
 query T multiline
-explain with(arity, join_impls) select * from t1 as a1 join t1 as a2 on (a2.f2 = (select 6 from t1)) where a2.f2 = 9;
+explain with(arity, join implementations) select * from t1 as a1 join t1 as a2 on (a2.f2 = (select 6 from t1)) where a2.f2 = 9;
 ----
 Explained Query:
   CrossJoin type=delta // { arity: 4 }
     implementation
-      %0:t1 » %2[×]UA » %1:t1[×]Aef
-      %1:t1 » %2[×]UA » %0:t1[×]A
-      %2 » %1:t1[×]Aef » %0:t1[×]A
+      %0:t1 » %2[×]U » %1:t1[×]ef
+      %1:t1 » %2[×]U » %0:t1[×]
+      %2 » %1:t1[×]ef » %0:t1[×]
     ArrangeBy keys=[[]] // { arity: 2 }
-      Get materialize.public.t1 // { arity: 2 }
+      ReadStorage materialize.public.t1 // { arity: 2 }
     ArrangeBy keys=[[]] // { arity: 2 }
       Filter (#1 = 9) // { arity: 2 }
-        Get materialize.public.t1 // { arity: 2 }
+        ReadStorage materialize.public.t1 // { arity: 2 }
     ArrangeBy keys=[[]] // { arity: 0 }
       Project () // { arity: 0 }
         Filter error("more than one record produced in subquery") AND (#0 > 1) // { arity: 1 }
           Reduce aggregates=[count(*)] // { arity: 1 }
             Project () // { arity: 0 }
-              Get materialize.public.t1 // { arity: 2 }
+              ReadStorage materialize.public.t1 // { arity: 2 }
 
 EOF
 
 # count(null) is always 0
 query T multiline
-explain with(arity, join_impls) select count(null) from t;
+explain with(arity, join implementations) select count(null) from t;
 ----
 Explained Query (fast path):
   Constant

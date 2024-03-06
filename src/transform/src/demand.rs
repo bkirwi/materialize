@@ -19,7 +19,7 @@ use mz_expr::{
 use mz_ore::stack::{CheckedRecursion, RecursionGuard};
 use mz_repr::{Datum, Row};
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Drive demand from the root through operators.
 ///
@@ -69,16 +69,15 @@ impl CheckedRecursion for Demand {
 }
 
 impl crate::Transform for Demand {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "demand")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         let result = self.action(
             relation,
@@ -138,7 +137,7 @@ impl Demand {
                     limits: _,
                     body,
                 } => {
-                    let ids_used_across_iterations = MirRelationExpr::recursive_ids(ids, values)?
+                    let ids_used_across_iterations = MirRelationExpr::recursive_ids(ids, values)
                         .iter()
                         .map(|id| Id::Local(*id))
                         .collect::<BTreeSet<_>>();
@@ -210,16 +209,14 @@ impl Demand {
                     // A FlatMap which returns zero rows acts like a filter
                     // so we always need to execute it
                     for expr in exprs {
-                        columns.extend(expr.support());
+                        expr.support_into(&mut columns);
                     }
                     columns.retain(|c| *c < input.arity());
                     self.action(input, columns, gets)
                 }
                 MirRelationExpr::Filter { input, predicates } => {
                     for predicate in predicates {
-                        for column in predicate.support() {
-                            columns.insert(column);
-                        }
+                        predicate.support_into(&mut columns)
                     }
                     self.action(input, columns, gets)
                 }
@@ -254,7 +251,7 @@ impl Demand {
                     // Each equivalence class imposes internal demand for columns.
                     for equivalence in equivalences.iter() {
                         for expr in equivalence.iter() {
-                            columns.extend(expr.support());
+                            expr.support_into(&mut columns);
                         }
                     }
 
@@ -285,13 +282,16 @@ impl Demand {
                     // Group keys determine aggregation granularity and are
                     // each crucial in determining aggregates and even the
                     // multiplicities of other keys.
-                    new_columns.extend(group_key.iter().flat_map(|e| e.support()));
+                    for k in group_key.iter() {
+                        k.support_into(&mut new_columns)
+                    }
                     for column in columns.iter() {
                         // No obvious requirements on aggregate columns.
                         // A "non-empty" requirement, I guess?
                         if *column >= group_key.len() {
-                            new_columns
-                                .extend(aggregates[*column - group_key.len()].expr.support());
+                            aggregates[*column - group_key.len()]
+                                .expr
+                                .support_into(&mut new_columns);
                         }
                     }
 
@@ -314,12 +314,20 @@ impl Demand {
                     input,
                     group_key,
                     order_key,
+                    limit,
                     ..
                 } => {
-                    // Group and order keys must be retained, as they define
-                    // which rows are retained.
+                    // Group and order keys and limit must be retained, as they
+                    // define which rows are retained.
                     columns.extend(group_key.iter().cloned());
                     columns.extend(order_key.iter().map(|o| o.column));
+                    if let Some(limit) = limit {
+                        // Strictly speaking not needed because the
+                        // `limit` support should be a subset of the
+                        // `group_key` support, but we don't want to
+                        // take this for granted here.
+                        limit.support_into(&mut columns)
+                    }
                     self.action(input, columns, gets)
                 }
                 MirRelationExpr::Negate { input } => self.action(input, columns, gets),
@@ -340,7 +348,7 @@ impl Demand {
                 MirRelationExpr::ArrangeBy { input, keys } => {
                     for key_set in keys {
                         for key in key_set {
-                            columns.extend(key.support());
+                            key.support_into(&mut columns);
                         }
                     }
                     self.action(input, columns, gets)

@@ -6,10 +6,12 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
-from typing import Set
 
 from materialize.output_consistency.data_type.data_type import DataType
 from materialize.output_consistency.data_type.data_type_category import DataTypeCategory
+from materialize.output_consistency.execution.sql_dialect_adjuster import (
+    SqlDialectAdjuster,
+)
 from materialize.output_consistency.execution.value_storage_layout import (
     ValueStorageLayout,
 )
@@ -29,9 +31,12 @@ class DataValue(LeafExpression):
         value: str,
         data_type: DataType,
         value_identifier: str,
-        characteristics: Set[ExpressionCharacteristics],
+        characteristics: set[ExpressionCharacteristics],
+        is_postgres_compatible: bool = True,
     ):
-        column_name = f"{data_type.identifier.lower()}_{value_identifier.lower()}"
+        column_name = (
+            f"{data_type.internal_identifier.lower()}_{value_identifier.lower()}"
+        )
         super().__init__(
             column_name,
             data_type,
@@ -41,6 +46,7 @@ class DataValue(LeafExpression):
             False,
         )
         self.value = value
+        self.is_postgres_compatible = is_postgres_compatible
 
     def resolve_return_type_spec(self) -> ReturnTypeSpec:
         return self.data_type.resolve_return_type_spec(self.own_characteristics)
@@ -48,12 +54,12 @@ class DataValue(LeafExpression):
     def resolve_return_type_category(self) -> DataTypeCategory:
         return self.data_type.category
 
-    def to_sql_as_value(self) -> str:
-        return self.data_type.value_to_sql(self.value)
+    def to_sql_as_value(self, sql_adjuster: SqlDialectAdjuster) -> str:
+        return self.data_type.value_to_sql(self.value, sql_adjuster)
 
     def recursively_collect_involved_characteristics(
         self, row_selection: DataRowSelection
-    ) -> Set[ExpressionCharacteristics]:
+    ) -> set[ExpressionCharacteristics]:
         return self.own_characteristics
 
     def __str__(self) -> str:

@@ -11,25 +11,28 @@
 
 use std::fmt;
 
-use chrono::NaiveDateTime;
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use differential_dataflow::lattice::Lattice;
-use mz_compute_client::controller::ComputeInstanceId;
+use mz_compute_types::ComputeInstanceId;
 use mz_expr::MirScalarExpr;
+use mz_ore::cast::CastLossy;
 use mz_repr::explain::ExprHumanizer;
 use mz_repr::{GlobalId, RowArena, ScalarType, Timestamp, TimestampManipulation};
 use mz_sql::plan::QueryWhen;
+use mz_sql::session::metadata::SessionMetadata;
 use mz_sql::session::vars::IsolationLevel;
-use mz_storage_client::types::sources::Timeline;
+use mz_storage_types::sources::Timeline;
 use serde::{Deserialize, Serialize};
 use timely::progress::frontier::AntichainRef;
 use timely::progress::{Antichain, Timestamp as TimelyTimestamp};
 use tracing::{event, Level};
 
-use crate::catalog::{Catalog, CatalogState};
-use crate::coord::dataflows::{prep_scalar_expr, ExprPrepStyle};
+use crate::catalog::CatalogState;
 use crate::coord::id_bundle::CollectionIdBundle;
 use crate::coord::timeline::TimelineContext;
 use crate::coord::Coordinator;
+use crate::optimize::dataflows::{prep_scalar_expr, ExprPrepStyle};
 use crate::session::Session;
 use crate::AdapterError;
 
@@ -37,7 +40,20 @@ use crate::AdapterError;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TimestampContext<T> {
     /// Read is executed in a specific timeline with a specific timestamp.
-    TimelineTimestamp(Timeline, T),
+    TimelineTimestamp {
+        timeline: Timeline,
+        /// The timestamp that was chosen for a read. This can differ from the
+        /// `oracle_ts` when collections are not readable at the (linearized)
+        /// timestamp for the oracle. In those cases (when the chosen timestamp
+        /// is further ahead than the oracle timestamp) we have to delay
+        /// returning peek results until the timestamp oracle is also
+        /// sufficiently advanced.
+        chosen_ts: T,
+        /// The timestamp that would have been chosen for the read by the
+        /// (linearized) timestamp oracle). In most cases this will be picked as
+        /// the `chosen_ts`.
+        oracle_ts: Option<T>,
+    },
     /// Read is execute without a timeline or timestamp.
     NoTimestamp,
 }
@@ -45,23 +61,29 @@ pub enum TimestampContext<T> {
 impl<T: TimestampManipulation> TimestampContext<T> {
     /// Creates a `TimestampContext` from a timestamp and `TimelineContext`.
     pub fn from_timeline_context(
-        ts: T,
+        chosen_ts: T,
+        oracle_ts: Option<T>,
         transaction_timeline: Option<Timeline>,
-        timeline_context: TimelineContext,
+        timeline_context: &TimelineContext,
     ) -> TimestampContext<T> {
         match timeline_context {
             TimelineContext::TimelineDependent(timeline) => {
                 if let Some(transaction_timeline) = transaction_timeline {
-                    assert_eq!(timeline, transaction_timeline);
+                    assert_eq!(timeline, &transaction_timeline);
                 }
-                Self::TimelineTimestamp(timeline, ts)
+                Self::TimelineTimestamp {
+                    timeline: timeline.clone(),
+                    chosen_ts,
+                    oracle_ts,
+                }
             }
             TimelineContext::TimestampDependent => {
                 // We default to the `Timeline::EpochMilliseconds` timeline if one doesn't exist.
-                Self::TimelineTimestamp(
-                    transaction_timeline.unwrap_or(Timeline::EpochMilliseconds),
-                    ts,
-                )
+                Self::TimelineTimestamp {
+                    timeline: transaction_timeline.unwrap_or(Timeline::EpochMilliseconds),
+                    chosen_ts,
+                    oracle_ts,
+                }
             }
             TimelineContext::TimestampIndependent => Self::NoTimestamp,
         }
@@ -69,16 +91,22 @@ impl<T: TimestampManipulation> TimestampContext<T> {
 
     /// The timeline belonging to this context, if one exists.
     pub fn timeline(&self) -> Option<&Timeline> {
-        match self {
-            Self::TimelineTimestamp(timeline, _) => Some(timeline),
-            Self::NoTimestamp => None,
-        }
+        self.timeline_timestamp().map(|tt| tt.0)
     }
 
     /// The timestamp belonging to this context, if one exists.
     pub fn timestamp(&self) -> Option<&T> {
+        self.timeline_timestamp().map(|tt| tt.1)
+    }
+
+    /// The timeline and timestamp belonging to this context, if one exists.
+    pub fn timeline_timestamp(&self) -> Option<(&Timeline, &T)> {
         match self {
-            Self::TimelineTimestamp(_, ts) => Some(ts),
+            Self::TimelineTimestamp {
+                timeline,
+                chosen_ts,
+                ..
+            } => Some((timeline, chosen_ts)),
             Self::NoTimestamp => None,
         }
     }
@@ -86,7 +114,7 @@ impl<T: TimestampManipulation> TimestampContext<T> {
     /// The timestamp belonging to this context, or a sensible default if one does not exists.
     pub fn timestamp_or_default(&self) -> T {
         match self {
-            Self::TimelineTimestamp(_, ts) => ts.clone(),
+            Self::TimelineTimestamp { chosen_ts, .. } => chosen_ts.clone(),
             // Anything without a timestamp is given the maximum possible timestamp to indicate
             // that they have been closed up until the end of time. This allows us to SUBSCRIBE to
             // static views.
@@ -105,12 +133,8 @@ impl<T: TimestampManipulation> TimestampContext<T> {
     }
 }
 
+#[async_trait(?Send)]
 impl TimestampProvider for Coordinator {
-    fn oracle_read_ts(&self, timeline: &Timeline) -> Option<Timestamp> {
-        let timestamp_oracle = self.get_timestamp_oracle(timeline);
-        Some(timestamp_oracle.read_ts())
-    }
-
     /// Reports a collection's current read frontier.
     fn compute_read_frontier<'a>(
         &'a self,
@@ -181,6 +205,7 @@ impl TimestampProvider for Coordinator {
     }
 }
 
+#[async_trait(?Send)]
 pub trait TimestampProvider {
     fn compute_read_frontier<'a>(
         &'a self,
@@ -202,7 +227,48 @@ pub trait TimestampProvider {
     fn storage_implied_capability<'a>(&'a self, id: GlobalId) -> &'a Antichain<Timestamp>;
     fn storage_write_frontier<'a>(&'a self, id: GlobalId) -> &'a Antichain<Timestamp>;
 
-    fn oracle_read_ts(&self, timeline: &Timeline) -> Option<Timestamp>;
+    fn get_timeline(timeline_context: &TimelineContext) -> Option<Timeline> {
+        let timeline = match timeline_context {
+            TimelineContext::TimelineDependent(timeline) => Some(timeline.clone()),
+            // We default to the `Timeline::EpochMilliseconds` timeline if one doesn't exist.
+            TimelineContext::TimestampDependent => Some(Timeline::EpochMilliseconds),
+            TimelineContext::TimestampIndependent => None,
+        };
+
+        timeline
+    }
+
+    /// Returns a `Timeline` whose timestamp oracle we have to use to get a
+    /// linearized read timestamp, _iff_ linearization is needed.
+    fn get_linearized_timeline(
+        isolation_level: &IsolationLevel,
+        when: &QueryWhen,
+        timeline_context: &TimelineContext,
+    ) -> Option<Timeline> {
+        let timeline = Self::get_timeline(timeline_context);
+
+        // In order to use a timestamp oracle, we must be in the context of some timeline. In that
+        // context we would use the timestamp oracle in the following scenarios:
+        // - The isolation level is Strict Serializable and the `when` allows us to use the
+        //   the timestamp oracle (ex: queries with no AS OF).
+        // - The `when` requires us to use the timestamp oracle (ex: read-then-write queries).
+        let linearized_timeline = match &timeline {
+            Some(timeline)
+                if when.must_advance_to_timeline_ts()
+                    || (when.can_advance_to_timeline_ts()
+                        && matches!(
+                            isolation_level,
+                            IsolationLevel::StrictSerializable
+                                | IsolationLevel::StrongSessionSerializable
+                        )) =>
+            {
+                Some(timeline.clone())
+            }
+            _ => None,
+        };
+
+        linearized_timeline
+    }
 
     /// Determines the timestamp for a query.
     ///
@@ -211,15 +277,17 @@ pub trait TimestampProvider {
     /// after `since` and sure to be available not after `upper`.
     ///
     /// The timeline that `id_bundle` belongs to is also returned, if one exists.
-    fn determine_timestamp_for(
+    async fn determine_timestamp_for(
         &self,
         catalog: &CatalogState,
         session: &Session,
         id_bundle: &CollectionIdBundle,
         when: &QueryWhen,
         compute_instance: ComputeInstanceId,
-        timeline_context: TimelineContext,
+        timeline_context: &TimelineContext,
+        oracle_read_ts: Option<Timestamp>,
         real_time_recency_ts: Option<mz_repr::Timestamp>,
+        isolation_level: &IsolationLevel,
     ) -> Result<TimestampDetermination<mz_repr::Timestamp>, AdapterError> {
         // Each involved trace has a validity interval `[since, upper)`.
         // The contents of a trace are only guaranteed to be correct when
@@ -237,134 +305,139 @@ pub trait TimestampProvider {
         let upper = self.least_valid_write(id_bundle);
         let largest_not_in_advance_of_upper = Coordinator::largest_not_in_advance_of_upper(&upper);
 
-        let isolation_level = session.vars().transaction_isolation();
-        let in_immediate_multi_statement_txn = when == &QueryWhen::Immediately
-            && session.transaction().is_in_multi_statement_transaction();
-        let timeline = match &timeline_context {
-            TimelineContext::TimelineDependent(timeline) => Some(timeline.clone()),
-            // We default to the `Timeline::EpochMilliseconds` timeline if one doesn't exist.
-            TimelineContext::TimestampDependent => Some(Timeline::EpochMilliseconds),
-            TimelineContext::TimestampIndependent => None,
-        };
-
-        // In order to use a timestamp oracle, we must be in the context of some timeline. In that
-        // context we would use the timestamp oracle in the following scenarios:
-        // - The isolation level is Strict Serializable and the `when` allows us to use the
-        //   the timestamp oracle (ex: queries with no AS OF).
-        // - The `when` requires us to use the timestamp oracle (ex: read-then-write queries).
-        let oracle_read_ts = match &timeline {
-            Some(timeline)
-                if when.must_advance_to_timeline_ts()
-                    || (when.can_advance_to_timeline_ts()
-                        && isolation_level == &IsolationLevel::StrictSerializable) =>
-            {
-                self.oracle_read_ts(timeline)
-            }
-            _ => None,
-        };
-
-        // For transactions that do not use `AS OF`, get the timestamp context of the
-        // in-progress transaction if one exists.
+        let timeline = Self::get_timeline(timeline_context);
+        let linearized_timeline =
+            Self::get_linearized_timeline(isolation_level, when, timeline_context);
+        // TODO: We currently split out getting the oracle timestamp because
+        // it's a potentially expensive call, but a call that can be done in an
+        // async task. TimestampProvider is not Send (nor Sync), so we cannot do
+        // the call to `determine_timestamp_for` (including the oracle call) on
+        // an async task. If/when TimestampProvider can become Send, we can fold
+        // the call to the TimestampOracle back into this function.
         //
-        // If one does not exist, it implies that the query is the first in a multi-statment transaction
-        // or the only one in a single-statement transaction (i.e. a `TransactionStatus::Started` txn).
-        // In either case, we determine a timestamp for the query.
-        //
-        // If the query does use `AS OF`, we disregard the timestamp context of the
-        // in-progress transaction as its explicitly provided by the client.
-        let det = match session.get_transaction_timestamp_context() {
-            Some(timestamp_context @ TimestampContext::TimelineTimestamp(_, _))
-                if in_immediate_multi_statement_txn =>
+        // We assert here that the logic that determines the oracle timestamp
+        // matches our expectations.
+        if linearized_timeline.is_some() {
+            assert!(
+                oracle_read_ts.is_some(),
+                "should get a timestamp from the oracle for linearized timeline {:?} but didn't",
+                timeline
+            );
+        }
+
+        // Initialize candidate to the minimum correct time.
+        let mut candidate = Timestamp::minimum();
+
+        if let Some(timestamp) = when.advance_to_timestamp() {
+            let ts = Coordinator::evaluate_when(catalog, timestamp, session)?;
+            candidate.join_assign(&ts);
+        }
+
+        if when.advance_to_since() {
+            candidate.advance_by(since.borrow());
+        }
+
+        // If we've acquired a read timestamp from the timestamp oracle, use it
+        // as the new lower bound for the candidate.
+        // In Strong Session Serializable, we ignore the oracle timestamp for now, unless we need
+        // to use it.
+        if let Some(timestamp) = &oracle_read_ts {
+            if isolation_level != &IsolationLevel::StrongSessionSerializable
+                || when.must_advance_to_timeline_ts()
             {
-                TimestampDetermination {
-                    timestamp_context,
-                    since,
-                    upper,
-                    largest_not_in_advance_of_upper,
-                    oracle_read_ts: None,
-                }
+                candidate.join_assign(timestamp);
             }
-            _ => {
-                // Initialize candidate to the minimum correct time.
-                let mut candidate = Timestamp::minimum();
+        }
 
-                if let Some(timestamp) = when.advance_to_timestamp() {
-                    let ts = Coordinator::evaluate_when(catalog, timestamp, session)?;
-                    candidate.join_assign(&ts);
-                }
+        // We advance to the upper in the following scenarios:
+        // - The isolation level is Serializable and the `when` allows us to advance to upper (ex:
+        //   queries with no AS OF). We avoid using the upper in Strict Serializable to prevent
+        //   reading source data that is being written to in the future.
+        // - The isolation level is Strict Serializable but there is no timelines and the `when`
+        //   allows us to advance to upper.
+        if when.can_advance_to_upper()
+            && (isolation_level == &IsolationLevel::Serializable || timeline.is_none())
+        {
+            candidate.join_assign(&largest_not_in_advance_of_upper);
+        }
 
-                if when.advance_to_since() {
-                    candidate.advance_by(since.borrow());
-                }
-
-                // If we've acquired a read timestamp from the timestamp oracle, use it
-                // as the new lower bound for the candidate
-                if let Some(timestamp) = &oracle_read_ts {
-                    candidate.join_assign(timestamp);
-                }
-
-                // We advance to the upper in the following scenarios:
-                // - The isolation level is Serializable and the `when` allows us to advance to upper (ex:
-                //   queries with no AS OF). We avoid using the upper in Strict Serializable to prevent
-                //   reading source data that is being written to in the future.
-                // - The isolation level is Strict Serializable but there is no timelines and the `when`
-                //   allows us to advance to upper.
-                // - The `when` requires us to advance to the upper (ex: read-then-write queries).
-                if when.must_advance_to_upper()
-                    || (when.can_advance_to_upper()
-                        && (isolation_level == &IsolationLevel::Serializable || timeline.is_none()))
-                {
-                    candidate.join_assign(&largest_not_in_advance_of_upper);
-                }
-
-                if let Some(real_time_recency_ts) = real_time_recency_ts {
-                    assert!(
-                        session.vars().real_time_recency()
-                            && isolation_level == &IsolationLevel::StrictSerializable,
-                        "real time recency timestamp should only be supplied when real time recency \
+        if let Some(real_time_recency_ts) = real_time_recency_ts {
+            assert!(
+                session.vars().real_time_recency()
+                    && isolation_level == &IsolationLevel::StrictSerializable,
+                "real time recency timestamp should only be supplied when real time recency \
                             is enabled and the isolation level is strict serializable"
-                    );
-                    candidate.join_assign(&real_time_recency_ts);
-                }
+            );
+            candidate.join_assign(&real_time_recency_ts);
+        }
 
-                // If the timestamp is greater or equal to some element in `since` we are
-                // assured that the answer will be correct.
-                //
-                // It's ok for this timestamp to be larger than the current timestamp of
-                // the timestamp oracle. For Strict Serializable queries, the Coord will
-                // linearize the query by holding back the result until the timestamp
-                // oracle catches up.
-                let timestamp = if since.less_equal(&candidate) {
-                    event!(
-                        Level::DEBUG,
-                        conn_id = format!("{}", session.conn_id()),
-                        since = format!("{since:?}"),
-                        largest_not_in_advance_of_upper =
-                            format!("{largest_not_in_advance_of_upper}"),
-                        timestamp = format!("{candidate}")
-                    );
-                    candidate
-                } else {
-                    coord_bail!(self.generate_timestamp_not_valid_error_msg(
-                        id_bundle,
-                        compute_instance,
-                        candidate
-                    ));
-                };
-
-                let timestamp_context =
-                    TimestampContext::from_timeline_context(timestamp, timeline, timeline_context);
-
-                TimestampDetermination {
-                    timestamp_context,
-                    since,
-                    upper,
-                    largest_not_in_advance_of_upper,
-                    oracle_read_ts,
+        let mut session_oracle_read_ts = None;
+        if isolation_level == &IsolationLevel::StrongSessionSerializable {
+            if let Some(timeline) = &timeline {
+                if let Some(oracle) = session.get_timestamp_oracle(timeline) {
+                    let session_ts = oracle.read_ts();
+                    candidate.join_assign(&session_ts);
+                    session_oracle_read_ts = Some(session_ts);
                 }
             }
+
+            // When advancing the read timestamp under Strong Session Serializable, there is a
+            // trade-off to make between freshness and latency. We can choose a timestamp close the
+            // `upper`, but then later queries might block if the `upper` is too far into the
+            // future. We can chose a timestamp close to the current time, but then we may not be
+            // getting results that are as fresh as possible. As a heuristic, we choose the minimum
+            // of now and the upper, where we use the global timestamp oracle read timestamp as a
+            // proxy for now. If upper > now, then we choose now and prevent blocking future
+            // queries. If upper < now, then we choose the upper and prevent blocking the current
+            // query.
+            if when.can_advance_to_upper() && when.can_advance_to_timeline_ts() {
+                let mut advance_to = largest_not_in_advance_of_upper;
+                if let Some(oracle_read_ts) = oracle_read_ts {
+                    advance_to = std::cmp::min(advance_to, oracle_read_ts);
+                }
+                candidate.join_assign(&advance_to);
+            }
+        }
+
+        // If the timestamp is greater or equal to some element in `since` we are
+        // assured that the answer will be correct.
+        //
+        // It's ok for this timestamp to be larger than the current timestamp of
+        // the timestamp oracle. For Strict Serializable queries, the Coord will
+        // linearize the query by holding back the result until the timestamp
+        // oracle catches up.
+        let timestamp = if since.less_equal(&candidate) {
+            event!(
+                Level::DEBUG,
+                conn_id = format!("{}", session.conn_id()),
+                since = format!("{since:?}"),
+                largest_not_in_advance_of_upper = format!("{largest_not_in_advance_of_upper}"),
+                timestamp = format!("{candidate}")
+            );
+            candidate
+        } else {
+            coord_bail!(self.generate_timestamp_not_valid_error_msg(
+                id_bundle,
+                compute_instance,
+                candidate
+            ));
         };
-        Ok(det)
+
+        let timestamp_context = TimestampContext::from_timeline_context(
+            timestamp,
+            oracle_read_ts,
+            timeline,
+            timeline_context,
+        );
+
+        Ok(TimestampDetermination {
+            timestamp_context,
+            since,
+            upper,
+            largest_not_in_advance_of_upper,
+            oracle_read_ts,
+            session_oracle_read_ts,
+        })
     }
 
     /// The smallest common valid read frontier among the specified collections.
@@ -404,6 +477,16 @@ pub trait TimestampProvider {
             }
         }
         since
+    }
+
+    /// Returns `least_valid_write` - 1, i.e., each time in `least_valid_write` stepped back in a
+    /// saturating way.
+    fn greatest_available_read(&self, id_bundle: &CollectionIdBundle) -> Antichain<Timestamp> {
+        let mut frontier = Antichain::new();
+        for t in self.least_valid_write(id_bundle) {
+            frontier.insert(t.step_back().unwrap_or(t));
+        }
+        frontier
     }
 
     fn generate_timestamp_not_valid_error_msg(
@@ -448,26 +531,52 @@ pub trait TimestampProvider {
 }
 
 impl Coordinator {
+    pub(crate) async fn oracle_read_ts(
+        &self,
+        session: &Session,
+        timeline_ctx: &TimelineContext,
+        when: &QueryWhen,
+    ) -> Option<Timestamp> {
+        let isolation_level = session.vars().transaction_isolation().clone();
+        let linearized_timeline =
+            Coordinator::get_linearized_timeline(&isolation_level, when, timeline_ctx);
+        let oracle_read_ts = match linearized_timeline {
+            Some(timeline) => {
+                let timestamp_oracle = self.get_timestamp_oracle(&timeline);
+                Some(timestamp_oracle.read_ts().await)
+            }
+            None => None,
+        };
+
+        oracle_read_ts
+    }
+
     /// Determines the timestamp for a query.
-    pub(crate) fn determine_timestamp(
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn determine_timestamp(
         &self,
         session: &Session,
         id_bundle: &CollectionIdBundle,
         when: &QueryWhen,
         compute_instance: ComputeInstanceId,
-        timeline_context: TimelineContext,
+        timeline_context: &TimelineContext,
+        oracle_read_ts: Option<Timestamp>,
         real_time_recency_ts: Option<mz_repr::Timestamp>,
     ) -> Result<TimestampDetermination<mz_repr::Timestamp>, AdapterError> {
-        let det = self.determine_timestamp_for(
-            self.catalog().state(),
-            session,
-            id_bundle,
-            when,
-            compute_instance,
-            timeline_context,
-            real_time_recency_ts,
-        )?;
         let isolation_level = session.vars().transaction_isolation();
+        let det = self
+            .determine_timestamp_for(
+                self.catalog().state(),
+                session,
+                id_bundle,
+                when,
+                compute_instance,
+                timeline_context,
+                oracle_read_ts,
+                real_time_recency_ts,
+                isolation_level,
+            )
+            .await?;
         self.metrics
             .determine_timestamp
             .with_label_values(&[
@@ -479,6 +588,34 @@ impl Coordinator {
                 &compute_instance.to_string(),
             ])
             .inc();
+        if !det.respond_immediately()
+            && isolation_level == &IsolationLevel::StrictSerializable
+            && real_time_recency_ts.is_none()
+        {
+            if let Some(strict) = det.timestamp_context.timestamp() {
+                let serializable_det = self
+                    .determine_timestamp_for(
+                        self.catalog().state(),
+                        session,
+                        id_bundle,
+                        when,
+                        compute_instance,
+                        timeline_context,
+                        oracle_read_ts,
+                        real_time_recency_ts,
+                        &IsolationLevel::Serializable,
+                    )
+                    .await?;
+                if let Some(serializable) = serializable_det.timestamp_context.timestamp() {
+                    self.metrics
+                        .timestamp_difference_for_strict_serializable_ms
+                        .with_label_values(&[&compute_instance.to_string()])
+                        .observe(f64::cast_lossy(u64::from(
+                            strict.saturating_sub(*serializable),
+                        )));
+                }
+            }
+        }
         Ok(det)
     }
 
@@ -510,7 +647,7 @@ impl Coordinator {
         session: &Session,
     ) -> Result<mz_repr::Timestamp, AdapterError> {
         let temp_storage = RowArena::new();
-        prep_scalar_expr(catalog, &mut timestamp, ExprPrepStyle::AsOfUpTo)?;
+        prep_scalar_expr(&mut timestamp, ExprPrepStyle::AsOfUpTo)?;
         let evaled = timestamp.eval(&[], &temp_storage)?;
         if evaled.is_null() {
             coord_bail!("can't use {} as a mz_timestamp for AS OF or UP TO", evaled);
@@ -528,18 +665,22 @@ impl Coordinator {
             ScalarType::UInt16 => u64::from(evaled.unwrap_uint16()).into(),
             ScalarType::UInt32 => u64::from(evaled.unwrap_uint32()).into(),
             ScalarType::UInt64 => evaled.unwrap_uint64().into(),
-            ScalarType::TimestampTz => evaled.unwrap_timestamptz().timestamp_millis().try_into()?,
-            ScalarType::Timestamp => evaled.unwrap_timestamp().timestamp_millis().try_into()?,
+            ScalarType::TimestampTz { .. } => {
+                evaled.unwrap_timestamptz().timestamp_millis().try_into()?
+            }
+            ScalarType::Timestamp { .. } => {
+                evaled.unwrap_timestamp().timestamp_millis().try_into()?
+            }
             _ => coord_bail!(
                 "can't use {} as a mz_timestamp for AS OF or UP TO",
-                Catalog::for_session_state(catalog, session).humanize_column_type(&ty)
+                catalog.for_session(session).humanize_column_type(&ty)
             ),
         })
     }
 }
 
 /// Information used when determining the timestamp for a query.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TimestampDetermination<T> {
     /// The chosen timestamp context from `determine_timestamp`.
     pub timestamp_context: TimestampContext<T>,
@@ -551,27 +692,35 @@ pub struct TimestampDetermination<T> {
     pub largest_not_in_advance_of_upper: T,
     /// The value of the timeline's oracle timestamp, if used.
     pub oracle_read_ts: Option<T>,
+    /// The value of the session local timestamp's oracle timestamp, if used.
+    pub session_oracle_read_ts: Option<T>,
 }
 
 impl<T: TimestampManipulation> TimestampDetermination<T> {
     pub fn respond_immediately(&self) -> bool {
         match &self.timestamp_context {
-            TimestampContext::TimelineTimestamp(_, timestamp) => !self.upper.less_equal(timestamp),
+            TimestampContext::TimelineTimestamp { chosen_ts, .. } => {
+                !self.upper.less_equal(chosen_ts)
+            }
             TimestampContext::NoTimestamp => true,
         }
     }
 }
 
 /// Information used when determining the timestamp for a query.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TimestampExplanation<T> {
     /// The chosen timestamp from `determine_timestamp`.
     pub determination: TimestampDetermination<T>,
     /// Details about each source.
     pub sources: Vec<TimestampSource<T>>,
+    /// Wall time of first statement executed in this transaction
+    pub session_wall_time: DateTime<Utc>,
+    /// Cached value of determination.respond_immediately()
+    pub respond_immediately: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TimestampSource<T> {
     pub name: String,
     pub read_frontier: Vec<T>,
@@ -641,6 +790,13 @@ impl<T: fmt::Display + fmt::Debug + DisplayableInTimeline + TimestampManipulatio
                 oracle_read_ts.display(timeline)
             )?;
         }
+        if let Some(session_oracle_read_ts) = &self.determination.session_oracle_read_ts {
+            writeln!(
+                f,
+                "  session oracle read timestamp: {}",
+                session_oracle_read_ts.display(timeline)
+            )?;
+        }
         writeln!(
             f,
             "largest not in advance of upper: {}",
@@ -669,9 +825,15 @@ impl<T: fmt::Display + fmt::Debug + DisplayableInTimeline + TimestampManipulatio
         writeln!(
             f,
             "        can respond immediately: {}",
-            self.determination.respond_immediately()
+            self.respond_immediately
         )?;
         writeln!(f, "                       timeline: {:?}", &timeline)?;
+        writeln!(
+            f,
+            "              session wall time: {:13} ({})",
+            self.session_wall_time.naive_local().timestamp_millis(),
+            self.session_wall_time.format("%Y-%m-%d %H:%M:%S%.3f"),
+        )?;
 
         for source in &self.sources {
             writeln!(f, "")?;

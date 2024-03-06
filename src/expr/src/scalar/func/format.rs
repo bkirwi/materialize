@@ -135,7 +135,7 @@ enum DateTimeToken {
 impl DateTimeToken {
     /// Returns the literal sequence of characters that this `DateTimeToken`
     /// matches.
-    fn pattern(&self) -> &'static str {
+    const fn pattern(&self) -> &'static str {
         match self {
             DateTimeToken::AD => "AD",
             DateTimeToken::ad => "ad",

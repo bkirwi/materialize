@@ -20,23 +20,22 @@ pub mod union;
 
 use mz_expr::MirRelationExpr;
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Fuses multiple like operators together when possible.
 #[derive(Debug)]
 pub struct Fusion;
 
 impl crate::Transform for Fusion {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "fusion")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         use mz_expr::visit::Visit;
         relation.visit_mut_post(&mut Self::action)?;

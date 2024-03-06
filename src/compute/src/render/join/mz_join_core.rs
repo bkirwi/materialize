@@ -38,6 +38,7 @@
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use differential_dataflow::consolidation::consolidate_updates;
 use differential_dataflow::difference::Multiply;
@@ -45,8 +46,9 @@ use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::arrange::arrangement::Arranged;
 use differential_dataflow::trace::{BatchReader, Cursor, TraceReader};
 use differential_dataflow::{AsCollection, Collection, Data};
-use mz_repr::{Diff, Row};
+use mz_repr::Diff;
 use timely::dataflow::channels::pact::Pipeline;
+use timely::dataflow::channels::pushers::buffer::Session;
 use timely::dataflow::channels::pushers::Tee;
 use timely::dataflow::operators::generic::OutputHandle;
 use timely::dataflow::operators::{Capability, Operator};
@@ -54,25 +56,33 @@ use timely::dataflow::Scope;
 use timely::progress::timestamp::Timestamp;
 use timely::scheduling::Activator;
 use timely::PartialOrder;
+use tracing::trace;
+
+use crate::render::context::ShutdownToken;
 
 /// Joins two arranged collections with the same key type.
 ///
 /// Each matching pair of records `(key, val1)` and `(key, val2)` are subjected to the `result` function,
 /// which produces something implementing `IntoIterator`, where the output collection will have an entry for
 /// every value returned by the iterator.
-pub(super) fn mz_join_core<G, Tr1, Tr2, L, I>(
+pub(super) fn mz_join_core<G, Tr1, Tr2, L, I, YFn>(
     arranged1: &Arranged<G, Tr1>,
     arranged2: &Arranged<G, Tr2>,
+    shutdown_token: ShutdownToken,
     mut result: L,
+    yield_fn: YFn,
 ) -> Collection<G, I::Item, Diff>
 where
     G: Scope,
     G::Timestamp: Lattice,
-    Tr1: TraceReader<Key = Row, Val = Row, Time = G::Timestamp, R = Diff> + Clone + 'static,
-    Tr2: TraceReader<Key = Row, Val = Row, Time = G::Timestamp, R = Diff> + Clone + 'static,
-    L: FnMut(&Tr1::Key, &Tr1::Val, &Tr2::Val) -> I + 'static,
+    Tr1: TraceReader<Time = G::Timestamp, Diff = Diff> + Clone + 'static,
+    Tr2: for<'a> TraceReader<Key<'a> = Tr1::Key<'a>, Time = G::Timestamp, Diff = Diff>
+        + Clone
+        + 'static,
+    L: FnMut(Tr1::Key<'_>, Tr1::Val<'_>, Tr2::Val<'_>) -> I + 'static,
     I: IntoIterator,
     I::Item: Data,
+    YFn: Fn(Instant, usize) -> bool + 'static,
 {
     let mut trace1 = arranged1.trace.clone();
     let mut trace2 = arranged2.trace.clone();
@@ -85,6 +95,8 @@ where
             Pipeline,
             "Join",
             move |capability, info| {
+                let operator_id = info.global_id;
+
                 // Acquire an activator to reschedule the operator when it has unfinished work.
                 let activations = arranged1.stream.scope().activations();
                 let activator = Activator::new(&info.address[..], activations);
@@ -109,6 +121,15 @@ where
 
                 // We'll unload the initial batches here, to put ourselves in a less non-deterministic state to start.
                 trace1.map_batches(|batch1| {
+                    trace!(
+                        operator_id,
+                        input = 1,
+                        lower = ?batch1.lower().elements(),
+                        upper = ?batch1.upper().elements(),
+                        size = batch1.len(),
+                        "pre-loading batch",
+                    );
+
                     acknowledged1.clone_from(batch1.upper());
                     // No `todo1` work here, because we haven't accepted anything into `batches2` yet.
                     // It is effectively "empty", because we choose to drain `trace1` before `trace2`.
@@ -125,10 +146,26 @@ where
                     &acknowledged1.borrow()
                 ));
 
+                trace!(
+                    operator_id,
+                    input = 1,
+                    acknowledged1 = ?acknowledged1.elements(),
+                    "pre-loading finished",
+                );
+
                 // We capture batch2 cursors first and establish work second to avoid taking a `RefCell` lock
                 // on both traces at the same time, as they could be the same trace and this would panic.
                 let mut batch2_cursors = Vec::new();
                 trace2.map_batches(|batch2| {
+                    trace!(
+                        operator_id,
+                        input = 2,
+                        lower = ?batch2.lower().elements(),
+                        upper = ?batch2.upper().elements(),
+                        size = batch2.len(),
+                        "pre-loading batch",
+                    );
+
                     acknowledged2.clone_from(batch2.upper());
                     batch2_cursors.push((batch2.cursor(), batch2.clone()));
                 });
@@ -143,6 +180,13 @@ where
 
                 // Load up deferred work using trace2 cursors and batches captured just above.
                 for (batch2_cursor, batch2) in batch2_cursors.into_iter() {
+                    trace!(
+                        operator_id,
+                        input = 2,
+                        acknowledged1 = ?acknowledged1.elements(),
+                        "deferring work for batch",
+                    );
+
                     // It is safe to ask for `ack1` because we have confirmed it to be in advance of `distinguish_since`.
                     let (trace1_cursor, trace1_storage) =
                         trace1.cursor_through(acknowledged1.borrow()).unwrap();
@@ -159,6 +203,13 @@ where
                     ));
                 }
 
+                trace!(
+                    operator_id,
+                    input = 2,
+                    acknowledged2 = ?acknowledged2.elements(),
+                    "pre-loading finished",
+                );
+
                 // Droppable handles to shared trace data structures.
                 let mut trace1_option = Some(trace1);
                 let mut trace2_option = Some(trace2);
@@ -168,6 +219,25 @@ where
                 let mut input2_buffer = Vec::new();
 
                 move |input1, input2, output| {
+                    // If the dataflow is shutting down, discard all existing and future work.
+                    if shutdown_token.in_shutdown() {
+                        trace!(operator_id, "shutting down");
+
+                        // Discard data at the inputs.
+                        input1.for_each(|_cap, _data| ());
+                        input2.for_each(|_cap, _data| ());
+
+                        // Discard queued work.
+                        todo1 = Default::default();
+                        todo2 = Default::default();
+
+                        // Stop holding on to input traces.
+                        trace1_option = None;
+                        trace2_option = None;
+
+                        return;
+                    }
+
                     // 1. Consuming input.
                     //
                     // The join computation repeatedly accepts batches of updates from each of its inputs.
@@ -191,7 +261,23 @@ where
                         for batch1 in input1_buffer.drain(..) {
                             // Ignore any pre-loaded data.
                             if PartialOrder::less_equal(&acknowledged1, batch1.lower()) {
+                                trace!(
+                                    operator_id,
+                                    input = 1,
+                                    lower = ?batch1.lower().elements(),
+                                    upper = ?batch1.upper().elements(),
+                                    size = batch1.len(),
+                                    "loading batch",
+                                );
+
                                 if !batch1.is_empty() {
+                                    trace!(
+                                        operator_id,
+                                        input = 1,
+                                        acknowledged2 = ?acknowledged2.elements(),
+                                        "deferring work for batch",
+                                    );
+
                                     // It is safe to ask for `ack2` as we validated that it was at least `get_physical_compaction()`
                                     // at start-up, and have held back physical compaction ever since.
                                     let (trace2_cursor, trace2_storage) =
@@ -214,6 +300,13 @@ where
                                     batch1.upper()
                                 ));
                                 acknowledged1.clone_from(batch1.upper());
+
+                                trace!(
+                                    operator_id,
+                                    input = 1,
+                                    acknowledged1 = ?acknowledged1.elements(),
+                                    "batch acknowledged",
+                                );
                             }
                         }
                     });
@@ -228,7 +321,23 @@ where
                         for batch2 in input2_buffer.drain(..) {
                             // Ignore any pre-loaded data.
                             if PartialOrder::less_equal(&acknowledged2, batch2.lower()) {
+                                trace!(
+                                    operator_id,
+                                    input = 2,
+                                    lower = ?batch2.lower().elements(),
+                                    upper = ?batch2.upper().elements(),
+                                    size = batch2.len(),
+                                    "loading batch",
+                                );
+
                                 if !batch2.is_empty() {
+                                    trace!(
+                                        operator_id,
+                                        input = 2,
+                                        acknowledged1 = ?acknowledged1.elements(),
+                                        "deferring work for batch",
+                                    );
+
                                     // It is safe to ask for `ack1` as we validated that it was at least `get_physical_compaction()`
                                     // at start-up, and have held back physical compaction ever since.
                                     let (trace1_cursor, trace1_storage) =
@@ -251,15 +360,34 @@ where
                                     batch2.upper()
                                 ));
                                 acknowledged2.clone_from(batch2.upper());
+
+                                trace!(
+                                    operator_id,
+                                    input = 2,
+                                    acknowledged2 = ?acknowledged2.elements(),
+                                    "batch acknowledged",
+                                );
                             }
                         }
                     });
 
                     // Advance acknowledged frontiers through any empty regions that we may not receive as batches.
                     if let Some(trace1) = trace1_option.as_mut() {
+                        trace!(
+                            operator_id,
+                            input = 1,
+                            acknowledged1 = ?acknowledged1.elements(),
+                            "advancing trace upper",
+                        );
                         trace1.advance_upper(&mut acknowledged1);
                     }
                     if let Some(trace2) = trace2_option.as_mut() {
+                        trace!(
+                            operator_id,
+                            input = 2,
+                            acknowledged2 = ?acknowledged2.elements(),
+                            "advancing trace upper",
+                        );
                         trace2.advance_upper(&mut acknowledged2);
                     }
 
@@ -274,28 +402,66 @@ where
                     // input must scan all batches from the other input).
 
                     // Perform some amount of outstanding work.
-                    let mut fuel = 1_000_000;
-                    while !todo1.is_empty() && fuel > 0 {
-                        todo1
-                            .front_mut()
-                            .unwrap()
-                            .work(output, &mut result, &mut fuel);
+                    trace!(
+                        operator_id,
+                        input = 1,
+                        work_left = todo1.len(),
+                        "starting work",
+                    );
+
+                    let start_time = Instant::now();
+                    let mut work = 0;
+                    while !todo1.is_empty() && !yield_fn(start_time, work) {
+                        todo1.front_mut().unwrap().work(
+                            output,
+                            &mut result,
+                            |w| yield_fn(start_time, w),
+                            &mut work,
+                        );
                         if !todo1.front().unwrap().work_remains() {
                             todo1.pop_front();
                         }
                     }
 
+                    trace!(
+                        operator_id,
+                        input = 1,
+                        work_left = todo1.len(),
+                        work_done = work,
+                        elapsed = ?start_time.elapsed(),
+                        "ceasing work",
+                    );
+
                     // Perform some amount of outstanding work.
-                    let mut fuel = 1_000_000;
-                    while !todo2.is_empty() && fuel > 0 {
-                        todo2
-                            .front_mut()
-                            .unwrap()
-                            .work(output, &mut result, &mut fuel);
+                    trace!(
+                        operator_id,
+                        input = 2,
+                        work_left = todo2.len(),
+                        "starting work",
+                    );
+
+                    let start_time = Instant::now();
+                    let mut work = 0;
+                    while !todo2.is_empty() && !yield_fn(start_time, work) {
+                        todo2.front_mut().unwrap().work(
+                            output,
+                            &mut result,
+                            |w| yield_fn(start_time, w),
+                            &mut work,
+                        );
                         if !todo2.front().unwrap().work_remains() {
                             todo2.pop_front();
                         }
                     }
+
+                    trace!(
+                        operator_id,
+                        input = 2,
+                        work_left = todo2.len(),
+                        work_done = work,
+                        elapsed = ?start_time.elapsed(),
+                        "ceasing work",
+                    );
 
                     // Re-activate operator if work remains.
                     if !todo1.is_empty() || !todo2.is_empty() {
@@ -314,8 +480,17 @@ where
                     // Maintain `trace1`. Drop if `input2` is empty, or advance based on future needs.
                     if let Some(trace1) = trace1_option.as_mut() {
                         if input2.frontier().is_empty() {
+                            trace!(operator_id, input = 1, "dropping trace handle");
                             trace1_option = None;
                         } else {
+                            trace!(
+                                operator_id,
+                                input = 1,
+                                logical = ?*input2.frontier().frontier(),
+                                physical = ?acknowledged1.elements(),
+                                "advancing trace compaction",
+                            );
+
                             // Allow `trace1` to compact logically up to the frontier we may yet receive,
                             // in the opposing input (`input2`). All `input2` times will be beyond this
                             // frontier, and joined times only need to be accurate when advanced to it.
@@ -330,8 +505,17 @@ where
                     // Maintain `trace2`. Drop if `input1` is empty, or advance based on future needs.
                     if let Some(trace2) = trace2_option.as_mut() {
                         if input1.frontier().is_empty() {
+                            trace!(operator_id, input = 2, "dropping trace handle");
                             trace2_option = None;
                         } else {
+                            trace!(
+                                operator_id,
+                                input = 2,
+                                logical = ?*input1.frontier().frontier(),
+                                physical = ?acknowledged2.elements(),
+                                "advancing trace compaction",
+                            );
+
                             // Allow `trace2` to compact logically up to the frontier we may yet receive,
                             // in the opposing input (`input1`). All `input1` times will be beyond this
                             // frontier, and joined times only need to be accurate when advanced to it.
@@ -356,8 +540,8 @@ where
 struct Deferred<T, C1, C2, D>
 where
     T: Timestamp,
-    C1: Cursor<Key = Row, Val = Row, Time = T, R = Diff>,
-    C2: Cursor<Key = Row, Val = Row, Time = T, R = Diff>,
+    C1: Cursor<Time = T, Diff = Diff>,
+    C2: for<'a> Cursor<Key<'a> = C1::Key<'a>, Time = T, Diff = Diff>,
 {
     cursor1: C1,
     storage1: C1::Storage,
@@ -371,8 +555,8 @@ where
 impl<T, C1, C2, D> Deferred<T, C1, C2, D>
 where
     T: Timestamp + Lattice,
-    C1: Cursor<Key = Row, Val = Row, Time = T, R = Diff>,
-    C2: Cursor<Key = Row, Val = Row, Time = T, R = Diff>,
+    C1: Cursor<Time = T, Diff = Diff>,
+    C2: for<'a> Cursor<Key<'a> = C1::Key<'a>, Time = T, Diff = Diff>,
     D: Data,
 {
     fn new(
@@ -398,14 +582,16 @@ where
     }
 
     /// Process keys until at least `fuel` output tuples produced, or the work is exhausted.
-    fn work<L, I>(
+    fn work<L, I, YFn>(
         &mut self,
         output: &mut OutputHandle<T, (D, T, Diff), Tee<T, (D, T, Diff)>>,
         mut result: L,
-        fuel: &mut usize,
+        yield_fn: YFn,
+        work: &mut usize,
     ) where
         I: IntoIterator<Item = D>,
-        L: FnMut(&C1::Key, &C1::Val, &C2::Val) -> I,
+        L: FnMut(C1::Key<'_>, C1::Val<'_>, C2::Val<'_>) -> I,
+        YFn: Fn(usize) -> bool,
     {
         let meet = self.capability.time();
 
@@ -419,14 +605,24 @@ where
 
         let temp = &mut self.temp;
 
+        let flush = |data: &mut Vec<_>, session: &mut Session<_, _, _>| {
+            let old_len = data.len();
+            // Consolidating here is important when the join closure produces data that
+            // consolidates well, for example when projecting columns.
+            consolidate_updates(data);
+            let recovered = old_len - data.len();
+            session.give_iterator(data.drain(..));
+            recovered
+        };
+
+        assert_eq!(temp.len(), 0);
+
         while cursor1.key_valid(storage1) && cursor2.key_valid(storage2) {
-            match cursor1.key(storage1).cmp(cursor2.key(storage2)) {
+            match cursor1.key(storage1).cmp(&cursor2.key(storage2)) {
                 Ordering::Less => cursor1.seek_key(storage1, cursor2.key(storage2)),
                 Ordering::Greater => cursor2.seek_key(storage2, cursor1.key(storage1)),
                 Ordering::Equal => {
-                    assert_eq!(temp.len(), 0);
-
-                    // Populate `temp` with the results, as long as fuel remains.
+                    // Populate `temp` with the results, until we should yield.
                     let key = cursor2.key(storage2);
                     while let Some(val1) = cursor1.get_val(storage1) {
                         while let Some(val2) = cursor2.get_val(storage2) {
@@ -446,19 +642,16 @@ where
                         cursor1.step_val(storage1);
                         cursor2.rewind_vals(storage2);
 
-                        // TODO: This consolidation is optional, and it may not be very
-                        //       helpful. We might try harder to understand whether we
-                        //       should do this work here, or downstream at consumers.
-                        consolidate_updates(temp);
+                        *work = work.saturating_add(temp.len());
 
-                        *fuel = fuel.saturating_sub(temp.len());
-                        session.give_container(temp);
-
-                        if *fuel == 0 {
-                            // The fuel is exhausted, so we should yield. Returning here is only
-                            // allowed because we leave the cursors in a state that will let us
-                            // pick up the work correctly on the next invocation.
-                            return;
+                        if yield_fn(*work) {
+                            // Returning here is only allowed because we leave the cursors in a
+                            // state that will let us pick up the work correctly on the next
+                            // invocation.
+                            *work -= flush(temp, &mut session);
+                            if yield_fn(*work) {
+                                return;
+                            }
                         }
                     }
 
@@ -466,6 +659,10 @@ where
                     cursor2.step_key(storage2);
                 }
             }
+        }
+
+        if !temp.is_empty() {
+            *work -= flush(temp, &mut session);
         }
 
         // We only get here after having iterated through all keys.

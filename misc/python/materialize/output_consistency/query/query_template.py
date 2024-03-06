@@ -6,10 +6,13 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
-from typing import List, Optional
+from collections.abc import Callable
 
 from materialize.output_consistency.execution.evaluation_strategy import (
     EvaluationStrategy,
+)
+from materialize.output_consistency.execution.sql_dialect_adjuster import (
+    SqlDialectAdjuster,
 )
 from materialize.output_consistency.execution.value_storage_layout import (
     ROW_INDEX_COL_NAME,
@@ -29,13 +32,16 @@ class QueryTemplate:
     def __init__(
         self,
         expect_error: bool,
-        select_expressions: List[Expression],
+        select_expressions: list[Expression],
+        where_expression: Expression | None,
         storage_layout: ValueStorageLayout,
         contains_aggregations: bool,
         row_selection: DataRowSelection,
     ) -> None:
+        assert storage_layout != ValueStorageLayout.ANY
         self.expect_error = expect_error
-        self.select_expressions: List[Expression] = select_expressions
+        self.select_expressions: list[Expression] = select_expressions
+        self.where_expression = where_expression
         self.storage_layout = storage_layout
         self.contains_aggregations = contains_aggregations
         self.row_selection = row_selection
@@ -44,7 +50,7 @@ class QueryTemplate:
     def add_select_expression(self, expression: Expression) -> None:
         self.select_expressions.append(expression)
 
-    def add_multiple_select_expressions(self, expressions: List[Expression]) -> None:
+    def add_multiple_select_expressions(self, expressions: list[Expression]) -> None:
         self.select_expressions.extend(expressions)
 
     def to_sql(
@@ -52,15 +58,17 @@ class QueryTemplate:
         strategy: EvaluationStrategy,
         output_format: QueryOutputFormat,
         query_column_selection: QueryColumnByIndexSelection,
-        override_db_object_name: Optional[str] = None,
+        override_db_object_name: str | None = None,
     ) -> str:
         db_object_name = override_db_object_name or strategy.get_db_object_name(
             self.storage_layout
         )
         space_separator = self._get_space_separator(output_format)
 
-        column_sql = self._create_column_sql(query_column_selection, space_separator)
-        where_clause = self._create_where_clause()
+        column_sql = self._create_column_sql(
+            query_column_selection, space_separator, strategy.sql_adjuster
+        )
+        where_clause = self._create_where_clause(strategy.sql_adjuster)
         order_by_clause = self._create_order_by_clause()
 
         sql = f"""
@@ -75,18 +83,42 @@ FROM{space_separator}{db_object_name}
         return "\n  " if output_format == QueryOutputFormat.MULTI_LINE else " "
 
     def _create_column_sql(
-        self, query_column_selection: QueryColumnByIndexSelection, space_separator: str
+        self,
+        query_column_selection: QueryColumnByIndexSelection,
+        space_separator: str,
+        sql_adjuster: SqlDialectAdjuster,
     ) -> str:
         expressions_as_sql = []
         for index, expression in enumerate(self.select_expressions):
             if query_column_selection.is_included(index):
-                expressions_as_sql.append(expression.to_sql(True))
+                expressions_as_sql.append(expression.to_sql(sql_adjuster, True))
 
         return f",{space_separator}".join(expressions_as_sql)
 
-    def _create_where_clause(self) -> str:
-        if self.row_selection.keys is None:
+    def _create_where_clause(self, sql_adjuster: SqlDialectAdjuster) -> str:
+        where_conditions = []
+
+        row_filter_clause = self._create_row_filter_clause()
+        if row_filter_clause:
+            where_conditions.append(row_filter_clause)
+
+        if self.where_expression:
+            where_conditions.append(self.where_expression.to_sql(sql_adjuster, True))
+
+        if len(where_conditions) == 0:
             return ""
+
+        # It is important that the condition parts are in parentheses so that they are connected with AND.
+        # Otherwise, a generated condition containing OR at the top level may lift the row filter clause.
+        all_conditions_sql = " AND ".join(
+            [f"({condition})" for condition in where_conditions]
+        )
+        return f"WHERE {all_conditions_sql}"
+
+    def _create_row_filter_clause(self) -> str | None:
+        """Create s SQL clause to only include rows of certain indices"""
+        if self.row_selection.keys is None:
+            return None
 
         if len(self.row_selection.keys) == 0:
             row_index_string = "-1"
@@ -94,7 +126,7 @@ FROM{space_separator}{db_object_name}
             row_index_string = ", ".join(
                 str(index) for index in self.row_selection.keys
             )
-        return f"WHERE {ROW_INDEX_COL_NAME} IN ({row_index_string})"
+        return f"{ROW_INDEX_COL_NAME} IN ({row_index_string})"
 
     def _create_order_by_clause(self) -> str:
         if (
@@ -130,3 +162,20 @@ FROM{space_separator}{db_object_name}
                 return False
 
         return True
+
+    def matches_any_select_expression(
+        self, predicate: Callable[[Expression], bool], check_recursively: bool
+    ) -> bool:
+        for expression in self.select_expressions:
+            if expression.matches(predicate, check_recursively):
+                return True
+
+        return False
+
+    def matches_any_expression(
+        self, predicate: Callable[[Expression], bool], check_recursively: bool
+    ) -> bool:
+        return self.matches_any_select_expression(predicate, check_recursively) or (
+            self.where_expression is not None
+            and self.where_expression.matches(predicate, check_recursively)
+        )

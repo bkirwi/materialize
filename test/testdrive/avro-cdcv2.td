@@ -104,9 +104,10 @@ $ kafka-ingest format=avro topic=data schema=${schema}
 # Create a source using an inline schema.
 
 > CREATE CONNECTION kafka_conn
-  TO KAFKA (BROKER '${testdrive.kafka-addr}');
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > CREATE SOURCE data_schema_inline
+  IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-data-${testdrive.seed}')
   FORMAT AVRO USING SCHEMA '${schema}'
   ENVELOPE MATERIALIZE

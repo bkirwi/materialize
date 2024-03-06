@@ -10,20 +10,26 @@
 ws-text
 {"query": "bad sql"}
 ----
-{"type":"Error","payload":{"message":"Expected a keyword at the beginning of a statement, found identifier \"bad\"","code":"XX000"}}
+{"type":"Error","payload":{"message":"Expected a keyword at the beginning of a statement, found identifier \"bad\"","code":"42601","position":0}}
 {"type":"ReadyForQuery","payload":"I"}
 
 ws-text
 {"queries": [{"query": "bad sql"}]}
 ----
-{"type":"Error","payload":{"message":"Expected a keyword at the beginning of a statement, found identifier \"bad\"","code":"XX000"}}
+{"type":"Error","payload":{"message":"Expected a keyword at the beginning of a statement, found identifier \"bad\"","code":"42601","position":0}}
+{"type":"ReadyForQuery","payload":"I"}
+
+ws-text
+{"queries": [{"query": "SELECT 1 1"}]}
+----
+{"type":"Error","payload":{"message":"Expected end of statement, found number \"1\"","code":"42601","position":9}}
 {"type":"ReadyForQuery","payload":"I"}
 
 ws-text
 {"query": "select NULL"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["?column?"]}
+{"type":"Rows","payload":{"columns":[{"name":"?column?","type_oid":25,"type_len":-1,"type_mod":-1}]}}
 {"type":"Row","payload":[null]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"ReadyForQuery","payload":"I"}
@@ -32,7 +38,7 @@ ws-binary
 {"query": "select 'binary'"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["?column?"]}
+{"type":"Rows","payload":{"columns":[{"name":"?column?","type_oid":25,"type_len":-1,"type_mod":-1}]}}
 {"type":"Row","payload":["binary"]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"ReadyForQuery","payload":"I"}
@@ -41,11 +47,11 @@ ws-text
 {"query": "select 1,2; values ('a'), ('b')"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["?column?","?column?"]}
-{"type":"Row","payload":[1,2]}
+{"type":"Rows","payload":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1},{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]}}
+{"type":"Row","payload":["1","2"]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["column1"]}
+{"type":"Rows","payload":{"columns":[{"name":"column1","type_oid":25,"type_len":-1,"type_mod":-1}]}}
 {"type":"Row","payload":["a"]}
 {"type":"Row","payload":["b"]}
 {"type":"CommandComplete","payload":"SELECT 2"}
@@ -73,8 +79,8 @@ ws-text
 {"query": ";;select 1;"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["?column?"]}
-{"type":"Row","payload":[1]}
+{"type":"Rows","payload":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]}}
+{"type":"Row","payload":["1"]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"ReadyForQuery","payload":"I"}
 
@@ -82,12 +88,12 @@ ws-text
 {"query": ";;select 1;; select 2;;"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["?column?"]}
-{"type":"Row","payload":[1]}
+{"type":"Rows","payload":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]}}
+{"type":"Row","payload":["1"]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["?column?"]}
-{"type":"Row","payload":[2]}
+{"type":"Rows","payload":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]}}
+{"type":"Row","payload":["2"]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"ReadyForQuery","payload":"I"}
 
@@ -120,8 +126,8 @@ ws-text
 {"queries": [{"query": "select $1::int", "params": ["2"]}]}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["int4"]}
-{"type":"Row","payload":[2]}
+{"type":"Rows","payload":{"columns":[{"name":"int4","type_oid":23,"type_len":4,"type_mod":-1}]}}
+{"type":"Row","payload":["2"]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"ReadyForQuery","payload":"I"}
 
@@ -142,9 +148,45 @@ ws-text
 {"queries": [{"query": "select $1::int", "params": [null]}]}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["int4"]}
+{"type":"Rows","payload":{"columns":[{"name":"int4","type_oid":23,"type_len":4,"type_mod":-1}]}}
 {"type":"Row","payload":[null]}
 {"type":"CommandComplete","payload":"SELECT 1"}
+{"type":"ReadyForQuery","payload":"I"}
+
+# Test notice severity filtering.
+ws-text
+{"query": "BEGIN; BEGIN"}
+----
+{"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
+{"type":"CommandComplete","payload":"BEGIN"}
+{"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
+{"type":"CommandComplete","payload":"BEGIN"}
+{"type":"Notice","payload":{"message":"there is already a transaction in progress","severity":"warning"}}
+{"type":"ReadyForQuery","payload":"T"}
+
+ws-text
+{"query": "SET client_min_messages = error"}
+----
+{"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
+{"type":"CommandComplete","payload":"SET"}
+{"type":"ReadyForQuery","payload":"T"}
+
+ws-text
+{"query": "BEGIN; BEGIN"}
+----
+{"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
+{"type":"CommandComplete","payload":"BEGIN"}
+{"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
+{"type":"CommandComplete","payload":"BEGIN"}
+{"type":"ReadyForQuery","payload":"T"}
+
+ws-text
+{"query": "ROLLBACK; RESET client_min_messages"}
+----
+{"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
+{"type":"CommandComplete","payload":"ROLLBACK"}
+{"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
+{"type":"CommandComplete","payload":"RESET"}
 {"type":"ReadyForQuery","payload":"I"}
 
 # Test that transactions are preserved across requests.
@@ -155,8 +197,8 @@ ws-text
 {"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
 {"type":"CommandComplete","payload":"BEGIN"}
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["?column?"]}
-{"type":"Row","payload":[1]}
+{"type":"Rows","payload":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]}}
+{"type":"Row","payload":["1"]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"ReadyForQuery","payload":"T"}
 
@@ -174,14 +216,14 @@ ws-text
 {"query": "CREATE VIEW v AS SELECT 1"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
-{"type":"Error","payload":{"message":"CREATE VIEW v AS SELECT 1 cannot be run inside a transaction block","code":"XX000"}}
+{"type":"Error","payload":{"message":"transaction in read-only mode","code":"25006","detail":"SELECT queries cannot be combined with other query types, including SUBSCRIBE."}}
 {"type":"ReadyForQuery","payload":"E"}
 
 ws-text
 {"query": "CREATE VIEW v AS SELECT 1"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
-{"type":"Error","payload":{"message":"current transaction is aborted, commands ignored until end of transaction block","code":"XX000"}}
+{"type":"Error","payload":{"message":"current transaction is aborted, commands ignored until end of transaction block","code":"25P02"}}
 {"type":"ReadyForQuery","payload":"E"}
 
 
@@ -189,7 +231,7 @@ ws-text
 {"query": "SELECT 2"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
-{"type":"Error","payload":{"message":"current transaction is aborted, commands ignored until end of transaction block","code":"XX000"}}
+{"type":"Error","payload":{"message":"current transaction is aborted, commands ignored until end of transaction block","code":"25P02"}}
 {"type":"ReadyForQuery","payload":"E"}
 
 ws-text
@@ -199,8 +241,8 @@ ws-text
 {"type":"CommandComplete","payload":"ROLLBACK"}
 {"type":"ParameterStatus","payload":{"name":"application_name","value":"a"}}
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["?column?"]}
-{"type":"Row","payload":[2]}
+{"type":"Rows","payload":{"columns":[{"name":"?column?","type_oid":23,"type_len":4,"type_mod":-1}]}}
+{"type":"Row","payload":["2"]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"ReadyForQuery","payload":"I"}
 
@@ -225,7 +267,7 @@ ws-text
 {"query": "SHOW application_name"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["application_name"]}
+{"type":"Rows","payload":{"columns":[{"name":"application_name","type_oid":25,"type_len":-1,"type_mod":-1}]}}
 {"type":"Row","payload":["c"]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"ReadyForQuery","payload":"T"}
@@ -242,7 +284,7 @@ ws-text
 {"query": "SHOW application_name"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
-{"type":"Rows","payload":["application_name"]}
+{"type":"Rows","payload":{"columns":[{"name":"application_name","type_oid":25,"type_len":-1,"type_mod":-1}]}}
 {"type":"Row","payload":["a"]}
 {"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"ReadyForQuery","payload":"I"}
@@ -272,17 +314,38 @@ ws-text
 {"query": "SUBSCRIBE (VALUES (1)); SELECT 1"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":true}}
-{"type":"Rows","payload":["mz_timestamp","mz_diff","column1"]}
-{"type":"Row","payload":["18446744073709551615",1,1]}
+{"type":"Rows","payload":{"columns":[{"name":"mz_timestamp","type_oid":1700,"type_len":-1,"type_mod":2555908},{"name":"mz_diff","type_oid":20,"type_len":8,"type_mod":-1},{"name":"column1","type_oid":23,"type_len":4,"type_mod":-1}]}}
+{"type":"Row","payload":["18446744073709551615","1","1"]}
 {"type":"CommandComplete","payload":"SUBSCRIBE"}
 {"type":"CommandStarting","payload":{"has_rows":false,"is_streaming":false}}
-{"type":"Error","payload":{"message":"SUBSCRIBE in transactions must be the only read statement","code":"XX000"}}
+{"type":"Error","payload":{"message":"SUBSCRIBE in transactions must be the only read statement","code":"25000"}}
+{"type":"ReadyForQuery","payload":"I"}
+
+# Test timestamp precision.
+ws-text
+{"query":"select TIMESTAMP '2023-12-19T06:50:37.123056' as col"}
+----
+{"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
+{"type":"Rows","payload":{"columns":[{"name":"col","type_oid":1114,"type_len":8,"type_mod":-1}]}}
+{"type":"Row","payload":["1702968637123.056"]}
+{"type":"CommandComplete","payload":"SELECT 1"}
+{"type":"ReadyForQuery","payload":"I"}
+
+ws-text
+{"query":"select TIMESTAMPTZ '2023-12-19T06:50:37.123056' as col"}
+----
+{"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":false}}
+{"type":"Rows","payload":{"columns":[{"name":"col","type_oid":1184,"type_len":8,"type_mod":-1}]}}
+{"type":"Row","payload":["1702968637123.056"]}
+{"type":"CommandComplete","payload":"SELECT 1"}
 {"type":"ReadyForQuery","payload":"I"}
 
 ws-text rows=2 fixtimestamp=true
 {"query": "SUBSCRIBE t"}
 ----
 {"type":"CommandStarting","payload":{"has_rows":true,"is_streaming":true}}
-{"type":"Rows","payload":["mz_timestamp","mz_diff","i"]}
-{"type":"Row","payload":["<TIMESTAMP>",1,1]}
-{"type":"Row","payload":["<TIMESTAMP>",1,2]}
+{"type":"Rows","payload":{"columns":[{"name":"mz_timestamp","type_oid":1700,"type_len":-1,"type_mod":2555908},{"name":"mz_diff","type_oid":20,"type_len":8,"type_mod":-1},{"name":"i","type_oid":23,"type_len":4,"type_mod":-1}]}}
+{"type":"Row","payload":["<TIMESTAMP>","1","1"]}
+{"type":"Row","payload":["<TIMESTAMP>","1","2"]}
+
+# The above query never completes, so don't put anything below this.

@@ -79,11 +79,7 @@ SELECT a + 1, b, 4 FROM mv WHERE a > 0
                     "Literal": [
                       {
                         "data": [
-                          4,
-                          0,
-                          0,
-                          0,
-                          0
+                          41
                         ]
                       },
                       {
@@ -111,11 +107,8 @@ SELECT a + 1, b, 4 FROM mv WHERE a > 0
                 "Literal": [
                   {
                     "data": [
-                      4,
-                      1,
-                      0,
-                      0,
-                      0
+                      42,
+                      1
                     ]
                   },
                   {
@@ -130,11 +123,8 @@ SELECT a + 1, b, 4 FROM mv WHERE a > 0
             "Literal": [
               {
                 "data": [
-                  4,
-                  4,
-                  0,
-                  0,
-                  0
+                  42,
+                  4
                 ]
               },
               {
@@ -168,11 +158,8 @@ SELECT * FROM generate_series(1, 7)
         "Literal": [
           {
             "data": [
-              4,
-              1,
-              0,
-              0,
-              0
+              42,
+              1
             ]
           },
           {
@@ -185,11 +172,8 @@ SELECT * FROM generate_series(1, 7)
         "Literal": [
           {
             "data": [
-              4,
-              7,
-              0,
-              0,
-              0
+              42,
+              7
             ]
           },
           {
@@ -202,11 +186,8 @@ SELECT * FROM generate_series(1, 7)
         "Literal": [
           {
             "data": [
-              4,
-              1,
-              0,
-              0,
-              0
+              42,
+              1
             ]
           },
           {
@@ -303,63 +284,6 @@ SELECT a FROM t EXCEPT SELECT b FROM mv
         ]
       }
     }
-  }
-}
-EOF
-
-# Test TopK.
-query T multiline
-EXPLAIN RAW PLAN AS JSON FOR
-VIEW ov
-----
-{
-  "Project": {
-    "input": {
-      "TopK": {
-        "input": {
-          "Get": {
-            "id": {
-              "Global": {
-                "User": 1
-              }
-            },
-            "typ": {
-              "column_types": [
-                {
-                  "scalar_type": "Int32",
-                  "nullable": true
-                },
-                {
-                  "scalar_type": "Int32",
-                  "nullable": true
-                }
-              ],
-              "keys": []
-            }
-          }
-        },
-        "group_key": [],
-        "order_key": [
-          {
-            "column": 1,
-            "desc": false,
-            "nulls_last": true
-          },
-          {
-            "column": 0,
-            "desc": true,
-            "nulls_last": false
-          }
-        ],
-        "limit": 5,
-        "offset": 0,
-        "expected_group_size": null
-      }
-    },
-    "outputs": [
-      0,
-      1
-    ]
   }
 }
 EOF
@@ -597,7 +521,7 @@ EOF
 
 # Test EXISTS subqueries.
 query T multiline
-EXPLAIN RAW PLAN WITH(raw_syntax) AS JSON FOR
+EXPLAIN RAW PLAN WITH(raw syntax) AS JSON FOR
 SELECT * FROM t WHERE EXISTS(SELECT * FROM mv WHERE t.a < mv.a) AND EXISTS(SELECT * FROM mv WHERE t.b > mv.b)
 ----
 {
@@ -767,7 +691,7 @@ EOF
 
 # Test SELECT subqueries.
 query T multiline
-EXPLAIN RAW PLAN WITH(raw_syntax) AS JSON FOR
+EXPLAIN RAW PLAN WITH(raw syntax) AS JSON FOR
 SELECT (SELECT v.a FROM v WHERE v.b = t.b LIMIT 1), (SELECT mv.a FROM mv WHERE mv.b = t.b LIMIT 1) FROM t
 ----
 {
@@ -827,7 +751,20 @@ SELECT (SELECT v.a FROM v WHERE v.b = t.b LIMIT 1), (SELECT mv.a FROM mv WHERE m
                 },
                 "group_key": [],
                 "order_key": [],
-                "limit": 1,
+                "limit": {
+                  "Literal": [
+                    {
+                      "data": [
+                        47,
+                        1
+                      ]
+                    },
+                    {
+                      "scalar_type": "Int64",
+                      "nullable": false
+                    }
+                  ]
+                },
                 "offset": 0,
                 "expected_group_size": null
               }
@@ -892,7 +829,20 @@ SELECT (SELECT v.a FROM v WHERE v.b = t.b LIMIT 1), (SELECT mv.a FROM mv WHERE m
                     },
                     "group_key": [],
                     "order_key": [],
-                    "limit": 1,
+                    "limit": {
+                      "Literal": [
+                        {
+                          "data": [
+                            47,
+                            1
+                          ]
+                        },
+                        {
+                          "scalar_type": "Int64",
+                          "nullable": false
+                        }
+                      ]
+                    },
                     "offset": 0,
                     "expected_group_size": null
                   }
@@ -1243,11 +1193,8 @@ WITH A AS (SELECT 1 AS a), B as (SELECT a as b FROM A WHERE a > 0) SELECT * FROM
             "Literal": [
               {
                 "data": [
-                  4,
-                  1,
-                  0,
-                  0,
-                  0
+                  42,
+                  1
                 ]
               },
               {
@@ -1295,11 +1242,7 @@ WITH A AS (SELECT 1 AS a), B as (SELECT a as b FROM A WHERE a > 0) SELECT * FROM
                     "Literal": [
                       {
                         "data": [
-                          4,
-                          0,
-                          0,
-                          0,
-                          0
+                          41
                         ]
                       },
                       {

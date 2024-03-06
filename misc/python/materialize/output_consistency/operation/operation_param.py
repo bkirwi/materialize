@@ -7,7 +7,6 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-from typing import List, Optional, Set
 
 from materialize.output_consistency.data_type.data_type import DataType
 from materialize.output_consistency.data_type.data_type_category import DataTypeCategory
@@ -25,10 +24,9 @@ class OperationParam:
         self,
         type_category: DataTypeCategory,
         optional: bool = False,
-        incompatibilities: Optional[Set[ExpressionCharacteristics]] = None,
-        incompatibility_combinations: Optional[
-            List[Set[ExpressionCharacteristics]]
-        ] = None,
+        incompatibilities: set[ExpressionCharacteristics] | None = None,
+        incompatibility_combinations: list[set[ExpressionCharacteristics]]
+        | None = None,
     ):
         """
         Create a parameter for an operation.
@@ -49,11 +47,11 @@ class OperationParam:
                 self.incompatibility_combinations.append({incompatibility})
 
     def supports_type(
-        self, data_type: DataType, previous_args: List[Expression]
+        self, data_type: DataType, previous_args: list[Expression]
     ) -> bool:
         raise NotImplementedError
 
-    def might_support_as_input_assuming_category_matches(
+    def might_support_type_as_input_assuming_category_matches(
         self, return_type_spec: ReturnTypeSpec
     ) -> bool:
         return True
@@ -65,8 +63,11 @@ class OperationParam:
 
         return True
 
+    def get_declared_type_category(self) -> DataTypeCategory:
+        return self._type_category
+
     def resolve_type_category(
-        self, previous_args: List[Expression]
+        self, previous_args: list[Expression]
     ) -> DataTypeCategory:
         return self._type_category
 

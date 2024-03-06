@@ -8,7 +8,7 @@
 # by the Apache License, Version 2.0.
 
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
-ALTER SYSTEM SET enable_unmanaged_cluster_replicas = true
+ALTER SYSTEM SET enable_unorchestrated_cluster_replicas = true
 
 $ kafka-create-topic topic=topic
 
@@ -27,7 +27,7 @@ three
     )
   )
 
-> CREATE CONNECTION conn TO KAFKA (BROKER '${testdrive.kafka-addr}')
+> CREATE CONNECTION conn TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT)
 
 > CREATE SOURCE topic
   IN CLUSTER clusterd

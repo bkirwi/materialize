@@ -10,20 +10,22 @@
 use std::fmt::Debug;
 
 use mz_compute_client::controller::error::{
-    CollectionUpdateError, DataflowCreationError, InstanceMissing, PeekError, SubscribeTargetError,
+    CollectionUpdateError, DataflowCreationError, InstanceMissing, PeekError, ReadPolicyError,
+    SubscribeTargetError,
 };
-use mz_controller::clusters::ClusterId;
-use mz_ore::{halt, soft_assert};
-use mz_repr::{GlobalId, RelationDesc, Row, ScalarType};
+use mz_controller_types::ClusterId;
+use mz_ore::tracing::OpenTelemetryContext;
+use mz_ore::{halt, soft_assert_no_log};
+use mz_repr::{RelationDesc, ScalarType};
 use mz_sql::names::FullItemName;
 use mz_sql::plan::StatementDesc;
+use mz_sql::session::metadata::SessionMetadata;
 use mz_sql::session::vars::Var;
 use mz_sql_parser::ast::display::AstDisplay;
 use mz_sql_parser::ast::{
     CreateIndexStatement, FetchStatement, Ident, Raw, RawClusterName, RawItemName, Statement,
 };
-use mz_stash::StashError;
-use mz_storage_client::controller::StorageError;
+use mz_storage_types::controller::StorageError;
 use mz_transform::TransformError;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -33,19 +35,23 @@ use crate::command::{Command, Response};
 use crate::coord::{Message, PendingTxnResponse};
 use crate::error::AdapterError;
 use crate::session::{EndTransactionAction, Session};
-use crate::{ExecuteContext, ExecuteResponse, PeekResponseUnary};
+use crate::{ExecuteContext, ExecuteResponse};
 
 /// Handles responding to clients.
 #[derive(Debug)]
-pub struct ClientTransmitter<T: Transmittable> {
+pub struct ClientTransmitter<T>
+where
+    T: Transmittable,
+    <T as Transmittable>::Allowed: 'static,
+{
     tx: Option<oneshot::Sender<Response<T>>>,
     internal_cmd_tx: UnboundedSender<Message>,
-    /// Expresses an optional [`soft_assert`] on the set of values allowed to be
+    /// Expresses an optional soft-assert on the set of values allowed to be
     /// sent from `self`.
-    allowed: Option<Vec<T::Allowed>>,
+    allowed: Option<&'static [T::Allowed]>,
 }
 
-impl<T: Transmittable> ClientTransmitter<T> {
+impl<T: Transmittable + std::fmt::Debug> ClientTransmitter<T> {
     /// Creates a new client transmitter.
     pub fn new(
         tx: oneshot::Sender<Response<T>>,
@@ -64,14 +70,15 @@ impl<T: Transmittable> ClientTransmitter<T> {
     /// # Panics
     /// - If in `soft_assert`, `result.is_ok()`, `self.allowed.is_some()`, and
     ///   the result value is not in the set of allowed values.
+    #[mz_ore::instrument(level = "debug")]
     pub fn send(mut self, result: Result<T, AdapterError>, session: Session) {
         // Guarantee that the value sent is of an allowed type.
-        soft_assert!(
+        soft_assert_no_log!(
             match (&result, self.allowed.take()) {
                 (Ok(ref t), Some(allowed)) => allowed.contains(&t.to_allowed()),
                 _ => true,
             },
-            "tried to send disallowed value through ClientTransmitter; \
+            "tried to send disallowed value {result:?} through ClientTransmitter; \
             see ClientTransmitter::set_allowed"
         );
 
@@ -81,13 +88,20 @@ impl<T: Transmittable> ClientTransmitter<T> {
             .tx
             .take()
             .expect("tx will always be `Some` unless `self` has been consumed")
-            .send(Response { result, session })
+            .send(Response {
+                result,
+                session,
+                otel_ctx: OpenTelemetryContext::obtain(),
+            })
         {
             self.internal_cmd_tx
-                .send(Message::Command(Command::Terminate {
-                    session: res.session,
-                    tx: None,
-                }))
+                .send(Message::Command(
+                    OpenTelemetryContext::obtain(),
+                    Command::Terminate {
+                        conn_id: res.session.conn_id().clone(),
+                        tx: None,
+                    },
+                ))
                 .expect("coordinator unexpectedly gone");
         }
     }
@@ -98,10 +112,10 @@ impl<T: Transmittable> ClientTransmitter<T> {
             .expect("tx will always be `Some` unless `self` has been consumed")
     }
 
-    /// Sets `self` so that the next call to [`Self::send`] will [`soft_assert`]
+    /// Sets `self` so that the next call to [`Self::send`] will soft-assert
     /// that, if `Ok`, the value is one of `allowed`, as determined by
     /// [`Transmittable::to_allowed`].
-    pub fn set_allowed(&mut self, allowed: Vec<T::Allowed>) {
+    pub fn set_allowed(&mut self, allowed: &'static [T::Allowed]) {
         self.allowed = Some(allowed);
     }
 }
@@ -178,16 +192,6 @@ impl<T: Transmittable> Drop for ClientTransmitter<T> {
     }
 }
 
-/// Constructs an [`ExecuteResponse`] that that will send some rows to the
-/// client immediately, as opposed to asking the dataflow layer to send along
-/// the rows after some computation.
-pub(crate) fn send_immediate_rows(rows: Vec<Row>) -> ExecuteResponse {
-    ExecuteResponse::SendingRows {
-        future: Box::pin(async { PeekResponseUnary::Rows(rows) }),
-        span: tracing::Span::none(),
-    }
-}
-
 // TODO(benesch): constructing the canonical CREATE INDEX statement should be
 // the responsibility of the SQL package.
 pub fn index_sql(
@@ -200,13 +204,13 @@ pub fn index_sql(
     use mz_sql::ast::{Expr, Value};
 
     CreateIndexStatement::<Raw> {
-        name: Some(Ident::new(index_name)),
+        name: Some(Ident::new_unchecked(index_name)),
         on_name: RawItemName::Name(mz_sql::normalize::unresolve(view_name)),
         in_cluster: Some(RawClusterName::Resolved(cluster_id.to_string())),
         key_parts: Some(
             keys.iter()
                 .map(|i| match view_desc.get_unambiguous_name(*i) {
-                    Some(n) => Expr::Identifier(vec![Ident::new(n.to_string())]),
+                    Some(n) => Expr::Identifier(vec![Ident::new_unchecked(n.to_string())]),
                     _ => Expr::Value(Value::Number((i + 1).to_string())),
                 })
                 .collect(),
@@ -238,7 +242,12 @@ pub fn describe(
                 .get_portal_unverified(name.as_str())
                 .map(|p| p.desc.clone())
             {
-                Some(desc) => Ok(desc),
+                Some(mut desc) => {
+                    // Parameters are already bound to the portal and will not be accepted through
+                    // FETCH.
+                    desc.param_types = Vec::new();
+                    Ok(desc)
+                }
                 None => Err(AdapterError::UnknownCursor(name.to_string())),
             }
         }
@@ -253,13 +262,6 @@ pub fn describe(
             )?)
         }
     }
-}
-
-/// Type identifying a sink maintained by a cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ComputeSinkId {
-    pub cluster_id: ClusterId,
-    pub global_id: GlobalId,
 }
 
 pub trait ResultExt<T> {
@@ -297,16 +299,25 @@ impl ShouldHalt for AdapterError {
     }
 }
 
-impl ShouldHalt for crate::catalog::Error {
+impl ShouldHalt for mz_catalog::memory::error::Error {
     fn should_halt(&self) -> bool {
         match &self.kind {
-            crate::catalog::ErrorKind::Stash(e) => e.should_halt(),
+            mz_catalog::memory::error::ErrorKind::Durable(e) => e.should_halt(),
             _ => false,
         }
     }
 }
 
-impl ShouldHalt for StashError {
+impl ShouldHalt for mz_catalog::durable::CatalogError {
+    fn should_halt(&self) -> bool {
+        match &self {
+            Self::Durable(e) => e.should_halt(),
+            _ => false,
+        }
+    }
+}
+
+impl ShouldHalt for mz_catalog::durable::DurableCatalogError {
     fn should_halt(&self) -> bool {
         self.is_unrecoverable()
     }
@@ -315,19 +326,22 @@ impl ShouldHalt for StashError {
 impl ShouldHalt for StorageError {
     fn should_halt(&self) -> bool {
         match self {
+            StorageError::ResourceExhausted(_) => true,
             StorageError::UpdateBeyondUpper(_)
             | StorageError::ReadBeforeSince(_)
             | StorageError::InvalidUppers(_)
-            | StorageError::InvalidUsage(_) => true,
-            StorageError::SourceIdReused(_)
+            | StorageError::InvalidUsage(_)
+            | StorageError::SourceIdReused(_)
             | StorageError::SinkIdReused(_)
             | StorageError::IdentifierMissing(_)
+            | StorageError::IdentifierInvalid(_)
             | StorageError::IngestionInstanceMissing { .. }
             | StorageError::ExportInstanceMissing { .. }
             | StorageError::Generic(_)
             | StorageError::DataflowError(_)
-            | StorageError::InvalidAlterSource { .. } => false,
-            StorageError::IOError(e) => e.should_halt(),
+            | StorageError::InvalidAlter { .. }
+            | StorageError::ShuttingDown(_) => false,
+            StorageError::IOError(e) => e.is_unrecoverable(),
         }
     }
 }
@@ -335,10 +349,12 @@ impl ShouldHalt for StorageError {
 impl ShouldHalt for DataflowCreationError {
     fn should_halt(&self) -> bool {
         match self {
-            DataflowCreationError::SinceViolation(_) => true,
-            DataflowCreationError::InstanceMissing(_)
+            DataflowCreationError::SinceViolation(_)
+            | DataflowCreationError::InstanceMissing(_)
             | DataflowCreationError::CollectionMissing(_)
-            | DataflowCreationError::MissingAsOf => false,
+            | DataflowCreationError::MissingAsOf
+            | DataflowCreationError::EmptyAsOfForSubscribe
+            | DataflowCreationError::EmptyAsOfForCopyTo => false,
         }
     }
 }
@@ -355,10 +371,20 @@ impl ShouldHalt for CollectionUpdateError {
 impl ShouldHalt for PeekError {
     fn should_halt(&self) -> bool {
         match self {
-            PeekError::SinceViolation(_) => true,
-            PeekError::InstanceMissing(_)
+            PeekError::SinceViolation(_)
+            | PeekError::InstanceMissing(_)
             | PeekError::CollectionMissing(_)
             | PeekError::ReplicaMissing(_) => false,
+        }
+    }
+}
+
+impl ShouldHalt for ReadPolicyError {
+    fn should_halt(&self) -> bool {
+        match self {
+            ReadPolicyError::InstanceMissing(_)
+            | ReadPolicyError::CollectionMissing(_)
+            | ReadPolicyError::WriteOnlyCollection(_) => false,
         }
     }
 }
@@ -377,7 +403,9 @@ impl ShouldHalt for SubscribeTargetError {
 impl ShouldHalt for TransformError {
     fn should_halt(&self) -> bool {
         match self {
-            TransformError::Internal(_) | TransformError::IdentifierMissing(_) => false,
+            TransformError::Internal(_)
+            | TransformError::IdentifierMissing(_)
+            | TransformError::CallerShouldPanic(_) => false,
         }
     }
 }
@@ -391,7 +419,7 @@ impl ShouldHalt for InstanceMissing {
 /// Returns the viewable session and system variables.
 pub(crate) fn viewable_variables<'a>(
     catalog: &'a CatalogState,
-    session: &'a Session,
+    session: &'a dyn SessionMetadata,
 ) -> impl Iterator<Item = &'a dyn Var> {
     session
         .vars()

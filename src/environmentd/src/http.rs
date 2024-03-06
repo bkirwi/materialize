@@ -16,51 +16,64 @@
 // Axum handlers must use async, but often don't actually use `await`.
 #![allow(clippy::unused_async)]
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::error_handling::HandleErrorLayer;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Query, State};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::{routing, Extension, Json, Router};
 use futures::future::{FutureExt, Shared, TryFutureExt};
 use headers::authorization::{Authorization, Basic, Bearer};
 use headers::{HeaderMapExt, HeaderName};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
-use http::{Request, StatusCode};
+use http::{Method, Request, StatusCode};
 use hyper_openssl::MaybeHttpsStream;
-use mz_adapter::{AdapterError, AdapterNotice, Client, SessionClient};
-use mz_frontegg_auth::{Authentication as FronteggAuthentication, Error as FronteggError};
+use mz_adapter::session::{Session, SessionConfig};
+use mz_adapter::{AdapterError, AdapterNotice, Client, SessionClient, WebhookAppenderCache};
+use mz_frontegg_auth::{Authenticator as FronteggAuthentication, Error as FronteggError};
+use mz_http_util::DynamicFilterTarget;
 use mz_ore::cast::u64_to_usize;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::str::StrExt;
-use mz_ore::tracing::TracingHandle;
-use mz_sql::session::user::{ExternalUserMetadata, User, HTTP_DEFAULT_USER, SYSTEM_USER};
-use mz_sql::session::vars::{ConnectionCounter, DropConnection, VarInput};
+use mz_repr::user::ExternalUserMetadata;
+use mz_server_core::{ConnectionHandler, Server};
+use mz_sql::session::metadata::SessionMetadata;
+use mz_sql::session::user::{HTTP_DEFAULT_USER, SUPPORT_USER_NAME, SYSTEM_USER_NAME};
+use mz_sql::session::vars::{
+    ConnectionCounter, DropConnection, Value, Var, VarInput, WELCOME_MESSAGE,
+};
 use openssl::ssl::{Ssl, SslContext};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::{oneshot, watch};
 use tokio_openssl::SslStream;
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{error, warn};
 
-use crate::server::{ConnectionHandler, Server};
 use crate::BUILD_INFO;
 
 mod catalog;
+mod console;
 mod memory;
+mod metrics;
 mod probe;
 mod root;
 mod sql;
+mod webhook;
 
+pub use metrics::Metrics;
 pub use sql::{SqlResponse, WebSocketAuth, WebSocketResponse};
 
 /// Maximum allowed size for a request.
@@ -68,11 +81,14 @@ pub const MAX_REQUEST_SIZE: usize = u64_to_usize(2 * bytesize::MB);
 
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
+    pub source: &'static str,
     pub tls: Option<TlsConfig>,
     pub frontegg: Option<FronteggAuthentication>,
     pub adapter_client: mz_adapter::Client,
     pub allowed_origin: AllowOrigin,
     pub active_connection_count: Arc<Mutex<ConnectionCounter>>,
+    pub concurrent_webhook_req: Arc<tokio::sync::Semaphore>,
+    pub metrics: Metrics,
 }
 
 #[derive(Debug, Clone)]
@@ -90,8 +106,14 @@ pub enum TlsMode {
 #[derive(Clone)]
 pub struct WsState {
     frontegg: Arc<Option<FronteggAuthentication>>,
-    adapter_client: mz_adapter::Client,
+    adapter_client_rx: Delayed<mz_adapter::Client>,
     active_connection_count: SharedConnectionCounter,
+}
+
+#[derive(Clone)]
+pub struct WebhookState {
+    adapter_client: mz_adapter::Client,
+    webhook_cache: WebhookAppenderCache,
 }
 
 #[derive(Debug)]
@@ -103,11 +125,14 @@ pub struct HttpServer {
 impl HttpServer {
     pub fn new(
         HttpConfig {
+            source,
             tls,
             frontegg,
             adapter_client,
             allowed_origin,
             active_connection_count,
+            concurrent_webhook_req,
+            metrics,
         }: HttpConfig,
     ) -> HttpServer {
         let tls_mode = tls.as_ref().map(|tls| tls.mode).unwrap_or(TlsMode::Disable);
@@ -117,14 +142,15 @@ impl HttpServer {
         adapter_client_tx
             .send(adapter_client.clone())
             .expect("rx known to be live");
+        let adapter_client_rx = adapter_client_rx.shared();
+        let webhook_cache = WebhookAppenderCache::new();
 
         let base_router = base_router(BaseRouterConfig { profiling: false })
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_SIZE))
             .layer(middleware::from_fn(move |req, next| {
                 let base_frontegg = Arc::clone(&base_frontegg);
-                async move { http_auth(req, next, tls_mode, &base_frontegg).await }
+                async move { http_auth(req, next, tls_mode, base_frontegg.as_ref().as_ref()).await }
             }))
-            .layer(Extension(adapter_client_rx.shared()))
+            .layer(Extension(adapter_client_rx.clone()))
             .layer(Extension(Arc::clone(&active_connection_count)))
             .layer(
                 CorsLayer::new()
@@ -143,10 +169,40 @@ impl HttpServer {
             .route("/api/experimental/sql", routing::get(sql::handle_sql_ws))
             .with_state(WsState {
                 frontegg,
-                adapter_client,
+                adapter_client_rx,
                 active_connection_count,
             });
-        let router = Router::new().merge(base_router).merge(ws_router);
+
+        let webhook_router = Router::new()
+            .route(
+                "/api/webhook/:database/:schema/:id",
+                routing::post(webhook::handle_webhook),
+            )
+            .with_state(WebhookState {
+                adapter_client,
+                webhook_cache,
+            })
+            .layer(
+                CorsLayer::new()
+                    .allow_methods(Method::POST)
+                    .allow_origin(AllowOrigin::mirror_request())
+                    .allow_headers(Any),
+            )
+            .layer(
+                ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(handle_load_error))
+                    .load_shed()
+                    .layer(GlobalConcurrencyLimitLayer::with_semaphore(
+                        concurrent_webhook_req,
+                    )),
+            );
+
+        let router = Router::new()
+            .merge(base_router)
+            .merge(ws_router)
+            .merge(webhook_router)
+            .apply_default_layers(source, metrics);
+
         HttpServer { tls, router }
     }
 
@@ -185,11 +241,11 @@ impl Server for HttpServer {
 
 pub struct InternalHttpConfig {
     pub metrics_registry: MetricsRegistry,
-    pub tracing_handle: TracingHandle,
     pub adapter_client_rx: oneshot::Receiver<mz_adapter::Client>,
     pub active_connection_count: Arc<Mutex<ConnectionCounter>>,
     pub promote_leader: oneshot::Sender<()>,
     pub ready_to_promote: oneshot::Receiver<()>,
+    pub internal_console_redirect_url: Option<String>,
 }
 
 pub struct InternalHttpServer {
@@ -319,13 +375,20 @@ impl InternalHttpServer {
     pub fn new(
         InternalHttpConfig {
             metrics_registry,
-            tracing_handle,
             adapter_client_rx,
             active_connection_count,
             promote_leader,
             ready_to_promote,
+            internal_console_redirect_url,
         }: InternalHttpConfig,
     ) -> InternalHttpServer {
+        let metrics = Metrics::register_into(&metrics_registry, "mz_internal_http");
+        let console_config = Arc::new(console::ConsoleProxyConfig::new(
+            internal_console_redirect_url,
+            "/internal-console".to_string(),
+        ));
+
+        let adapter_client_rx = adapter_client_rx.shared();
         let router = base_router(BaseRouterConfig { profiling: true })
             .route(
                 "/metrics",
@@ -341,39 +404,71 @@ impl InternalHttpServer {
             .route(
                 "/api/opentelemetry/config",
                 routing::put({
-                    let tracing_handle = tracing_handle.clone();
-                    move |payload| async move {
-                        mz_http_util::handle_reload_tracing_filter(
-                            &tracing_handle,
-                            TracingHandle::reload_opentelemetry_filter,
-                            payload,
+                    move |_: axum::Json<DynamicFilterTarget>| async {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            "This endpoint has been replaced. \
+                            Use the `opentelemetry_filter` system variable."
+                                .to_string(),
                         )
-                        .await
                     }
                 }),
             )
             .route(
                 "/api/stderr/config",
                 routing::put({
-                    move |payload| async move {
-                        mz_http_util::handle_reload_tracing_filter(
-                            &tracing_handle,
-                            TracingHandle::reload_stderr_log_filter,
-                            payload,
+                    move |_: axum::Json<DynamicFilterTarget>| async {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            "This endpoint has been replaced. \
+                            Use the `log_filter` system variable."
+                                .to_string(),
                         )
-                        .await
                     }
                 }),
             )
             .route("/api/tracing", routing::get(mz_http_util::handle_tracing))
             .route(
-                "/api/catalog",
-                routing::get(catalog::handle_internal_catalog),
+                "/api/catalog/dump",
+                routing::get(catalog::handle_catalog_dump),
             )
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_SIZE))
-            .layer(Extension(AuthedUser(SYSTEM_USER.clone())))
-            .layer(Extension(adapter_client_rx.shared()))
-            .layer(Extension(active_connection_count));
+            .route(
+                "/api/catalog/check",
+                routing::get(catalog::handle_catalog_check),
+            )
+            .route(
+                "/api/coordinator/check",
+                routing::get(catalog::handle_coordinator_check),
+            )
+            .route(
+                "/internal-console",
+                routing::get(|| async { Redirect::temporary("/internal-console/") }),
+            )
+            .route(
+                "/internal-console/*path",
+                routing::get(console::handle_internal_console),
+            )
+            .route(
+                "/internal-console/",
+                routing::get(console::handle_internal_console),
+            )
+            .layer(middleware::from_fn(internal_http_auth))
+            .layer(Extension(adapter_client_rx.clone()))
+            .layer(Extension(console_config))
+            .layer(Extension(Arc::clone(&active_connection_count)));
+
+        let ws_router = Router::new()
+            .route("/api/experimental/sql", routing::get(sql::handle_sql_ws))
+            // This middleware extracts the MZ user from the x-materialize-user http header.
+            // Normally, browser-initiated websocket requests do not support headers, however for the
+            // Internal HTTP Server the browser would be connecting through teleport, which should
+            // attach the x-materialize-user header to all requests it proxies to this api.
+            .layer(middleware::from_fn(internal_http_auth))
+            .with_state(WsState {
+                frontegg: Arc::new(None),
+                adapter_client_rx,
+                active_connection_count,
+            });
 
         let leader_router = Router::new()
             .route("/api/leader/status", routing::get(handle_leader_status))
@@ -383,10 +478,34 @@ impl InternalHttpServer {
                 ready_to_promote,
             })));
 
-        InternalHttpServer {
-            router: router.merge(leader_router),
-        }
+        let router = router
+            .merge(ws_router)
+            .merge(leader_router)
+            .apply_default_layers("internal", metrics);
+
+        InternalHttpServer { router }
     }
+}
+
+async fn internal_http_auth<B>(mut req: Request<B>, next: Next<B>) -> impl IntoResponse {
+    let user_name = req
+        .headers()
+        .get("x-materialize-user")
+        .map(|h| h.to_str())
+        .unwrap_or_else(|| Ok(SYSTEM_USER_NAME));
+    let user_name = match user_name {
+        Ok(name @ (SUPPORT_USER_NAME | SYSTEM_USER_NAME)) => name.to_string(),
+        _ => {
+            return Err(AuthError::MismatchedUser(format!(
+            "user specified in x-materialize-user must be {SUPPORT_USER_NAME} or {SYSTEM_USER_NAME}"
+        )));
+        }
+    };
+    req.extensions_mut().insert(AuthedUser {
+        name: user_name,
+        external_metadata_rx: None,
+    });
+    Ok(next.run(req).await)
 }
 
 #[async_trait]
@@ -397,7 +516,10 @@ impl Server for InternalHttpServer {
         let router = self.router.clone();
         Box::pin(async {
             let http = hyper::server::conn::Http::new();
-            http.serve_connection(conn, router).err_into().await
+            http.serve_connection(conn, router)
+                .with_upgrades()
+                .err_into()
+                .await
         })
     }
 }
@@ -413,7 +535,10 @@ enum ConnProtocol {
 }
 
 #[derive(Clone, Debug)]
-struct AuthedUser(User);
+pub struct AuthedUser {
+    name: String,
+    external_metadata_rx: Option<watch::Receiver<ExternalUserMetadata>>,
+}
 
 pub struct AuthedClient {
     pub client: SessionClient,
@@ -421,16 +546,38 @@ pub struct AuthedClient {
 }
 
 impl AuthedClient {
-    async fn new(
+    async fn new<F>(
         adapter_client: &Client,
         user: AuthedUser,
         active_connection_count: SharedConnectionCounter,
-    ) -> Result<Self, AdapterError> {
-        let AuthedUser(user) = user;
-        let drop_connection = DropConnection::new_connection(&user, active_connection_count)?;
+        session_config: F,
+        options: BTreeMap<String, String>,
+    ) -> Result<Self, AdapterError>
+    where
+        F: FnOnce(&mut Session),
+    {
         let conn_id = adapter_client.new_conn_id()?;
-        let session = adapter_client.new_session(conn_id, user);
-        let (adapter_client, _) = adapter_client.startup(session).await?;
+        let mut session = adapter_client.new_session(SessionConfig {
+            conn_id,
+            user: user.name,
+            external_metadata_rx: user.external_metadata_rx,
+        });
+        let drop_connection =
+            DropConnection::new_connection(session.user(), active_connection_count)?;
+        session_config(&mut session);
+        for (key, val) in options {
+            const LOCAL: bool = false;
+            if let Err(err) = session
+                .vars_mut()
+                .set(None, &key, VarInput::Flat(&val), LOCAL)
+            {
+                session.add_notice(AdapterNotice::BadStartupSetting {
+                    name: key.to_string(),
+                    reason: err.to_string(),
+                })
+            }
+        }
+        let adapter_client = adapter_client.startup(session).await?;
         Ok(AuthedClient {
             client: adapter_client,
             drop_connection,
@@ -471,43 +618,37 @@ where
             )
         })?;
         let active_connection_count = req.extensions.get::<SharedConnectionCounter>().unwrap();
-        let mut client = AuthedClient::new(
+
+        let options = if params.options.is_empty() {
+            // It's possible 'options' simply wasn't provided, we don't want that to
+            // count as a failure to deserialize
+            BTreeMap::<String, String>::default()
+        } else {
+            match serde_json::from_str(&params.options) {
+                Ok(options) => options,
+                Err(_e) => {
+                    // If we fail to deserialize options, fail the request.
+                    let code = StatusCode::BAD_REQUEST;
+                    let msg = format!("Failed to deserialize {} map", "options".quoted());
+                    return Err((code, msg));
+                }
+            }
+        };
+
+        let client = AuthedClient::new(
             &adapter_client,
             user.clone(),
             Arc::clone(active_connection_count),
+            |session| {
+                session
+                    .vars_mut()
+                    .set_default(WELCOME_MESSAGE.name(), VarInput::Flat(&false.format()))
+                    .expect("known to exist")
+            },
+            options,
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        // Apply options that were provided in query params.
-        let session = client.client.session();
-        let maybe_options = if params.options.is_empty() {
-            // It's possible 'options' simply wasn't provided, we don't want that to
-            // count as a failure to deserialize
-            Ok(BTreeMap::<String, String>::default())
-        } else {
-            serde_json::from_str(&params.options)
-        };
-
-        if let Ok(options) = maybe_options {
-            for (key, val) in options {
-                const LOCAL: bool = false;
-                if let Err(err) = session
-                    .vars_mut()
-                    .set(None, &key, VarInput::Flat(&val), LOCAL)
-                {
-                    session.add_notice(AdapterNotice::BadStartupSetting {
-                        name: key.to_string(),
-                        reason: err.to_string(),
-                    })
-                }
-            }
-        } else {
-            // If we fail to deserialize options, fail the request.
-            let code = StatusCode::BAD_REQUEST;
-            let msg = format!("Failed to deserialize {} map", "options".quoted());
-            return Err((code, msg));
-        }
 
         Ok(client)
     }
@@ -524,7 +665,7 @@ enum AuthError {
     #[error("missing authorization header")]
     MissingHttpAuthentication,
     #[error("{0}")]
-    MismatchedUser(&'static str),
+    MismatchedUser(String),
     #[error("unexpected credentials")]
     UnexpectedCredentials,
 }
@@ -551,30 +692,22 @@ async fn http_auth<B>(
     mut req: Request<B>,
     next: Next<B>,
     tls_mode: TlsMode,
-    frontegg: &Option<FronteggAuthentication>,
+    frontegg: Option<&FronteggAuthentication>,
 ) -> impl IntoResponse {
     // First, extract the username from the certificate, validating that the
     // connection matches the TLS configuration along the way.
     let conn_protocol = req.extensions().get::<ConnProtocol>().unwrap();
-    let cert_user = match (tls_mode, &conn_protocol) {
-        (TlsMode::Disable, ConnProtocol::Http) => None,
+    match (tls_mode, &conn_protocol) {
+        (TlsMode::Disable, ConnProtocol::Http) => {}
         (TlsMode::Disable, ConnProtocol::Https { .. }) => unreachable!(),
         (TlsMode::Require, ConnProtocol::Http) => return Err(AuthError::HttpsRequired),
-        (TlsMode::Require, ConnProtocol::Https { .. }) => None,
-    };
+        (TlsMode::Require, ConnProtocol::Https { .. }) => {}
+    }
     let creds = match frontegg {
-        // If no Frontegg authentication, we can use the cert's username if
-        // present, otherwise the default HTTP user.
-        None => Credentials::User(cert_user),
+        // If no Frontegg authentication, use the default HTTP user.
+        None => Credentials::DefaultUser,
         Some(_) => {
             if let Some(basic) = req.headers().typed_get::<Authorization<Basic>>() {
-                if let Some(user) = cert_user {
-                    if basic.username() != user {
-                        return Err(AuthError::MismatchedUser(
-                        "user in client certificate did not match user specified in authorization header",
-                    ));
-                    }
-                }
                 Credentials::Password {
                     username: basic.username().to_string(),
                     password: basic.password().to_string(),
@@ -602,9 +735,10 @@ async fn http_auth<B>(
 async fn init_ws(
     WsState {
         frontegg,
-        adapter_client,
+        adapter_client_rx,
         active_connection_count,
     }: &WsState,
+    existing_user: Option<AuthedUser>,
     ws: &mut WebSocket,
 ) -> Result<AuthedClient, anyhow::Error> {
     // TODO: Add a timeout here to prevent resource leaks by clients that
@@ -626,60 +760,78 @@ async fn init_ws(
             }
         }
     };
-    let (creds, options) = if frontegg.is_some() {
-        match ws_auth {
+    let (user, options) = match (frontegg.as_ref(), existing_user, ws_auth) {
+        (Some(frontegg), None, ws_auth) => {
+            let (creds, options) = match ws_auth {
+                WebSocketAuth::Basic {
+                    user,
+                    password,
+                    options,
+                } => {
+                    let creds = Credentials::Password {
+                        username: user,
+                        password,
+                    };
+                    (creds, options)
+                }
+                WebSocketAuth::Bearer { token, options } => {
+                    let creds = Credentials::Token { token };
+                    (creds, options)
+                }
+                WebSocketAuth::OptionsOnly { options: _ } => {
+                    anyhow::bail!("expected auth information");
+                }
+            };
+            (auth(Some(frontegg), creds).await?, options)
+        }
+        (
+            None,
+            None,
             WebSocketAuth::Basic {
                 user,
-                password,
+                password: _,
                 options,
-            } => {
-                let creds = Credentials::Password {
-                    username: user,
-                    password,
-                };
-                (creds, options)
-            }
-            WebSocketAuth::Bearer { token, options } => {
-                let creds = Credentials::Token { token };
-                (creds, options)
-            }
+            },
+        ) => (auth(None, Credentials::User(user)).await?, options),
+        // No frontegg, specified existing user, we only accept options only.
+        (None, Some(existing_user), WebSocketAuth::OptionsOnly { options }) => {
+            (existing_user, options)
         }
-    } else if let WebSocketAuth::Basic { user, options, .. } = ws_auth {
-        (Credentials::User(Some(user)), options)
-    } else {
-        anyhow::bail!("unexpected")
+        // No frontegg, specified existing user, we do not expect basic or bearer auth.
+        (None, Some(_), WebSocketAuth::Basic { .. } | WebSocketAuth::Bearer { .. }) => {
+            warn!("Unexpected bearer or basic auth provided when using user header");
+            anyhow::bail!("unexpected")
+        }
+        // Specifying both frontegg and an existing user should not be possible.
+        (Some(_), Some(_), _) => anyhow::bail!("unexpected"),
+        // No frontegg, no existing user, and no passed username.
+        (None, None, WebSocketAuth::Bearer { .. } | WebSocketAuth::OptionsOnly { .. }) => {
+            warn!("Unexpected auth type when not using frontegg or user header");
+            anyhow::bail!("unexpected")
+        }
     };
-    let user = auth(frontegg, creds).await?;
 
-    let mut client =
-        AuthedClient::new(adapter_client, user, Arc::clone(active_connection_count)).await?;
-
-    // Assign any options we got from our WebSocket startup.
-    let session = client.client.session();
-    for (key, val) in options {
-        const LOCAL: bool = false;
-        if let Err(err) = session
-            .vars_mut()
-            .set(None, &key, VarInput::Flat(&val), LOCAL)
-        {
-            session.add_notice(AdapterNotice::BadStartupSetting {
-                name: key,
-                reason: err.to_string(),
-            })
-        }
-    }
+    let client = AuthedClient::new(
+        &adapter_client_rx.clone().await?,
+        user,
+        Arc::clone(active_connection_count),
+        |_session| (),
+        options,
+    )
+    .await?;
 
     Ok(client)
 }
 
 enum Credentials {
-    User(Option<String>),
+    User(String),
+    DefaultUser,
     Password { username: String, password: String },
     Token { token: String },
 }
 
 async fn auth(
-    frontegg: &Option<FronteggAuthentication>,
+    frontegg: Option<&FronteggAuthentication>,
     creds: Credentials,
 ) -> Result<AuthedUser, AuthError> {
     // There are three places a username may be specified:
@@ -692,13 +844,11 @@ async fn auth(
     // that is also present.
 
     // Then, handle Frontegg authentication if required.
-    let user = match (frontegg, creds) {
-        // If no Frontegg authentication, use the requested user or the default
-        // HTTP user.
-        (None, Credentials::User(user)) => User {
-            name: user.unwrap_or_else(|| HTTP_DEFAULT_USER.name.to_string()),
-            external_metadata: None,
-        },
+    let (name, external_metadata_rx) = match (frontegg, creds) {
+        // If no Frontegg authentication, allow the default user.
+        (None, Credentials::DefaultUser) => (HTTP_DEFAULT_USER.name.to_string(), None),
+        // If no Frontegg authentication, allow a protocol-specified user.
+        (None, Credentials::User(name)) => (name, None),
         // With frontegg disabled, specifying credentials is an error.
         (None, _) => return Err(AuthError::UnexpectedCredentials),
         // If we require Frontegg auth, fetch credentials from the HTTP auth
@@ -706,34 +856,34 @@ async fn auth(
         // is the client+secret pair. Bearer auth is an existing JWT that must
         // be validated. In either case, if a username was specified in the
         // client cert, it must match that of the JWT.
-        (Some(frontegg), creds) => {
-            let (user, token) = match creds {
-                Credentials::Password { username, password } => (
-                    Some(username),
-                    frontegg
-                        .exchange_password_for_token(&password)
-                        .await?
-                        .access_token,
-                ),
-                Credentials::Token { token } => (None, token),
-                Credentials::User(_) => return Err(AuthError::MissingHttpAuthentication),
-            };
-            let claims = frontegg.validate_access_token(&token, user.as_deref())?;
-            User {
-                external_metadata: Some(ExternalUserMetadata {
-                    user_id: claims.best_user_id(),
-                    group_id: claims.tenant_id,
-                    admin: claims.admin(frontegg.admin_role()),
-                }),
-                name: claims.email,
+        (Some(frontegg), creds) => match creds {
+            Credentials::Password { username, password } => {
+                let auth_session = frontegg.authenticate(&username, &password).await?;
+                let user = auth_session.user().into();
+                let external_metadata_rx = Some(auth_session.external_metadata_rx());
+                (user, external_metadata_rx)
             }
-        }
+            Credentials::Token { token } => {
+                let claims = frontegg.validate_access_token(&token, None)?;
+                let (_, external_metadata_rx) = watch::channel(ExternalUserMetadata {
+                    user_id: claims.user_id,
+                    admin: claims.is_admin,
+                });
+                (claims.email, Some(external_metadata_rx))
+            }
+            Credentials::DefaultUser | Credentials::User(_) => {
+                return Err(AuthError::MissingHttpAuthentication)
+            }
+        },
     };
 
-    if mz_adapter::catalog::is_reserved_role_name(user.name.as_str()) {
-        return Err(AuthError::InvalidLogin(user.name));
+    if mz_adapter::catalog::is_reserved_role_name(name.as_str()) {
+        return Err(AuthError::InvalidLogin(name));
     }
-    Ok(AuthedUser(user))
+    Ok(AuthedUser {
+        name,
+        external_metadata_rx,
+    })
 }
 
 /// Configuration for [`base_router`].
@@ -759,8 +909,45 @@ fn base_router(BaseRouterConfig { profiling }: BaseRouterConfig) -> Router {
             routing::get(memory::handle_hierarchical_memory),
         )
         .route("/static/*path", routing::get(root::handle_static));
+
     if profiling {
-        router = router.nest("/prof/", mz_prof::http::router(&BUILD_INFO));
+        router = router.nest("/prof/", mz_prof_http::router(&BUILD_INFO));
     }
+
     router
+}
+
+/// Default layers that should be applied to all routes, and should get applied to both the
+/// internal http and external http routers.
+trait DefaultLayers {
+    fn apply_default_layers(self, source: &'static str, metrics: Metrics) -> Self;
+}
+
+impl DefaultLayers for Router {
+    fn apply_default_layers(self, source: &'static str, metrics: Metrics) -> Self {
+        self.layer(DefaultBodyLimit::max(MAX_REQUEST_SIZE))
+            .layer(metrics::PrometheusLayer::new(source, metrics))
+    }
+}
+
+/// Glue code to make [`tower`] work with [`axum`].
+///
+/// `axum` requires `Layer`s not return Errors, i.e. they must be `Result<_, Infallible>`,
+/// instead you must return a type that can be converted into a response. `tower` on the other
+/// hand does return Errors, so to make the two work together we need to convert our `tower` errors
+/// into responses.
+async fn handle_load_error(error: tower::BoxError) -> impl IntoResponse {
+    if error.is::<tower::load_shed::error::Overloaded>() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Cow::from("too many requests, try again later"),
+        );
+    }
+
+    // Note: This should be unreachable because at the time of writing our only use case is a
+    // layer that emits `tower::load_shed::error::Overloaded`, which is handled above.
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Cow::from(format!("Unhandled internal error: {}", error)),
+    )
 }

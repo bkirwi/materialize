@@ -79,7 +79,6 @@
 //!             v                  v
 //! ```
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::rc::Rc;
@@ -89,31 +88,31 @@ use differential_dataflow::Collection;
 use mz_expr::{EvalError, MirScalarExpr};
 use mz_ore::error::ErrorExt;
 use mz_postgres_util::desc::PostgresTableDesc;
-use mz_postgres_util::PostgresError;
+use mz_postgres_util::{simple_query_opt, PostgresError};
 use mz_repr::{Datum, Diff, Row};
 use mz_sql_parser::ast::{display::AstDisplay, Ident};
-use mz_storage_client::types::connections::ConnectionContext;
-use mz_storage_client::types::errors::SourceErrorDetails;
-use mz_storage_client::types::sources::{MzOffset, PostgresSourceConnection, SourceTimestamp};
+use mz_storage_types::errors::SourceErrorDetails;
+use mz_storage_types::sources::{MzOffset, PostgresSourceConnection, SourceTimestamp};
+use mz_timely_util::builder_async::PressOnDropButton;
 use serde::{Deserialize, Serialize};
-use timely::dataflow::operators::{Concat, Map};
+use timely::dataflow::operators::{Concat, Map, ToStream};
 use timely::dataflow::{Scope, Stream};
 use timely::progress::Antichain;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow};
+use tokio_postgres::Client;
 
-use crate::source::types::{HealthStatus, HealthStatusUpdate, SourceRender};
+use crate::healthcheck::{HealthStatusMessage, HealthStatusUpdate, StatusNamespace};
+use crate::source::types::{ProgressStatisticsUpdate, SourceRender};
 use crate::source::{RawSourceCreationConfig, SourceMessage, SourceReaderError};
 
-mod metrics;
 mod replication;
 mod snapshot;
 
 impl SourceRender for PostgresSourceConnection {
-    type Key = ();
-    type Value = Row;
     type Time = MzOffset;
+
+    const STATUS_NAMESPACE: StatusNamespace = StatusNamespace::Postgres;
 
     /// Render the ingestion dataflow. This function only connects things together and contains no
     /// actual processing logic.
@@ -121,17 +120,18 @@ impl SourceRender for PostgresSourceConnection {
         self,
         scope: &mut G,
         config: RawSourceCreationConfig,
-        context: ConnectionContext,
         resume_uppers: impl futures::Stream<Item = Antichain<MzOffset>> + 'static,
+        _start_signal: impl std::future::Future<Output = ()> + 'static,
     ) -> (
-        Collection<G, (usize, Result<SourceMessage<(), Row>, SourceReaderError>), Diff>,
+        Collection<G, (usize, Result<SourceMessage, SourceReaderError>), Diff>,
         Option<Stream<G, Infallible>>,
-        Stream<G, (usize, HealthStatusUpdate)>,
-        Rc<dyn Any>,
+        Stream<G, HealthStatusMessage>,
+        Stream<G, ProgressStatisticsUpdate>,
+        Vec<PressOnDropButton>,
     ) {
         // Determined which collections need to be snapshot and which already have been.
         let subsource_resume_uppers: BTreeMap<_, _> = config
-            .source_resume_upper
+            .source_resume_uppers
             .iter()
             .map(|(id, upper)| {
                 assert!(
@@ -148,7 +148,6 @@ impl SourceRender for PostgresSourceConnection {
 
         // Collect the tables that we will be ingesting.
         let mut table_info = BTreeMap::new();
-        let mut subsource_outputs = vec![];
         for (i, desc) in self.publication_details.tables.iter().enumerate() {
             // Index zero maps to the main source
             let output_index = i + 1;
@@ -158,66 +157,96 @@ impl SourceRender for PostgresSourceConnection {
             // not we have casts for it.
             if let Some(casts) = self.table_casts.get(&output_index) {
                 table_info.insert(desc.oid, (output_index, desc.clone(), casts.clone()));
-                subsource_outputs.push(output_index);
             }
         }
 
-        let (snapshot_updates, rewinds, snapshot_err, snapshot_token) = snapshot::render(
-            scope.clone(),
-            config.clone(),
-            self.clone(),
-            context.clone(),
-            subsource_resume_uppers.clone(),
-            table_info.clone(),
-        );
+        let metrics = config.metrics.get_postgres_source_metrics(config.id);
 
-        let (repl_updates, uppers, repl_err, repl_token) = replication::render(
+        let (snapshot_updates, rewinds, snapshot_stats, snapshot_err, snapshot_token) =
+            snapshot::render(
+                scope.clone(),
+                config.clone(),
+                self.clone(),
+                subsource_resume_uppers.clone(),
+                table_info.clone(),
+                metrics.snapshot_metrics.clone(),
+            );
+
+        let (repl_updates, uppers, stats_stream, repl_err, repl_token) = replication::render(
             scope.clone(),
             config,
             self,
-            context,
             subsource_resume_uppers,
             table_info,
             &rewinds,
             resume_uppers,
+            metrics,
         );
+
+        let stats_stream = stats_stream.concat(&snapshot_stats);
 
         let updates = snapshot_updates.concat(&repl_updates).map(|(output, res)| {
             let res = res.map(|row| SourceMessage {
-                upstream_time_millis: None,
-                key: (),
+                key: Row::default(),
                 value: row,
-                headers: None,
+                metadata: Row::default(),
             });
             (output, res)
         });
 
-        let health = snapshot_err.concat(&repl_err).flat_map(move |err| {
-            let update = HealthStatus::StalledWithError {
-                error: err.display_with_causes().to_string(),
-                hint: None,
-            };
-            // This update will cause the dataflow to restart
-            let halt_status = HealthStatusUpdate {
-                update: update.clone(),
-                should_halt: true,
-            };
-            let mut statuses = vec![(0, halt_status)];
+        let init = std::iter::once(HealthStatusMessage {
+            index: 0,
+            namespace: Self::STATUS_NAMESPACE,
+            update: HealthStatusUpdate::Running,
+        })
+        .to_stream(scope);
 
-            // But we still want to report the transient error for all subsources
-            statuses.extend(subsource_outputs.iter().map(|index| {
-                let status = HealthStatusUpdate {
-                    update: update.clone(),
-                    should_halt: false,
-                };
-                (*index, status)
-            }));
-            statuses
+        // N.B. Note that we don't check ssh tunnel statuses here. We could, but immediately on
+        // restart we are going to set the status to an ssh error correctly, so we don't do this
+        // extra work.
+        let errs = snapshot_err.concat(&repl_err).map(move |err| {
+            // This update will cause the dataflow to restart
+            let err_string = err.display_with_causes().to_string();
+            let update = HealthStatusUpdate::halting(err_string.clone(), None);
+
+            let namespace = match err {
+                ReplicationError::Transient(err)
+                    if matches!(
+                        &*err,
+                        TransientError::PostgresError(PostgresError::Ssh(_))
+                            | TransientError::PostgresError(PostgresError::SshIo(_))
+                    ) =>
+                {
+                    StatusNamespace::Ssh
+                }
+                _ => Self::STATUS_NAMESPACE,
+            };
+
+            HealthStatusMessage {
+                index: 0,
+                namespace: namespace.clone(),
+                update,
+            }
         });
 
-        let token = Rc::new((snapshot_token, repl_token));
-        (updates, Some(uppers), health, token)
+        let health = init.concat(&errs);
+
+        (
+            updates,
+            Some(uppers),
+            health,
+            stats_stream,
+            vec![snapshot_token, repl_token],
+        )
     }
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum ReplicationError {
+    #[error(transparent)]
+    Transient(#[from] Rc<TransientError>),
+    #[error(transparent)]
+    Definite(#[from] Rc<DefiniteError>),
 }
 
 /// A transient error that never ends up in the collection of a specific table.
@@ -236,18 +265,12 @@ pub enum TransientError {
     UnknownReplicationMessage,
     #[error("unexpected logical replication message")]
     UnknownLogicalReplicationMessage,
-    #[error("malformed logical replication message")]
-    MalformedReplicationMessage(#[source] std::io::Error),
-    #[error("transaction begun without BEGIN")]
-    UnmatchedTransaction,
     #[error("received replication event outside of transaction")]
     BareTransactionEvent,
     #[error("lsn mismatch between BEGIN and COMMIT")]
     InvalidTransaction,
     #[error("BEGIN within existing BEGIN stream")]
     NestedTransaction,
-    #[error("query returned more rows than expected")]
-    UnexpectedRow,
     #[error("recoverable errors should crash the process during snapshots")]
     SyntheticError,
     #[error("sql client error")]
@@ -261,16 +284,22 @@ pub enum TransientError {
 /// A definite error that always ends up in the collection of a specific table.
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 pub enum DefiniteError {
+    #[error("slot compacted past snapshot point. snapshot consistent point={0} resume_lsn={1}")]
+    SlotCompactedPastResumePoint(MzOffset, MzOffset),
     #[error("table was truncated")]
     TableTruncated,
     #[error("table was dropped")]
     TableDropped,
     #[error("publication {0:?} does not exist")]
     PublicationDropped(String),
+    #[error("replication slot has been invalidated because it exceeded the maximum reserved size")]
+    InvalidReplicationSlot,
     #[error("unexpected number of columns while parsing COPY output")]
     MissingColumn,
     #[error("failed to parse COPY protocol")]
     InvalidCopyInput,
+    #[error("invalid timeline ID from PostgreSQL server. Expected {expected} but got {actual}")]
+    InvalidTimelineId { expected: u64, actual: u64 },
     #[error("TOASTed value missing from old row. Did you forget to set REPLICA IDENTITY to FULL for your table?")]
     MissingToast,
     #[error("old row missing from replication stream. Did you forget to set REPLICA IDENTITY to FULL for your table?")]
@@ -294,15 +323,17 @@ impl From<DefiniteError> for SourceReaderError {
 
 /// Ensures the replication slot of this connection is created.
 async fn ensure_replication_slot(client: &Client, slot: &str) -> Result<(), TransientError> {
-    let slot = Ident::from(slot).to_ast_string();
+    // Note: Using unchecked here is okay because we're using it in a SQL query.
+    let slot = Ident::new_unchecked(slot).to_ast_string();
     let query = format!("CREATE_REPLICATION_SLOT {slot} LOGICAL \"pgoutput\" NOEXPORT_SNAPSHOT");
     match simple_query_opt(client, &query).await {
         Ok(_) => Ok(()),
         // If the slot already exists that's still ok
-        Err(TransientError::SQLClient(err)) if err.code() == Some(&SqlState::DUPLICATE_OBJECT) => {
+        Err(PostgresError::Postgres(err)) if err.code() == Some(&SqlState::DUPLICATE_OBJECT) => {
+            tracing::trace!("replication slot {slot} already existed");
             Ok(())
         }
-        Err(err) => Err(err),
+        Err(err) => Err(TransientError::PostgresError(err)),
     }
 }
 
@@ -318,12 +349,32 @@ async fn fetch_slot_resume_lsn(client: &Client, slot: &str) -> Result<MzOffset, 
 
         match row.get("confirmed_flush_lsn") {
             // For postgres, `confirmed_flush_lsn` means that the slot is able to produce
-            // all transactions that happen at tx_lsn > confirmed_flush_lsn. Therefore the
-            // upper is confirmed_flush_lsn + 1
-            Some(flush_lsn) => return Ok(MzOffset::from(flush_lsn.parse::<PgLsn>().unwrap()) + 1),
+            // all transactions that happen at tx_lsn >= confirmed_flush_lsn. Therefore this value
+            // already has "upper" semantics.
+            Some(flush_lsn) => return Ok(MzOffset::from(flush_lsn.parse::<PgLsn>().unwrap())),
             // It can happen that confirmed_flush_lsn is NULL as the slot initializes
             None => tokio::time::sleep(Duration::from_millis(500)).await,
         };
+    }
+}
+
+/// Fetch the `pg_current_wal_lsn`, used to report metrics.
+async fn fetch_max_lsn(client: &Client) -> Result<MzOffset, TransientError> {
+    let query = format!("SELECT pg_current_wal_lsn()",);
+    let row = simple_query_opt(client, &query).await?;
+
+    match row.and_then(|row| {
+        row.get("pg_current_wal_lsn")
+            .map(|lsn| lsn.parse::<PgLsn>().unwrap())
+    }) {
+        // Based on the documentation, it appears that `pg_current_wal_lsn` has
+        // the same "upper" semantics of `confirmed_flush_lsn`:
+        // <https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-BACKUP>
+        // We may need to revisit this and use `pg_current_wal_flush_lsn`.
+        Some(lsn) => Ok(MzOffset::from(lsn)),
+        None => Err(TransientError::Generic(anyhow::anyhow!(
+            "pg_current_wal_lsn() mysteriously has no value"
+        ))),
     }
 }
 
@@ -339,23 +390,6 @@ fn verify_schema(
     match expected_desc.determine_compatibility(current_desc) {
         Ok(()) => Ok(()),
         Err(err) => Err(DefiniteError::IncompatibleSchema(err.to_string())),
-    }
-}
-
-/// Runs the given query using the client and expects at most a single row to be returned.
-async fn simple_query_opt(
-    client: &Client,
-    query: &str,
-) -> Result<Option<SimpleQueryRow>, TransientError> {
-    let result = client.simple_query(query).await?;
-    let mut rows = result.into_iter().filter_map(|msg| match msg {
-        SimpleQueryMessage::Row(row) => Some(row),
-        _ => None,
-    });
-    match (rows.next(), rows.next()) {
-        (Some(row), None) => Ok(Some(row)),
-        (None, None) => Ok(None),
-        _ => Err(TransientError::UnexpectedRow),
     }
 }
 

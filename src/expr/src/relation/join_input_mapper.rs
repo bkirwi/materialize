@@ -58,9 +58,9 @@ impl JoinInputMapper {
     /// efficient if input arities have been pre-calculated
     pub fn new_from_input_arities<I>(arities: I) -> Self
     where
-        I: Iterator<Item = usize>,
+        I: IntoIterator<Item = usize>,
     {
-        let arities = arities.collect::<Vec<usize>>();
+        let arities = arities.into_iter().collect::<Vec<usize>>();
         let mut offset = 0;
         let mut prior_arities = Vec::new();
         for input in 0..arities.len() {
@@ -180,8 +180,7 @@ impl JoinInputMapper {
     /// where column references have been remapped to the local context.
     /// Assumes that all columns in `expr` are from the same input.
     pub fn map_expr_to_local(&self, mut expr: MirScalarExpr) -> MirScalarExpr {
-        #[allow(deprecated)]
-        expr.visit_mut_post_nolimit(&mut |e| {
+        expr.visit_pre_mut(|e| {
             if let MirScalarExpr::Column(c) = e {
                 *c -= self.prior_arities[self.input_relation[*c]];
             }
@@ -193,8 +192,7 @@ impl JoinInputMapper {
     /// creates a new version where column references have been remapped to the
     /// global context.
     pub fn map_expr_to_global(&self, mut expr: MirScalarExpr, index: usize) -> MirScalarExpr {
-        #[allow(deprecated)]
-        expr.visit_mut_post_nolimit(&mut |e| {
+        expr.visit_pre_mut(|e| {
             if let MirScalarExpr::Column(c) = e {
                 *c += self.prior_arities[index];
             }

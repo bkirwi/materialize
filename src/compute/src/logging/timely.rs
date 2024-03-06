@@ -17,15 +17,14 @@ use std::time::Duration;
 
 use differential_dataflow::collection::AsCollection;
 use mz_compute_client::logging::LoggingConfig;
-use mz_expr::{permutation_for_arrangement, MirScalarExpr};
 use mz_ore::cast::CastFrom;
-use mz_repr::{datum_list_size, datum_size, Datum, DatumVec, Diff, Row, Timestamp};
+use mz_repr::{Datum, Diff, Timestamp};
 use mz_timely_util::buffer::ConsolidateBuffer;
 use mz_timely_util::replay::MzReplay;
 use serde::{Deserialize, Serialize};
 use timely::communication::Allocate;
-use timely::container::columnation::{CloneRegion, Columnation};
-use timely::dataflow::channels::pact::{Exchange, Pipeline};
+use timely::container::columnation::{Columnation, CopyRegion};
+use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::channels::pushers::Tee;
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
 use timely::dataflow::operators::{Filter, InputCapability};
@@ -37,8 +36,9 @@ use tracing::error;
 
 use crate::extensions::arrange::MzArrange;
 use crate::logging::compute::ComputeEvent;
+use crate::logging::PermutedRowPacker;
 use crate::logging::{EventQueue, LogVariant, SharedLoggingState, TimelyLog};
-use crate::typedefs::{KeysValsHandle, RowSpine};
+use crate::typedefs::{KeyValSpine, RowRowAgent, RowRowSpine};
 
 /// Constructs the logging dataflow for timely logs.
 ///
@@ -53,7 +53,7 @@ pub(super) fn construct<A: Allocate>(
     config: &LoggingConfig,
     event_queue: EventQueue<TimelyEvent>,
     shared_state: Rc<RefCell<SharedLoggingState>>,
-) -> BTreeMap<LogVariant, (KeysValsHandle, Rc<dyn Any>)> {
+) -> BTreeMap<LogVariant, (RowRowAgent<Timestamp, Diff>, Rc<dyn Any>)> {
     let logging_interval_ms = std::cmp::max(1, config.interval.as_millis());
     let worker_id = worker.index();
     let peers = worker.peers();
@@ -84,6 +84,8 @@ pub(super) fn construct<A: Allocate>(
         let (mut messages_received_out, messages_received) = demux.new_output();
         let (mut schedules_duration_out, schedules_duration) = demux.new_output();
         let (mut schedules_histogram_out, schedules_histogram) = demux.new_output();
+        let (mut batches_sent_out, batches_sent) = demux.new_output();
+        let (mut batches_received_out, batches_received) = demux.new_output();
 
         let mut demux_state = DemuxState::default();
         let mut demux_buffer = Vec::new();
@@ -95,6 +97,8 @@ pub(super) fn construct<A: Allocate>(
                 let mut parks = parks_out.activate();
                 let mut messages_sent = messages_sent_out.activate();
                 let mut messages_received = messages_received_out.activate();
+                let mut batches_sent = batches_sent_out.activate();
+                let mut batches_received = batches_received_out.activate();
                 let mut schedules_duration = schedules_duration_out.activate();
                 let mut schedules_histogram = schedules_histogram_out.activate();
 
@@ -107,6 +111,8 @@ pub(super) fn construct<A: Allocate>(
                     messages_received: ConsolidateBuffer::new(&mut messages_received, 5),
                     schedules_duration: ConsolidateBuffer::new(&mut schedules_duration, 6),
                     schedules_histogram: ConsolidateBuffer::new(&mut schedules_histogram, 7),
+                    batches_sent: ConsolidateBuffer::new(&mut batches_sent, 8),
+                    batches_received: ConsolidateBuffer::new(&mut batches_received, 9),
                 };
 
                 input.for_each(|cap, data| {
@@ -142,29 +148,25 @@ pub(super) fn construct<A: Allocate>(
         // Encode the contents of each logging stream into its expected `Row` format.
         // We pre-arrange the logging streams to force a consolidation and reduce the amount of
         // updates that reach `Row` encoding.
+        let mut packer = PermutedRowPacker::new(TimelyLog::Operates);
         let operates = operates
             .as_collection()
-            .mz_arrange_core::<_, RowSpine<_, _, _, _>>(
-                Exchange::new(move |_| u64::cast_from(worker_id)),
-                "PreArrange Timely operates",
-            )
+            .mz_arrange_core::<_, KeyValSpine<_, _, _, _>>(Pipeline, "PreArrange Timely operates")
             .as_collection(move |id, name| {
-                Row::pack_slice(&[
+                packer.pack_slice(&[
                     Datum::UInt64(u64::cast_from(*id)),
                     Datum::UInt64(u64::cast_from(worker_id)),
                     Datum::String(name),
                 ])
             });
+        let mut packer = PermutedRowPacker::new(TimelyLog::Channels);
         let channels = channels
             .as_collection()
-            .mz_arrange_core::<_, RowSpine<_, _, _, _>>(
-                Exchange::new(move |_| u64::cast_from(worker_id)),
-                "PreArrange Timely operates",
-            )
+            .mz_arrange_core::<_, KeyValSpine<_, _, _, _>>(Pipeline, "PreArrange Timely operates")
             .as_collection(move |datum, ()| {
                 let (source_node, source_port) = datum.source;
                 let (target_node, target_port) = datum.target;
-                Row::pack_slice(&[
+                packer.pack_slice(&[
                     Datum::UInt64(u64::cast_from(datum.id)),
                     Datum::UInt64(u64::cast_from(worker_id)),
                     Datum::UInt64(u64::cast_from(source_node)),
@@ -173,21 +175,28 @@ pub(super) fn construct<A: Allocate>(
                     Datum::UInt64(u64::cast_from(target_port)),
                 ])
             });
+
+        let mut packer = PermutedRowPacker::new(TimelyLog::Addresses);
         let addresses = addresses
             .as_collection()
-            .mz_arrange_core::<_, RowSpine<_, _, _, _>>(
-                Exchange::new(move |_| u64::cast_from(worker_id)),
-                "PreArrange Timely addresses",
-            )
-            .as_collection(move |id, address| create_address_row(*id, address, worker_id));
+            .mz_arrange_core::<_, KeyValSpine<_, _, _, _>>(Pipeline, "PreArrange Timely addresses")
+            .as_collection({
+                move |id, address| {
+                    packer.pack_by_index(|packer, index| match index {
+                        0 => packer.push(Datum::UInt64(u64::cast_from(*id))),
+                        1 => packer.push(Datum::UInt64(u64::cast_from(worker_id))),
+                        2 => packer
+                            .push_list(address.iter().map(|i| Datum::UInt64(u64::cast_from(*i)))),
+                        _ => unreachable!("Addresses relation has three columns"),
+                    })
+                }
+            });
+        let mut packer = PermutedRowPacker::new(TimelyLog::Parks);
         let parks = parks
             .as_collection()
-            .mz_arrange_core::<_, RowSpine<_, _, _, _>>(
-                Exchange::new(move |_| u64::cast_from(worker_id)),
-                "PreArrange Timely parks",
-            )
+            .mz_arrange_core::<_, KeyValSpine<_, _, _, _>>(Pipeline, "PreArrange Timely parks")
             .as_collection(move |datum, ()| {
-                Row::pack_slice(&[
+                packer.pack_slice(&[
                     Datum::UInt64(u64::cast_from(worker_id)),
                     Datum::UInt64(u64::try_from(datum.duration_pow).expect("duration too big")),
                     datum
@@ -196,57 +205,82 @@ pub(super) fn construct<A: Allocate>(
                         .unwrap_or(Datum::Null),
                 ])
             });
+        let mut packer = PermutedRowPacker::new(TimelyLog::BatchesSent);
+        let batches_sent = batches_sent
+            .as_collection()
+            .mz_arrange_core::<_, KeyValSpine<_, _, _, _>>(
+                Pipeline,
+                "PreArrange Timely batches sent",
+            )
+            .as_collection(move |datum, ()| {
+                packer.pack_slice(&[
+                    Datum::UInt64(u64::cast_from(datum.channel)),
+                    Datum::UInt64(u64::cast_from(worker_id)),
+                    Datum::UInt64(u64::cast_from(datum.worker)),
+                ])
+            });
+        let mut packer = PermutedRowPacker::new(TimelyLog::BatchesReceived);
+        let batches_received = batches_received
+            .as_collection()
+            .mz_arrange_core::<_, KeyValSpine<_, _, _, _>>(
+                Pipeline,
+                "PreArrange Timely batches received",
+            )
+            .as_collection(move |datum, ()| {
+                packer.pack_slice(&[
+                    Datum::UInt64(u64::cast_from(datum.channel)),
+                    Datum::UInt64(u64::cast_from(datum.worker)),
+                    Datum::UInt64(u64::cast_from(worker_id)),
+                ])
+            });
+        let mut packer = PermutedRowPacker::new(TimelyLog::MessagesSent);
         let messages_sent = messages_sent
             .as_collection()
-            .mz_arrange_core::<_, RowSpine<_, _, _, _>>(
-                Exchange::new(move |_| u64::cast_from(worker_id)),
+            .mz_arrange_core::<_, KeyValSpine<_, _, _, _>>(
+                Pipeline,
                 "PreArrange Timely messages sent",
             )
             .as_collection(move |datum, ()| {
-                Row::pack_slice(&[
+                packer.pack_slice(&[
                     Datum::UInt64(u64::cast_from(datum.channel)),
                     Datum::UInt64(u64::cast_from(worker_id)),
                     Datum::UInt64(u64::cast_from(datum.worker)),
                 ])
             });
+        let mut packer = PermutedRowPacker::new(TimelyLog::MessagesReceived);
         let messages_received = messages_received
             .as_collection()
-            .mz_arrange_core::<_, RowSpine<_, _, _, _>>(
-                Exchange::new(move |_| u64::cast_from(worker_id)),
+            .mz_arrange_core::<_, KeyValSpine<_, _, _, _>>(
+                Pipeline,
                 "PreArrange Timely messages received",
             )
             .as_collection(move |datum, ()| {
-                Row::pack_slice(&[
+                packer.pack_slice(&[
                     Datum::UInt64(u64::cast_from(datum.channel)),
                     Datum::UInt64(u64::cast_from(datum.worker)),
                     Datum::UInt64(u64::cast_from(worker_id)),
                 ])
             });
+        let mut packer = PermutedRowPacker::new(TimelyLog::Elapsed);
         let elapsed = schedules_duration
             .as_collection()
-            .mz_arrange_core::<_, RowSpine<_, _, _, _>>(
-                Exchange::new(move |_| u64::cast_from(worker_id)),
-                "PreArrange Timely duration",
-            )
+            .mz_arrange_core::<_, KeyValSpine<_, _, _, _>>(Pipeline, "PreArrange Timely duration")
             .as_collection(move |operator, _| {
-                Row::pack_slice(&[
+                packer.pack_slice(&[
                     Datum::UInt64(u64::cast_from(*operator)),
                     Datum::UInt64(u64::cast_from(worker_id)),
                 ])
             });
+        let mut packer = PermutedRowPacker::new(TimelyLog::Histogram);
         let histogram = schedules_histogram
             .as_collection()
-            .mz_arrange_core::<_, RowSpine<_, _, _, _>>(
-                Exchange::new(move |_| u64::cast_from(worker_id)),
-                "PreArrange Timely histogram",
-            )
+            .mz_arrange_core::<_, KeyValSpine<_, _, _, _>>(Pipeline, "PreArrange Timely histogram")
             .as_collection(move |datum, _| {
-                let row = Row::pack_slice(&[
+                packer.pack_slice(&[
                     Datum::UInt64(u64::cast_from(datum.operator)),
                     Datum::UInt64(u64::cast_from(worker_id)),
                     Datum::UInt64(u64::try_from(datum.duration_pow).expect("duration too big")),
-                ]);
-                row
+                ])
             });
 
         use TimelyLog::*;
@@ -259,6 +293,8 @@ pub(super) fn construct<A: Allocate>(
             (Parks, parks),
             (MessagesSent, messages_sent),
             (MessagesReceived, messages_received),
+            (BatchesSent, batches_sent),
+            (BatchesReceived, batches_received),
         ];
 
         // Build the output arrangements.
@@ -266,58 +302,15 @@ pub(super) fn construct<A: Allocate>(
         for (variant, collection) in logs {
             let variant = LogVariant::Timely(variant);
             if config.index_logs.contains_key(&variant) {
-                let key = variant.index_by();
-                let (_, value) = permutation_for_arrangement(
-                    &key.iter()
-                        .cloned()
-                        .map(MirScalarExpr::Column)
-                        .collect::<Vec<_>>(),
-                    variant.desc().arity(),
-                );
                 let trace = collection
-                    .map({
-                        let mut row_buf = Row::default();
-                        let mut datums = DatumVec::new();
-                        move |row| {
-                            let datums = datums.borrow_with(&row);
-                            row_buf.packer().extend(key.iter().map(|k| datums[*k]));
-                            let row_key = row_buf.clone();
-                            row_buf.packer().extend(value.iter().map(|k| datums[*k]));
-                            let row_val = row_buf.clone();
-                            (row_key, row_val)
-                        }
-                    })
-                    .mz_arrange::<RowSpine<_, _, _, _>>(&format!("ArrangeByKey {:?}", variant))
+                    .mz_arrange::<RowRowSpine<_, _>>(&format!("Arrange {variant:?}"))
                     .trace;
-                traces.insert(variant.clone(), (trace, Rc::clone(&token)));
+                traces.insert(variant, (trace, Rc::clone(&token)));
             }
         }
 
         traces
     })
-}
-
-fn create_address_row(id: usize, address: &[usize], worker_id: usize) -> Row {
-    let id_datum = Datum::UInt64(u64::cast_from(id));
-    let worker_datum = Datum::UInt64(u64::cast_from(worker_id));
-    // We're collecting into a Vec because we need to iterate over the Datums
-    // twice: once for determining the size of the row, then again for pushing
-    // them.
-    let address_datums: Vec<_> = address
-        .iter()
-        .map(|i| Datum::UInt64(u64::cast_from(*i)))
-        .collect();
-
-    let row_capacity =
-        datum_size(&id_datum) + datum_size(&worker_datum) + datum_list_size(&address_datums);
-
-    let mut address_row = Row::with_capacity(row_capacity);
-    let mut packer = address_row.packer();
-    packer.push(id_datum);
-    packer.push(worker_datum);
-    packer.push_list(address_datums);
-
-    address_row
 }
 
 /// State maintained by the demux operator.
@@ -330,9 +323,9 @@ struct DemuxState {
     /// Information about the last requested park.
     last_park: Option<Park>,
     /// Maps channel IDs to vectors counting the messages sent to each target worker.
-    messages_sent: BTreeMap<usize, Vec<i64>>,
+    messages_sent: BTreeMap<usize, Vec<MessageCount>>,
     /// Maps channel IDs to vectors counting the messages received from each source worker.
-    messages_received: BTreeMap<usize, Vec<i64>>,
+    messages_received: BTreeMap<usize, Vec<MessageCount>>,
     /// Stores for scheduled operators the time when they were scheduled.
     schedule_starts: BTreeMap<usize, Duration>,
     /// Maps operator IDs to a vector recording the (count, elapsed_ns) values in each histogram
@@ -345,6 +338,15 @@ struct Park {
     time: Duration,
     /// Requested park time.
     requested: Option<Duration>,
+}
+
+/// Organize message counts into number of batches and records.
+#[derive(Default, Copy, Clone, Debug)]
+struct MessageCount {
+    /// The number of batches sent across a channel.
+    batches: i64,
+    /// The number of records sent across a channel.
+    records: i64,
 }
 
 type Pusher<D> = Tee<Timestamp, (D, Timestamp, Diff)>;
@@ -360,13 +362,15 @@ struct DemuxOutput<'a, 'b> {
     channels: OutputBuffer<'a, 'b, (ChannelDatum, ())>,
     addresses: OutputBuffer<'a, 'b, (usize, Vec<usize>)>,
     parks: OutputBuffer<'a, 'b, (ParkDatum, ())>,
+    batches_sent: OutputBuffer<'a, 'b, (MessageDatum, ())>,
+    batches_received: OutputBuffer<'a, 'b, (MessageDatum, ())>,
     messages_sent: OutputBuffer<'a, 'b, (MessageDatum, ())>,
     messages_received: OutputBuffer<'a, 'b, (MessageDatum, ())>,
     schedules_duration: OutputBuffer<'a, 'b, (usize, ())>,
     schedules_histogram: OutputBuffer<'a, 'b, (ScheduleHistogramDatum, ())>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 struct ChannelDatum {
     id: usize,
     source: (usize, usize),
@@ -374,37 +378,37 @@ struct ChannelDatum {
 }
 
 impl Columnation for ChannelDatum {
-    type InnerRegion = CloneRegion<Self>;
+    type InnerRegion = CopyRegion<Self>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 struct ParkDatum {
     duration_pow: u128,
     requested_pow: Option<u128>,
 }
 
 impl Columnation for ParkDatum {
-    type InnerRegion = CloneRegion<Self>;
+    type InnerRegion = CopyRegion<Self>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 struct MessageDatum {
     channel: usize,
     worker: usize,
 }
 
 impl Columnation for MessageDatum {
-    type InnerRegion = CloneRegion<Self>;
+    type InnerRegion = CopyRegion<Self>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 struct ScheduleHistogramDatum {
     operator: usize,
     duration_pow: u128,
 }
 
 impl Columnation for ScheduleHistogramDatum {
-    type InnerRegion = CloneRegion<Self>;
+    type InnerRegion = CopyRegion<Self>;
 }
 
 /// Event handler of the demux operator.
@@ -561,7 +565,10 @@ impl DemuxHandler<'_, '_, '_> {
                     };
                     self.output
                         .messages_sent
-                        .give(self.cap, ((datum, ()), ts, -count));
+                        .give(self.cap, ((datum, ()), ts, -count.records));
+                    self.output
+                        .batches_sent
+                        .give(self.cap, ((datum, ()), ts, -count.batches));
                 }
             }
             if let Some(received) = self.state.messages_received.remove(&channel.id) {
@@ -572,7 +579,10 @@ impl DemuxHandler<'_, '_, '_> {
                     };
                     self.output
                         .messages_received
-                        .give(self.cap, ((datum, ()), ts, -count));
+                        .give(self.cap, ((datum, ()), ts, -count.records));
+                    self.output
+                        .batches_received
+                        .give(self.cap, ((datum, ()), ts, -count.batches));
                 }
             }
         }
@@ -622,13 +632,17 @@ impl DemuxHandler<'_, '_, '_> {
             self.output
                 .messages_sent
                 .give(self.cap, ((datum, ()), ts, count));
+            self.output
+                .batches_sent
+                .give(self.cap, ((datum, ()), ts, 1));
 
             let sent_counts = self
                 .state
                 .messages_sent
                 .entry(event.channel)
-                .or_insert_with(|| vec![0; self.peers]);
-            sent_counts[event.target] += count;
+                .or_insert_with(|| vec![Default::default(); self.peers]);
+            sent_counts[event.target].records += count;
+            sent_counts[event.target].batches += 1;
         } else {
             let datum = MessageDatum {
                 channel: event.channel,
@@ -637,13 +651,17 @@ impl DemuxHandler<'_, '_, '_> {
             self.output
                 .messages_received
                 .give(self.cap, ((datum, ()), ts, count));
+            self.output
+                .batches_received
+                .give(self.cap, ((datum, ()), ts, 1));
 
             let received_counts = self
                 .state
                 .messages_received
                 .entry(event.channel)
-                .or_insert_with(|| vec![0; self.peers]);
-            received_counts[event.source] += count;
+                .or_insert_with(|| vec![Default::default(); self.peers]);
+            received_counts[event.source].records += count;
+            received_counts[event.source].batches += 1;
         }
     }
 

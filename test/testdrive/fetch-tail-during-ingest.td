@@ -14,6 +14,9 @@
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
 ALTER SYSTEM SET enable_create_source_denylist_with_options = true
 
+$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
+ALTER SYSTEM SET min_timestamp_interval = '100ms'
+
 $set-regex match=\d{13} replacement=<TIMESTAMP>
 
 $ set int={"type": "record", "name": "field_int", "fields": [ {"name": "f1", "type": "int"} ] }
@@ -21,9 +24,10 @@ $ set int={"type": "record", "name": "field_int", "fields": [ {"name": "f1", "ty
 $ kafka-create-topic topic=tail-fetch-during-ingest
 
 > CREATE CONNECTION kafka_conn
-  TO KAFKA (BROKER '${testdrive.kafka-addr}');
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > CREATE SOURCE fetch_during_ingest
+  IN CLUSTER ${arg.single-replica-cluster}
   FROM KAFKA CONNECTION kafka_conn (TOPIC 'testdrive-tail-fetch-during-ingest-${testdrive.seed}')
   FORMAT AVRO USING SCHEMA '${int}'
   ENVELOPE NONE

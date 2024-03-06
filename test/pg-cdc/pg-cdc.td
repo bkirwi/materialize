@@ -12,12 +12,24 @@
 # pg_hba.conf if you modify the existing user names or add new ones.
 
 > CREATE SECRET pgpass AS 'postgres'
+
+! CREATE CONNECTION pg TO POSTGRES (
+    HOST postgres,
+    DATABASE postgres,
+    USER postgres,
+    PASSWORD SECRET pgpass,
+    BROKER '${testdrive.kafka-addr}'
+  )
+contains:POSTGRES connections do not support BROKER values
+
 > CREATE CONNECTION pg TO POSTGRES (
     HOST postgres,
     DATABASE postgres,
     USER postgres,
     PASSWORD SECRET pgpass
   )
+
+> CREATE CLUSTER cdc_cluster SIZE '${arg.default-replica-size}'
 
 $ postgres-execute connection=postgres://postgres:postgres@postgres
 ALTER USER postgres WITH replication;
@@ -79,9 +91,14 @@ CREATE TABLE "таблица" ("колона" TEXT);
 ALTER TABLE "таблица" REPLICA IDENTITY FULL;
 INSERT INTO "таблица" VALUES ('стойност');
 
+CREATE TABLE tstzrange_table (a TSTZRANGE);
+ALTER TABLE tstzrange_table REPLICA IDENTITY FULL;
+INSERT INTO tstzrange_table VALUES ('["2024-02-13 17:01:58.37848+00!?!",)');
+
 CREATE TABLE """literal_quotes""" (a TEXT);
 ALTER TABLE """literal_quotes""" REPLICA IDENTITY FULL;
 INSERT INTO """literal_quotes""" VALUES ('v');
+ALTER TABLE """literal_quotes""" REPLICA IDENTITY FULL;
 
 CREATE TABLE "create" (a TEXT);
 ALTER TABLE "create" REPLICA IDENTITY FULL;
@@ -103,6 +120,7 @@ ALTER TABLE conflict_schema.conflict_table REPLICA IDENTITY FULL;
 INSERT INTO conflict_schema.conflict_table VALUES ('234');
 
 CREATE TABLE "space table" ("space column" INTEGER);
+ALTER TABLE "space table" REPLICA IDENTITY FULL;
 
 CREATE TYPE an_enum AS ENUM ('var0', 'var1');
 CREATE TABLE enum_table (a an_enum);
@@ -115,7 +133,6 @@ INSERT INTO another_enum_table VALUES ('var2'), ('var3');
 ALTER TABLE another_enum_table REPLICA IDENTITY FULL;
 
 CREATE TABLE conflict_schema.another_enum_table ("колона" another_enum);
-ALTER TABLE conflict_schema.another_enum_table REPLICA IDENTITY FULL;
 INSERT INTO conflict_schema.another_enum_table VALUES ('var2'), ('var3');
 ALTER TABLE conflict_schema.another_enum_table REPLICA IDENTITY FULL;
 
@@ -135,14 +152,21 @@ CREATE PUBLICATION another_publication FOR TABLE another_schema.another_table;
 
 #
 # Test that slots created for replication sources are deleted on DROP
-#
-$ postgres-verify-slot connection=postgres://postgres:postgres@postgres slot=materialize_% active=false
+# TODO: enable once we land #24586
+# $ postgres-verify-slot connection=postgres://postgres:postgres@postgres slot=materialize_% active=false
+
+# Sneak in a test for pg_source_snapshot_statement_timeout
+$ postgres-connect name=mz_system url=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
+$ postgres-execute connection=mz_system
+ALTER SYSTEM SET pg_source_snapshot_statement_timeout = 1000
 
 > CREATE SOURCE "test_slot_source"
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
   FOR TABLES ("pk_table");
 
-$ postgres-verify-slot connection=postgres://postgres:postgres@postgres slot=materialize_% active=true
+# TODO: enable once we land #24586
+# $ postgres-verify-slot connection=postgres://postgres:postgres@postgres slot=materialize_% active=true
 
 > SHOW SUBSOURCES ON test_slot_source
 pk_table subsource
@@ -150,88 +174,101 @@ test_slot_source_progress progress
 
 > DROP SOURCE test_slot_source
 
-$ postgres-verify-slot connection=postgres://postgres:postgres@postgres slot=materialize_% active=false
+# TODO: enable once we land #24586
+# $ postgres-verify-slot connection=postgres://postgres:postgres@postgres slot=materialize_% active=false
+
+$ postgres-execute connection=mz_system
+ALTER SYSTEM SET pg_source_snapshot_statement_timeout = 0
 
 #
 # Error checking
 #
 
-> CREATE CONNECTION no_such_host TO POSTGRES (
+! CREATE CONNECTION no_such_host TO POSTGRES (
     HOST 'no_such_postgres.mtrlz.com',
     DATABASE postgres,
     USER postgres,
     PASSWORD SECRET pgpass
   )
-! CREATE SOURCE "no_such_host"
-  FROM POSTGRES CONNECTION no_such_host (PUBLICATION 'mz_source');
-# TODO: assert on `detail` here.
-exact:failed to connect to PostgreSQL database
+contains:error connecting to server: failed to lookup address information: Name or service not known: failed to lookup address
 
-> CREATE CONNECTION no_such_port TO POSTGRES (
+! CREATE CONNECTION no_such_port TO POSTGRES (
     HOST postgres,
     PORT 65534,
     DATABASE postgres,
     USER postgres,
     PASSWORD SECRET pgpass
   )
-! CREATE SOURCE "no_such_port"
-  FROM POSTGRES CONNECTION no_such_port (PUBLICATION 'mz_source');
-# TODO: assert on `detail` here.
-exact:failed to connect to PostgreSQL database
+contains:error connecting to server: Connection refused
 
-> CREATE CONNECTION no_such_user TO POSTGRES (
+! CREATE CONNECTION no_such_user TO POSTGRES (
     HOST postgres,
     DATABASE postgres,
     USER no_such_user,
     PASSWORD SECRET pgpass
   )
-! CREATE SOURCE "no_such_user"
-  FROM POSTGRES CONNECTION no_such_user (PUBLICATION 'mz_source');
-# TODO: assert on `detail` here.
-exact:failed to connect to PostgreSQL database
+contains:password authentication failed for user "no_such_user"
 
 > CREATE SECRET badpass AS 'badpass'
-> CREATE CONNECTION no_such_password TO POSTGRES (
+! CREATE CONNECTION no_such_password TO POSTGRES (
     HOST postgres,
     DATABASE postgres,
     USER postgres,
     PASSWORD SECRET badpass
   )
-! CREATE SOURCE "no_such_password"
-  FROM POSTGRES CONNECTION no_such_password (PUBLICATION 'mz_source');
-# TODO: assert on `detail` here.
-exact:failed to connect to PostgreSQL database
+contains:password authentication failed for user "postgres"
 
-> CREATE CONNECTION no_such_dbname TO POSTGRES (
+! CREATE CONNECTION no_such_dbname TO POSTGRES (
     HOST postgres,
     DATABASE no_such_dbname,
     USER postgres,
     PASSWORD SECRET pgpass
   )
-! CREATE SOURCE "no_such_dbname"
-  FROM POSTGRES CONNECTION no_such_dbname (PUBLICATION 'mz_source');
-# TODO: assert on `detail` here.
-exact:failed to connect to PostgreSQL database
+contains:database "no_such_dbname" does not exist
 
 ! CREATE SOURCE "no_such_publication"
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (PUBLICATION 'no_such_publication');
 # TODO: assert on `detail` here.
-exact:failed to connect to PostgreSQL database
+contains:failed to connect to PostgreSQL database
 
 ! CREATE SOURCE "mz_source"
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
   FOR TABLES (
     "enum_table"
   );
-regex: the following columns contain unsupported types:\npostgres.public.enum_table.a \(OID \d+\)
+contains:referenced tables use unsupported types
 
 ! CREATE SOURCE "mz_source"
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
   FOR TABLES (
     "enum_table",
     public.another_enum_table
   );
-regex: the following columns contain unsupported types:\npostgres\.public\.another_enum_table\."колона" \(OID \d+\)\npostgres\.public\.enum_table\.a \(OID \d+\)
+contains:referenced tables use unsupported types
+
+! CREATE SOURCE mz_source
+  IN CLUSTER cdc_cluster
+  FROM POSTGRES CONNECTION pg (
+    PUBLICATION 'mz_source',
+    DETAILS 'abc'
+  )
+  FOR TABLES (
+    pk_table
+  );
+contains: CREATE SOURCE specifies DETAILS option
+
+! CREATE SOURCE "mz_source"
+  IN CLUSTER cdc_cluster
+  FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
+  FOR TABLES (
+    "no_replica_identity",
+    "pk_table"
+  );
+contains:referenced items not tables with REPLICA IDENTITY FULL
+detail:referenced items: no_replica_identity
 
 #
 # Establish direct replication
@@ -240,11 +277,10 @@ regex: the following columns contain unsupported types:\npostgres\.public\.anoth
 # Note: This implicitly tests that enum_table being part of the publication does not
 # prevent us from using other tables as subsources.
 #
-# TODO: This should produce an error because we included the `no_replica_identity` table
 > CREATE SOURCE "mz_source"
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
   FOR TABLES (
-    "no_replica_identity",
     "pk_table",
     "nonpk_table",
     "types_table",
@@ -260,37 +296,44 @@ regex: the following columns contain unsupported types:\npostgres\.public\.anoth
     conflict_schema.conflict_table AS public.conflict_table,
     "space table",
     """literal_quotes""",
-    "create"
+    "create",
+    tstzrange_table
   );
 
 > SHOW SOURCES
-array_types_table     subsource <null>
-conflict_table        subsource <null>
-create                subsource <null>
-escaped_text_table    subsource <null>
-large_text            subsource <null>
-multipart_pk          subsource <null>
-mz_source             postgres  ${arg.default-storage-size}
-mz_source_progress    progress  <null>
-no_replica_identity   subsource <null>
-nonpk_table           subsource <null>
-nulls_table           subsource <null>
-pk_table              subsource <null>
-"space table"         subsource <null>
-trailing_space_nopk   subsource <null>
-trailing_space_pk     subsource <null>
-"\"literal_quotes\""  subsource <null>
-types_table           subsource <null>
-utf8_table            subsource <null>
-таблица               subsource <null>
+array_types_table     subsource <null>  <null>
+conflict_table        subsource <null>  <null>
+create                subsource <null>  <null>
+escaped_text_table    subsource <null>  <null>
+large_text            subsource <null>  <null>
+multipart_pk          subsource <null>  <null>
+mz_source             postgres  ${arg.default-replica-size}  cdc_cluster
+mz_source_progress    progress  <null>  <null>
+nonpk_table           subsource <null>  <null>
+nulls_table           subsource <null>  <null>
+pk_table              subsource <null>  <null>
+"space table"         subsource <null>  <null>
+trailing_space_nopk   subsource <null>  <null>
+trailing_space_pk     subsource <null>  <null>
+"\"literal_quotes\""  subsource <null>  <null>
+tstzrange_table       subsource <null>  <null>
+types_table           subsource <null>  <null>
+utf8_table            subsource <null>  <null>
+таблица               subsource <null>  <null>
+
+> SELECT status FROM mz_internal.mz_source_statuses WHERE name = 'mz_source';
+running
+
+> SELECT status FROM mz_internal.mz_source_statuses WHERE name = 'mz_source_progress';
+running
 
 > SELECT lsn > 0 FROM mz_source_progress
 true
 
 # Ensure we report the write frontier of the progress subsource
-$ set-regex match=(\s{12}0|\d{13,20}|u\d{1,5}|\(\d+-\d\d-\d\d\s\d\d:\d\d:\d\d.\d\d\d\)|true|false) replacement=<>
+$ set-regex match=(\s{12}0|\d{13,20}|u\d{1,5}|\(\d+-\d\d-\d\d\s\d\d:\d\d:\d\d\.\d\d\d\)|true|false) replacement=<>
 > EXPLAIN TIMESTAMP FOR SELECT * FROM mz_source_progress
-"                query timestamp: <> <>\n          oracle read timestamp: <> <>\nlargest not in advance of upper: <> <>\n                          upper:[<> <>]\n                          since:[<> <>]\n        can respond immediately: <>\n                       timeline: Some(EpochMilliseconds)\n\nsource materialize.public.mz_source_progress (<>, storage):\n                  read frontier:[<> <>]\n                 write frontier:[<> <>]\n"
+"                query timestamp: <> <>\n          oracle read timestamp: <> <>\nlargest not in advance of upper: <> <>\n                          upper:[<> <>]\n                          since:[<> <>]\n        can respond immediately: <>\n                       timeline: Some(EpochMilliseconds)\n              session wall time: <> <>\n\nsource materialize.public.mz_source_progress (<>, storage):\n                  read frontier:[<> <>]\n                 write frontier:[<> <>]\n"
 
 $ set-regex match=[0-9]+|_[a-f0-9]+ replacement=<SUPPRESSED>
 
@@ -303,14 +346,10 @@ $ unset-regex
 
 # Cannot drop subsources independent of primary source
 ! DROP SOURCE conflict_table
-contains: SOURCE materialize.public.conflict_table is a subsource and cannot be dropped independently of its primary source
+contains: SOURCE "conflict_table" is a subsource and must be dropped with ALTER SOURCE...DROP SUBSOURCE
 
 ! DROP SOURCE conflict_table CASCADE
-contains: SOURCE materialize.public.conflict_table is a subsource and cannot be dropped independently of its primary source
-
-> SELECT * FROM no_replica_identity;
-1
-2
+contains: SOURCE "conflict_table" is a subsource and must be dropped with ALTER SOURCE...DROP SUBSOURCE
 
 #
 # Perform sanity checks of the initial snapshot
@@ -370,6 +409,9 @@ v
 
 > SELECT * FROM "create"
 v
+
+> SELECT * FROM tstzrange_table
+"[2024-02-13 17:01:58.378480 UTC,)"
 
 #
 # Confirm that the new sources can be used to build upon
@@ -506,6 +548,28 @@ true
 true
 
 #
+# Ensure we can start a source with more workers than the default max_wal_senders param (10)
+#
+
+> CREATE CLUSTER large_cluster SIZE '16';
+
+> CREATE SOURCE large_cluster_source
+  IN CLUSTER large_cluster
+  FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
+  FOR TABLES ("pk_table" AS large_cluster_source_pk_table);
+
+> SELECT * FROM large_cluster_source_pk_table;
+13 three
+14 four
+2 two_two
+5 five
+
+> SELECT status = 'running' FROM mz_internal.mz_source_statuses WHERE name = 'large_cluster_source_pk_table';
+true
+
+> DROP SOURCE large_cluster_source;
+
+#
 # Remove all data on the Postgres side
 #
 
@@ -520,6 +584,7 @@ DELETE FROM nulls_table;
 DELETE FROM utf8_table;
 DELETE FROM "таблица";
 DELETE FROM conflict_schema.conflict_table;
+DELETE FROM tstzrange_table;
 
 #
 # Check that all data sources empty out on the Materialize side
@@ -558,11 +623,15 @@ DELETE FROM conflict_schema.conflict_table;
 > SELECT COUNT(*) FROM conflict_table;
 0
 
+> SELECT COUNT(*) FROM tstzrange_table;
+0
+
 #
 # Support enum values as strings
 #
 #
 ! CREATE SOURCE enum_source
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (
     PUBLICATION 'mz_source',
     TEXT COLUMNS [pk_table.col_dne]
@@ -572,7 +641,20 @@ DELETE FROM conflict_schema.conflict_table;
   );
 contains: invalid TEXT COLUMNS option value: column "pk_table.col_dne" does not exist
 
+! CREATE SOURCE case_sensitive_names
+  IN CLUSTER cdc_cluster
+  FROM POSTGRES CONNECTION pg (
+    PUBLICATION 'mz_source',
+    TEXT COLUMNS [pk_table."F2"]
+  )
+  FOR TABLES (
+    "enum_table"
+  );
+contains: invalid TEXT COLUMNS option value: column "pk_table.F2" does not exist
+hint: The similarly named column "pk_table.f2" does exist.
+
 ! CREATE SOURCE enum_source
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (
     PUBLICATION 'mz_source',
     TEXT COLUMNS [table_dne.col_dne]
@@ -584,6 +666,7 @@ contains: invalid TEXT COLUMNS option value: table table_dne not found in source
 
 # Reference exists in two schemas, so is not unambiguous
 ! CREATE SOURCE enum_source
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (
     PUBLICATION 'mz_source',
     TEXT COLUMNS [another_enum_table."колона"]
@@ -595,42 +678,47 @@ contains: invalid TEXT COLUMNS option value: table table_dne not found in source
 contains: invalid TEXT COLUMNS option value: table another_enum_table is ambiguous, consider specifying the schema
 
 ! CREATE SOURCE enum_source
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (
     PUBLICATION 'mz_source',
     TEXT COLUMNS [foo]
   )
-  FOR SCHEMAS (public);
+  FOR TABLES (pk_table);
 contains: invalid TEXT COLUMNS option value: column name 'foo' must have at least a table qualification
 
 ! CREATE SOURCE enum_source
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (
     PUBLICATION 'mz_source',
     TEXT COLUMNS [foo.bar.qux.qax.foo]
   )
-  FOR SCHEMAS (public);
+  FOR TABLES (pk_table);
 contains: invalid TEXT COLUMNS option value: qualified name did not have between 1 and 3 components: foo.bar.qux.qax
 
 ! CREATE SOURCE enum_source
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (
     PUBLICATION 'mz_source',
     TEXT COLUMNS [enum_table.a, enum_table.a]
   )
-  FOR SCHEMAS (public);
+  FOR TABLES (enum_table);
 contains: invalid TEXT COLUMNS option value: unexpected multiple references to postgres.public.enum_table.a
 
 # utf8_table is not part of mz_source_narrow publication
 ! CREATE SOURCE enum_source
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (
     PUBLICATION 'mz_source_narrow',
     TEXT COLUMNS [enum_table.a, utf8_table.f1]
   )
-  FOR SCHEMAS (public);
+  FOR TABLES (enum_table);
 contains: invalid TEXT COLUMNS option value: table utf8_table not found in source
 
 # n.b includes a reference to pk_table, which is not a table that's part of the
 # source, but is part of the publication.
 
-> CREATE SOURCE enum_source
+! CREATE SOURCE enum_source
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (
     PUBLICATION 'mz_source',
     TEXT COLUMNS [
@@ -643,12 +731,27 @@ contains: invalid TEXT COLUMNS option value: table utf8_table not found in sourc
     "enum_table",
     public.another_enum_table
   );
+contains:TEXT COLUMNS refers to table not currently being added
+
+> CREATE SOURCE enum_source
+  IN CLUSTER cdc_cluster
+  FROM POSTGRES CONNECTION pg (
+    PUBLICATION 'mz_source',
+    TEXT COLUMNS [
+      enum_table.a,
+      public.another_enum_table."колона"
+    ]
+  )
+  FOR TABLES (
+    "enum_table",
+    public.another_enum_table
+  );
 
 > SELECT * FROM (SHOW SOURCES) WHERE name LIKE '%enum%';
-another_enum_table      subsource <null>
-enum_source             postgres  ${arg.default-storage-size}
-enum_source_progress    progress  <null>
-enum_table              subsource <null>
+another_enum_table      subsource <null> <null>
+enum_source             postgres  ${arg.default-replica-size} cdc_cluster
+enum_source_progress    progress  <null> <null>
+enum_table              subsource <null> <null>
 
 > SELECT * FROM enum_table
 var0
@@ -668,10 +771,11 @@ DROP PUBLICATION mz_source;
 DROP PUBLICATION mz_source_narrow;
 INSERT INTO pk_table VALUES (99999);
 
-# todo: we're purifying Postgres view names incorrectly, fix that and this error!
-# should be "materialize.public.pk_table"
-! SELECT COUNT(*) = 0 FROM pk_table;
-regex:publication "mz_source" does not exist
+# Ensure that source + all subsources have error
+> SELECT bool_and(error ~* 'publication .+ does not exist')
+  FROM mz_internal.mz_source_statuses
+  WHERE id IN ( SELECT id FROM mz_sources WHERE type != 'progress' );
+true
 
 > DROP SOURCE enum_source CASCADE;
 > DROP SOURCE "mz_source" CASCADE;
@@ -680,6 +784,7 @@ regex:publication "mz_source" does not exist
 # Check schema scoped tables
 
 > CREATE SOURCE another_source
+  IN CLUSTER cdc_cluster
   FROM POSTGRES CONNECTION pg (
     PUBLICATION 'another_publication'
   )
@@ -688,9 +793,9 @@ regex:publication "mz_source" does not exist
   );
 
 > SHOW SOURCES
-another_source          postgres  ${arg.default-storage-size}
-another_source_progress progress  <null>
-another_table           subsource <null>
+another_source          postgres  ${arg.default-replica-size} cdc_cluster
+another_source_progress progress  <null> <null>
+another_table           subsource <null> <null>
 
 > DROP SOURCE another_source
 

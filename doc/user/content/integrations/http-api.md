@@ -20,9 +20,9 @@ https://<MZ host address>/api/sql
 
 The API:
 
-- Requires username/password authentication, just as connecting via `psql`.
-  Materialize provides you the username and password upon setting up your
-  account.
+- Requires username/password authentication, just as connecting via a SQL
+  client (e.g. `psql`). Materialize provides you the username and password upon
+  setting up your account.
 - Requires that you provide the entirety of your request. The API does not
   provide session-like semantics, so there is no way to e.g. interactively use
   transactions.
@@ -60,7 +60,7 @@ The HTTP API provides two modes with slightly different transactional semantics 
 https://<MZ host address>/api/sql
 ```
 
-Accessing the endpoint requires [basic authentication](https://developer.mozilla.org/en-US/docs/Web/HTTP/Authentication#basic_authentication_scheme). Reuse the same credentials as with `psql`:
+Accessing the endpoint requires [basic authentication](https://developer.mozilla.org/en-US/docs/Web/HTTP/Authentication#basic_authentication_scheme). Reuse the same credentials as with a SQL client (e.g. `psql`):
 
 * **User ID:** Your email to access Materialize.
 * **Password:** Your app password.
@@ -126,7 +126,7 @@ an array of the following:
 
 Result | JSON value
 ---------------------|------------
-Rows | `{"rows": <2D array of JSON-ified results>, "col_names": <array of text>, "notices": <array of notices>}`
+Rows | `{"rows": <2D array of JSON-ified results>, "desc": <array of column descriptions>, "notices": <array of notices>}`
 Error | `{"error": <Error object from execution>, "notices": <array of notices>}`
 Ok | `{"ok": <tag>, "notices": <array of notices>}`
 
@@ -146,6 +146,9 @@ Note that the returned values include the results of statements which were
 ultimately rolled back because of an error in a later part of the transaction.
 You must parse the results to understand which statements ultimately reflect
 the resultant state.
+
+Numeric results are converted to strings to avoid possible JavaScript number inaccuracy.
+Column descriptions contain the name, oid, data type size and type modifier of a returned column.
 
 #### TypeScript definition
 
@@ -181,11 +184,22 @@ interface Error {
 	hint?: string;
 }
 
+interface Column {
+    name: string;
+    type_oid: number; // u32
+    type_len: number; // i16
+    type_mod: number; // i32
+}
+
+interface Description {
+	columns: Column[];
+}
+
 type SqlResult =
   | {
 	tag: string;
 	rows: any[][];
-	col_names: string[];
+	desc: Description;
 	notices: Notice[];
 } | {
 	ok: string;
@@ -251,21 +265,38 @@ Response:
 {
   "results": [
     {
-        "tag": "SELECT 4",
-        "rows": [[null],[null],[109],[209]],
-        "col_names": ["cross_add"],
-        "notices": []
+      "desc": {
+        "columns": [
+          {
+            "name": "cross_add",
+            "type_len": 4,
+            "type_mod": -1,
+            "type_oid": 23
+          }
+        ]
+      },
+      "notices": [],
+      "rows": [],
+      "tag": "SELECT 0"
     },
     {
-        "tag": "SELECT 2",
-        "rows":[[100],[200]],
-        "col_names":["a"],
-        "notices": []
+      "desc": {
+        "columns": [
+          {
+            "name": "a",
+            "type_len": 4,
+            "type_mod": -1,
+            "type_oid": 23
+          }
+        ]
+      },
+      "notices": [],
+      "rows": [],
+      "tag": "SELECT 0"
     }
   ]
 }
 ```
-
 
 ## See also
 - [SQL Clients](../sql-clients)

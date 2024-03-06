@@ -14,8 +14,8 @@ import pytest
 from pg8000.exceptions import InterfaceError
 
 from materialize.cloudtest.app.materialize_application import MaterializeApplication
-from materialize.cloudtest.k8s import cluster_pod_name
-from materialize.cloudtest.wait import wait
+from materialize.cloudtest.util.cluster import cluster_pod_name
+from materialize.cloudtest.util.wait import wait
 
 
 def test_secrets(mz: MaterializeApplication) -> None:
@@ -25,18 +25,15 @@ def test_secrets(mz: MaterializeApplication) -> None:
             > CREATE SECRET username AS '123';
             > CREATE SECRET password AS '234';
 
-            > CREATE CONNECTION secrets_conn TO KAFKA (
+            # Our Redpanda instance is not configured for SASL, so we can not
+            # really establish a successful connection.
+            ! CREATE CONNECTION secrets_conn TO KAFKA (
                 BROKER '${testdrive.kafka-addr}',
                 SASL MECHANISMS 'PLAIN',
                 SASL USERNAME = SECRET username,
                 SASL PASSWORD = SECRET password
               );
-
-            # Our Redpanda instance is not configured for SASL, so we can not
-            # really establish a successful connection.
-            ! CREATE SOURCE secrets_source
-              FROM KAFKA CONNECTION secrets_conn (TOPIC 'foo_bar');
-            contains:Meta data fetch error: BrokerTransportFailure (Local: Broker transport failure)
+            contains:Broker does not support SSL connections
             """
         )
     )
@@ -103,6 +100,9 @@ def test_missing_secret(mz: MaterializeApplication) -> None:
     mz.testdrive.run(
         input=dedent(
             """
+          $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
+          ALTER SYSTEM SET enable_connection_validation_syntax = true
+
           > CREATE CLUSTER to_be_killed REPLICAS (to_be_killed (SIZE '1'));
 
           > CREATE SECRET to_be_deleted AS 'postgres'
@@ -112,7 +112,7 @@ def test_missing_secret(mz: MaterializeApplication) -> None:
                 SASL MECHANISMS 'PLAIN',
                 SASL USERNAME = SECRET to_be_deleted,
                 SASL PASSWORD = SECRET to_be_deleted
-              );
+              ) WITH (VALIDATE = false);
 
           > CREATE CONNECTION pg_conn_with_deleted_secret TO POSTGRES (
             HOST 'postgres',
@@ -166,7 +166,7 @@ def test_missing_secret(mz: MaterializeApplication) -> None:
             ! CREATE SOURCE some_kafka_source
               FROM KAFKA CONNECTION kafka_conn_with_deleted_secret
               (TOPIC 'foo')
-            contains: NotFound
+            contains:failed to create and connect Kafka consumer
             """
         ),
         no_reset=True,
@@ -200,7 +200,7 @@ def test_missing_secret(mz: MaterializeApplication) -> None:
             ! CREATE SOURCE some_kafka_source
               FROM KAFKA CONNECTION kafka_conn_with_deleted_secret
               (TOPIC 'foo')
-            contains: NotFound
+            contains:failed to create and connect Kafka consumer
 
             > SELECT error like '%NotFound%'
               FROM mz_internal.mz_source_statuses
@@ -235,7 +235,7 @@ def test_missing_secret(mz: MaterializeApplication) -> None:
             ! CREATE SOURCE some_kafka_source
               FROM KAFKA CONNECTION kafka_conn_with_deleted_secret
               (TOPIC 'foo')
-            contains: NotFound
+            contains:failed to create and connect Kafka consumer
 
             > SELECT error like '%NotFound%'
               FROM mz_internal.mz_source_statuses

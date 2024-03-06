@@ -11,25 +11,30 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use mz_frontegg_auth::Authentication as FronteggAuthentication;
+use mz_frontegg_auth::Authenticator as FronteggAuthentication;
 use mz_ore::netio::AsyncReady;
+use mz_pgwire_common::{
+    decode_startup, Conn, FrontendStartupMessage, ACCEPT_SSL_ENCRYPTION, REJECT_ENCRYPTION,
+};
+use mz_server_core::{ConnectionHandler, TlsConfig};
 use mz_sql::session::vars::ConnectionCounter;
-use openssl::ssl::{Ssl, SslContext};
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, Interest, ReadBuf, Ready};
+use openssl::ssl::Ssl;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
 use tracing::trace;
 
-use crate::codec::{self, FramedConn, ACCEPT_SSL_ENCRYPTION, REJECT_ENCRYPTION};
-use crate::message::FrontendStartupMessage;
+use crate::codec::FramedConn;
 use crate::metrics::{Metrics, MetricsConfig};
 use crate::protocol;
 
 /// Configures a [`Server`].
 #[derive(Debug)]
 pub struct Config {
+    /// The label for the mz_connection_status metric.
+    pub label: &'static str,
     /// A client for the adapter with which the server will communicate.
     pub adapter_client: mz_adapter::Client,
     /// The TLS configuration for the server.
@@ -52,24 +57,6 @@ pub struct Config {
     pub active_connection_count: Arc<Mutex<ConnectionCounter>>,
 }
 
-/// Configures a server's TLS encryption and authentication.
-#[derive(Clone, Debug)]
-pub struct TlsConfig {
-    /// The SSL context used to manage incoming TLS negotiations.
-    pub context: SslContext,
-    /// The TLS mode.
-    pub mode: TlsMode,
-}
-
-/// Specifies how strictly to enforce TLS encryption.
-#[derive(Debug, Clone, Copy)]
-pub enum TlsMode {
-    /// Allow TLS encryption.
-    Allow,
-    /// Require that clients negotiate TLS encryption.
-    Require,
-}
-
 /// A server that communicates with clients via the pgwire protocol.
 pub struct Server {
     tls: Option<TlsConfig>,
@@ -80,6 +67,18 @@ pub struct Server {
     active_connection_count: Arc<Mutex<ConnectionCounter>>,
 }
 
+#[async_trait]
+impl mz_server_core::Server for Server {
+    const NAME: &'static str = "pgwire";
+
+    fn handle_connection(&self, conn: TcpStream) -> ConnectionHandler {
+        // Using fully-qualified syntax means we won't accidentally call
+        // ourselves (i.e., silently infinitely recurse) if the name or type of
+        // `crate::Server::handle_connection` changes.
+        Box::pin(crate::Server::handle_connection(self, conn))
+    }
+}
+
 impl Server {
     /// Constructs a new server.
     pub fn new(config: Config) -> Server {
@@ -87,13 +86,13 @@ impl Server {
             tls: config.tls,
             adapter_client: config.adapter_client,
             frontegg: config.frontegg,
-            metrics: Metrics::new(config.metrics, config.internal),
+            metrics: Metrics::new(config.metrics, config.label),
             internal: config.internal,
             active_connection_count: config.active_connection_count,
         }
     }
 
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[mz_ore::instrument(level = "debug")]
     pub fn handle_connection<A>(
         &self,
         conn: A,
@@ -107,13 +106,15 @@ impl Server {
         let internal = self.internal;
         let metrics = self.metrics.clone();
         let active_connection_count = Arc::clone(&self.active_connection_count);
+        // TODO(guswynn): remove this redundant_closure_call
+        #[allow(clippy::redundant_closure_call)]
         async move {
             let result = (|| {
                 async move {
                     let conn_id = adapter_client.new_conn_id()?;
                     let mut conn = Conn::Unencrypted(conn);
                     loop {
-                        let message = codec::decode_startup(&mut conn).await?;
+                        let message = decode_startup(&mut conn).await?;
 
                         match &message {
                             Some(message) => trace!("cid={} recv={:?}", conn_id, message),
@@ -182,73 +183,8 @@ impl Server {
                 }
             })()
             .await;
-            let status = match result {
-                Ok(()) => "success",
-                Err(_) => "error",
-            };
-            metrics.connection_status(status).inc();
+            metrics.connection_status(result.is_ok()).inc();
             result
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Conn<A> {
-    Unencrypted(A),
-    Ssl(SslStream<A>),
-}
-
-impl<A> AsyncRead for Conn<A>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &mut ReadBuf,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Conn::Unencrypted(inner) => Pin::new(inner).poll_read(cx, buf),
-            Conn::Ssl(inner) => Pin::new(inner).poll_read(cx, buf),
-        }
-    }
-}
-
-impl<A> AsyncWrite for Conn<A>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-{
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Conn::Unencrypted(inner) => Pin::new(inner).poll_write(cx, buf),
-            Conn::Ssl(inner) => Pin::new(inner).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Conn::Unencrypted(inner) => Pin::new(inner).poll_flush(cx),
-            Conn::Ssl(inner) => Pin::new(inner).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Conn::Unencrypted(inner) => Pin::new(inner).poll_shutdown(cx),
-            Conn::Ssl(inner) => Pin::new(inner).poll_shutdown(cx),
-        }
-    }
-}
-
-#[async_trait]
-impl<A> AsyncReady for Conn<A>
-where
-    A: AsyncRead + AsyncWrite + AsyncReady + Sync + Unpin,
-{
-    async fn ready(&self, interest: Interest) -> io::Result<Ready> {
-        match self {
-            Conn::Unencrypted(inner) => inner.ready(interest).await,
-            Conn::Ssl(inner) => inner.ready(interest).await,
         }
     }
 }

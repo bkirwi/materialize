@@ -17,9 +17,9 @@ We use [GitHub pull requests](https://github.com/MaterializeInc/materialize/pull
 small, must be submitted as a pull request, and that pull request must pass a
 battery of automated tests before it merges.
 
-Any substantial PR must additionally be reviewed by one or more engineers who
-are familiar with the areas of the codebase that are touched in the PR. The
-goals of code review are threefold:
+All PRs must be reviewed by one or more employees who are familiar with the
+areas of the codebase that are touched in the PR. The goals of code review are
+threefold:
 
 1. To ensure the health of the codebase improves over time.
 
@@ -28,8 +28,7 @@ goals of code review are threefold:
 3. To socialize changes with other engineers on the team.
 
 Once a PR is approved and merged to the `main` branch, CI will automatically
-deploy a new `materialized` binary to <https://binaries.materialize.com> and the
-[materialized Docker image][docker].
+deploy a new [materialized Docker image][docker].
 
 While we encourage customers to use the latest stable release in production,
 many of our prospective customers run their proofs-of-concept (POCs) off these
@@ -88,6 +87,16 @@ RU. But doing so makes it very difficult to view the code for the bugfix or
 feature in isolation. This can be particularly problematic if the bugfix or
 feature needs to be reverted—it is much more difficult to revert just one or the
 other if they are in the same RU.
+
+You should also endeavor to limit each RU to one team's scope as defined by
+the [CODEOWNERS](/.github/CODEOWNERS) file, in particular for larger changes.
+When a single RU contains changes across multiple parts of the stack, each
+reviewer has the additional overhead of digging through the PR to figure out
+which files require their review. Splitting up the change into multiple RUs
+avoids this.\
+Areas where this is particularly applicable:
+* Changes to the [SQL parser](/src/sql-parser)
+* Changes to the [SQL planner](/src/sql/src/plan)
 
 ### Change descriptions
 
@@ -381,18 +390,9 @@ strategy works best when you are fairly confident in the change. If you're not
 confident in the change, consider assigning _both_ an experienced an
 inexperienced reviewer.
 
-Coming soon: a breakdown of which tech lead is responsible for each area of the
-codebase. The tech lead needn't review every PR in their area of responsibility,
-but can help direct code review requests to the appropriate engineer.
-
 ### Merging
 
 #### When to merge
-
-For sufficiently trivial changes, you can consider merging without review. This
-should be somewhat rare, however, and only when you have high confidence that a)
-the change is correct, and b) the change is uncontroversial. When in doubt, get
-a review!
 
 When a reviewer approves your PR, they will either press the "approve" button
 in GitHub's code review interface, leaving a big green checkmark on your PR,
@@ -411,6 +411,10 @@ SQL layer LGTM, but please get someone else to review the docs changes." In this
 case you must use your discretion as to when you have received a covering set
 of approvals. (This is a great reason to prefer small PRs when possible, since
 you can gather full approvals from various owners in parallel.)
+
+We've configured GitHub to require at least one formal approval (i.e., clicking
+"Approve" in the review UI, rather than just posting a comment like "LGTM")
+before a PR can be merged.
 
 #### Stalled PRs
 
@@ -902,6 +906,9 @@ submit a PR to fix it!
 
 * Keep PRs small, and ideally less than 500 lines.
 
+* For larger PRs, aim to limit each RU to one team's scope as defined by the
+[CODEOWNERS](/.github/CODEOWNERS) file.
+
 * Always initiate PR reviews within one business day, and sooner if possible.
 
 * Verify that every PR has, at a minimum:
@@ -913,6 +920,19 @@ submit a PR to fix it!
 
 * Accept PRs that improve the overall health of the codebase, even if they
   are not perfect.
+
+## Common Issues
+
+### Stuck CLA check
+
+Taken from the [cla-assistant `README.md`](https://github.com/cla-assistant/cla-assistant/blob/main/COMMON_ISSUES.md#cla-assistant-status-or-comment-not-updated-1).
+
+Sometimes it happens that while you signed the CLA the status doesn't get updated.
+Might be a technical issue or some other problem. Most temporary issues can be solved by manually triggering a new check with navigating to
+```
+https://cla-assistant.io/check/<orgname>/<reponame>?pullRequest=<pr_number>
+```
+replacing `<orgname>`, `<reponame>` and `<pr_number>` with your respective values.
 
 [`29f8f46b9`]: https://github.com/MaterializeInc/materialize/commit/29f8f46b92280071c96b294d414675aa626f9403
 [#3808]: https://github.com/MaterializeInc/materialize/pull/3808

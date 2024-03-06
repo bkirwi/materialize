@@ -8,7 +8,6 @@
 # by the Apache License, Version 2.0.
 
 import itertools
-from typing import List
 
 from materialize.output_consistency.input_data.operations.aggregate_operations_provider import (
     AGGREGATE_OPERATION_TYPES,
@@ -16,11 +15,20 @@ from materialize.output_consistency.input_data.operations.aggregate_operations_p
 from materialize.output_consistency.input_data.operations.boolean_operations_provider import (
     BOOLEAN_OPERATION_TYPES,
 )
+from materialize.output_consistency.input_data.operations.bytea_operations_provider import (
+    BYTEA_OPERATION_TYPES,
+)
+from materialize.output_consistency.input_data.operations.crypto_operations_provider import (
+    CRYPTO_OPERATION_TYPES,
+)
 from materialize.output_consistency.input_data.operations.date_time_operations_provider import (
     DATE_TIME_OPERATION_TYPES,
 )
 from materialize.output_consistency.input_data.operations.generic_operations_provider import (
     GENERIC_OPERATION_TYPES,
+)
+from materialize.output_consistency.input_data.operations.jsonb_operations_provider import (
+    JSONB_OPERATION_TYPES,
 )
 from materialize.output_consistency.input_data.operations.number_operations_provider import (
     NUMERIC_OPERATION_TYPES,
@@ -33,7 +41,7 @@ from materialize.output_consistency.input_data.operations.trigonometric_operatio
 )
 from materialize.output_consistency.operation.operation import DbOperationOrFunction
 
-ALL_OPERATION_TYPES: List[DbOperationOrFunction] = list(
+ALL_OPERATION_TYPES: list[DbOperationOrFunction] = list(
     itertools.chain(
         GENERIC_OPERATION_TYPES,
         AGGREGATE_OPERATION_TYPES,
@@ -42,5 +50,8 @@ ALL_OPERATION_TYPES: List[DbOperationOrFunction] = list(
         TRIGONOMETRIC_OPERATION_TYPES,
         DATE_TIME_OPERATION_TYPES,
         TEXT_OPERATION_TYPES,
+        BYTEA_OPERATION_TYPES,
+        CRYPTO_OPERATION_TYPES,
+        JSONB_OPERATION_TYPES,
     )
 )

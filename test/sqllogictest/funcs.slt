@@ -222,6 +222,16 @@ SELECT date_trunc('millennium',  INTERVAL '1234 years 11 months 23 days 23:59:12
 ----
 1000 years
 
+query T
+SELECT date_trunc('second', '2562047788:00:54.775807'::INTERVAL) AS t;
+----
+2562047788:00:54
+
+query T
+SELECT date_trunc('second', '-2562047788:00:54.775807'::INTERVAL) AS t;
+----
+-2562047788:00:54
+
 mode standard
 
 statement ok
@@ -230,17 +240,17 @@ CREATE TABLE date_trunc_timestamps (
 )
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT date_trunc('day', ts) FROM date_trunc_timestamps
+EXPLAIN WITH(arity, join implementations) SELECT date_trunc('day', ts) FROM date_trunc_timestamps
 ----
 Explained Query:
   Project (#1) // { arity: 1 }
     Map (date_trunc_day_ts(#0)) // { arity: 2 }
-      Get materialize.public.date_trunc_timestamps // { arity: 1 }
+      ReadStorage materialize.public.date_trunc_timestamps // { arity: 1 }
 
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT date_trunc(field, ts) FROM date_trunc_fields, date_trunc_timestamps
+EXPLAIN WITH(arity, join implementations) SELECT date_trunc(field, ts) FROM date_trunc_fields, date_trunc_timestamps
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
@@ -249,9 +259,9 @@ Explained Query:
         implementation
           %0:date_trunc_fields[×] » %1:date_trunc_timestamps[×]
         ArrangeBy keys=[[]] // { arity: 1 }
-          Get materialize.public.date_trunc_fields // { arity: 1 }
+          ReadStorage materialize.public.date_trunc_fields // { arity: 1 }
         ArrangeBy keys=[[]] // { arity: 1 }
-          Get materialize.public.date_trunc_timestamps // { arity: 1 }
+          ReadStorage materialize.public.date_trunc_timestamps // { arity: 1 }
 
 EOF
 
@@ -722,32 +732,32 @@ CREATE TABLE t (
 )
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT a IS NULL FROM t
+EXPLAIN WITH(arity, join implementations) SELECT a IS NULL FROM t
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
     Map ((#0) IS NULL) // { arity: 3 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT a + a + a + a + a IS NULL FROM t
+EXPLAIN WITH(arity, join implementations) SELECT a + a + a + a + a IS NULL FROM t
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
     Map ((#0) IS NULL) // { arity: 3 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT a + b IS NULL FROM t
+EXPLAIN WITH(arity, join implementations) SELECT a + b IS NULL FROM t
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
     Map ((#0) IS NULL) // { arity: 3 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
@@ -756,12 +766,12 @@ EOF
 # exist, but we do not support them yet. Similarly for OR.
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT (a::bool AND b::bool) IS NULL FROM t
+EXPLAIN WITH(arity, join implementations) SELECT (a::bool AND b::bool) IS NULL FROM t
 ----
 Explained Query:
   Project (#2) // { arity: 1 }
     Map (((integer_to_boolean(#0) AND integer_to_boolean(#1))) IS NULL) // { arity: 3 }
-      Get materialize.public.t // { arity: 2 }
+      ReadStorage materialize.public.t // { arity: 2 }
 
 EOF
 
@@ -1517,12 +1527,12 @@ NULL
 query IIII
 SELECT pg_column_size(1::int4), pg_column_size(2::int8), pg_column_size('a'), pg_column_size('ab')
 ----
-5 9 3 4
+2 2 3 4
 
 query I
 SELECT pg_column_size((1, 2))
 ----
-19
+13
 
 statement ok
 CREATE TABLE col_size (a INT, b INT, c TEXT)
@@ -1533,7 +1543,7 @@ INSERT INTO col_size VALUES (1, 2, 'some string longer than 32 chars.'), (NULL, 
 query IIIIII
 SELECT a, b, pg_column_size(col_size.*), pg_column_size(col_size.a), pg_column_size(col_size.b), pg_column_size(col_size.c) FROM col_size ORDER BY a
 ----
-1  2  54  5  5  35
+1  2  48  2  2  35
 NULL  NULL  12  NULL  NULL  NULL
 
 statement error mz_row_size requires a record type
@@ -1549,24 +1559,35 @@ NULL
 query III
 SELECT mz_row_size((1, 2)), mz_row_size((1, 2, 3, 4)), mz_row_size((1, 2, 3, 4, 5))
 ----
-32  32  57
+24  24  24
+
+statement ok
+CREATE TABLE ts_size (t TEXT)
+
+statement ok
+INSERT INTO ts_size VALUES ('2023-10-30T13:47:11Z')
+
+query I
+SELECT mz_row_size(ts_size.*) FROM ts_size
+----
+24
 
 query III
 SELECT a, b, mz_row_size(col_size.*) FROM col_size ORDER BY a
 ----
-1  2  77
-NULL  NULL  32
+1  2  63
+NULL  NULL  24
 
 query error mz_errored
-SELECT mz_internal.mz_error_if_null(NULL, 'mz_errored')
+SELECT mz_unsafe.mz_error_if_null(NULL, 'mz_errored')
 
 query I
-SELECT mz_internal.mz_error_if_null(1, '')
+SELECT mz_unsafe.mz_error_if_null(1, '')
 ----
 1
 
 query error unexpected NULL
-SELECT mz_internal.mz_error_if_null(NULL, NULL)
+SELECT mz_unsafe.mz_error_if_null(NULL, NULL)
 
 query B
 SELECT pg_backend_pid() > 0
@@ -1582,3 +1603,81 @@ query B
 SELECT pg_tablespace_location(0) IS NULL
 ----
 true
+
+query B
+SELECT pg_get_ruledef(0) IS NULL
+----
+true
+
+query I
+SELECT pg_relation_size('pg_views'::regclass)
+----
+-1
+
+query I
+SELECT pg_relation_size('pg_views'::regclass::oid)
+----
+-1
+
+query I
+SELECT pg_relation_size('pg_views'::regclass, 'main')
+----
+-1
+
+query I
+SELECT pg_relation_size('pg_views'::regclass::oid, 'main')
+----
+-1
+
+query I
+SELECT pg_stat_get_numscans('pg_views'::regclass::oid)
+----
+-1
+
+# mz_unsafe functions can't be executed with the enable_unsafe_functions flag turned off
+
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET enable_unsafe_functions = false
+----
+COMPLETE 0
+
+statement error executing potentially dangerous functions is not supported
+SELECT mz_unsafe.mz_sleep(10)
+
+statement error executing potentially dangerous functions is not supported
+SELECT mz_unsafe.mz_panic('hello')
+
+statement ok
+SELECT mz_internal.is_rbac_enabled()
+
+statement ok
+CREATE TABLE dangerous_table (a INT, b TEXT)
+
+statement ok
+INSERT INTO dangerous_table (a) VALUES (1)
+
+statement error executing potentially dangerous functions is not supported
+SELECT mz_unsafe.mz_any(a) FROM dangerous_table
+
+statement error executing potentially dangerous functions is not supported
+INSERT INTO dangerous_table (b) VALUES (mz_unsafe.mz_panic('hello'))
+
+statement ok
+DROP TABLE dangerous_table
+
+statement ok
+SELECT * FROM mz_internal.mz_resolve_object_name('regclass', 't');
+
+statement ok
+SELECT mz_internal.mz_resolve_object_name('regclass', 't');
+
+simple conn=mz_system,user=mz_system
+ALTER SYSTEM SET enable_unsafe_functions = true
+----
+COMPLETE 0
+
+query error function textrecv\(\) does not exist
+SELECT textrecv()
+
+query error cannot call function with arguments of type internal
+SELECT textrecv('abc')

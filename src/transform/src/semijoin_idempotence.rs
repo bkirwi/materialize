@@ -32,7 +32,7 @@ use mz_expr::{Id, JoinInputMapper, LocalId, MirRelationExpr, MirScalarExpr, RECU
 use mz_ore::id_gen::IdGen;
 use mz_ore::stack::{CheckedRecursion, RecursionGuard};
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Remove redundant semijoin operators
 #[derive(Debug)]
@@ -55,16 +55,15 @@ impl CheckedRecursion for SemijoinIdempotence {
 }
 
 impl crate::Transform for SemijoinIdempotence {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "semijoin_idempotence")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         // We need to call `renumber_bindings` because we will call
         // `MirRelationExpr::collect_expirations`, which relies on this invariant.
@@ -186,7 +185,7 @@ impl SemijoinIdempotence {
 /// Attempt to simplify the join using local information and let bindings.
 fn attempt_join_simplification(
     inputs: &mut [MirRelationExpr],
-    equivalences: &mut Vec<Vec<MirScalarExpr>>,
+    equivalences: &Vec<Vec<MirScalarExpr>>,
     implementation: &mut mz_expr::JoinImplementation,
     let_replacements: &BTreeMap<LocalId, Vec<Replacement>>,
     gets_behind_gets: &BTreeMap<LocalId, Vec<(Id, Vec<MirScalarExpr>)>>,

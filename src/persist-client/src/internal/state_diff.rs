@@ -20,7 +20,7 @@ use mz_persist_types::Codec64;
 use mz_proto::TryFromProtoError;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
-use tracing::{debug, error};
+use tracing::debug;
 
 use crate::critical::CriticalReaderId;
 use crate::internal::paths::PartialRollupKey;
@@ -32,7 +32,7 @@ use crate::internal::state::{
 use crate::internal::trace::{FueledMergeRes, SpineId, SpineLevel, ThinSpineBatch, Trace};
 use crate::read::LeasedReaderId;
 use crate::write::WriterId;
-use crate::{Metrics, PersistConfig};
+use crate::{Metrics, PersistConfig, ShardId};
 
 use StateFieldValDiff::*;
 
@@ -236,9 +236,10 @@ impl<T: Timestamp + Lattice + Codec64> StateDiff<T> {
 
         use crate::internal::state::ProtoStateDiff;
 
-        let mut roundtrip_state =
-            from_state.clone(to_state.applier_version.clone(), to_state.hostname.clone());
-        roundtrip_state.walltime_ms = to_state.walltime_ms;
+        let mut roundtrip_state = from_state.clone(
+            from_state.applier_version.clone(),
+            from_state.hostname.clone(),
+        );
         roundtrip_state.apply_diff(metrics, diff.clone())?;
 
         if &roundtrip_state != to_state {
@@ -322,7 +323,7 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
 
     // Intentionally not even pub(crate) because all callers should use
     // [Self::apply_diffs].
-    fn apply_diff(&mut self, _metrics: &Metrics, diff: StateDiff<T>) -> Result<(), String> {
+    fn apply_diff(&mut self, metrics: &Metrics, diff: StateDiff<T>) -> Result<(), String> {
         // Deconstruct diff so we get a compile failure if new fields are added.
         let StateDiff {
             applier_version: diff_applier_version,
@@ -352,7 +353,14 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
         self.seqno = diff_seqno_to;
         self.applier_version = diff_applier_version;
         self.walltime_ms = diff_walltime_ms;
-        force_apply_diffs_single("hostname", diff_hostname, &mut self.hostname)?;
+        force_apply_diffs_single(
+            &self.shard_id,
+            diff_seqno_to,
+            "hostname",
+            diff_hostname,
+            &mut self.hostname,
+            metrics,
+        )?;
 
         // Deconstruct collections so we get a compile failure if new fields are
         // added.
@@ -452,28 +460,35 @@ fn apply_diff_single<X: PartialEq + Debug>(
 //
 // TODO: delete this once `hostname` has zero mismatches
 fn force_apply_diffs_single<X: PartialEq + Debug>(
+    shard_id: &ShardId,
+    seqno: SeqNo,
     name: &str,
     diffs: Vec<StateFieldDiff<(), X>>,
     single: &mut X,
+    metrics: &Metrics,
 ) -> Result<(), String> {
     for diff in diffs {
-        force_apply_diff_single(name, diff, single)?;
+        force_apply_diff_single(shard_id, seqno, name, diff, single, metrics)?;
     }
     Ok(())
 }
 
 fn force_apply_diff_single<X: PartialEq + Debug>(
+    shard_id: &ShardId,
+    seqno: SeqNo,
     name: &str,
     diff: StateFieldDiff<(), X>,
     single: &mut X,
+    metrics: &Metrics,
 ) -> Result<(), String> {
     match diff.val {
         Update(from, to) => {
             if single != &from {
-                error!(
-                    "{} update didn't match: {:?} vs {:?}, continuing to force apply diff...",
-                    name, single, &from
+                debug!(
+                    "{}: update didn't match: {:?} vs {:?}, continuing to force apply diff to {:?} for shard {} and seqno {}",
+                    name, single, &from, &to, shard_id, seqno
                 );
+                metrics.state.force_apply_hostname.inc();
             }
             *single = to
         }
@@ -1166,9 +1181,7 @@ impl<'a> Iterator for ProtoStateFieldDiffsIter<'a> {
 mod tests {
     use std::ops::ControlFlow::Continue;
 
-    use mz_build_info::DUMMY_BUILD_INFO;
     use mz_ore::metrics::MetricsRegistry;
-    use mz_ore::now::SYSTEM_TIME;
 
     use crate::internal::state::TypedState;
     use crate::ShardId;
@@ -1260,10 +1273,7 @@ mod tests {
             _ => unreachable!(),
         };
 
-        let metrics = Metrics::new(
-            &PersistConfig::new(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone()),
-            &MetricsRegistry::new(),
-        );
+        let metrics = Metrics::new(&PersistConfig::new_for_tests(), &MetricsRegistry::new());
         assert_eq!(
             apply_diffs_spine(&metrics, diffs, &mut state.collections.trace),
             Ok(())
@@ -1278,6 +1288,7 @@ mod tests {
     }
 
     #[mz_ore::test]
+    #[cfg_attr(miri, ignore)] // too slow
     fn apply_lenient() {
         #[track_caller]
         fn testcase(
@@ -1302,10 +1313,7 @@ mod tests {
             let replacement = batch(&replacement);
             let batches = spine.iter().map(batch).collect::<Vec<_>>();
 
-            let metrics = Metrics::new(
-                &PersistConfig::new(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone()),
-                &MetricsRegistry::new(),
-            );
+            let metrics = Metrics::new(&PersistConfig::new_for_tests(), &MetricsRegistry::new());
             let actual = apply_compaction_lenient(&metrics, batches, &replacement);
             let expected = match expected {
                 Ok(batches) => Ok(batches.iter().map(batch).collect::<Vec<_>>()),

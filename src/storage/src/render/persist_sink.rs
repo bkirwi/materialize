@@ -87,7 +87,6 @@
 //!
 // TODO(guswynn): merge at least the `append_batches` operator`
 
-use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -101,16 +100,18 @@ use differential_dataflow::{AsCollection, Collection, Hashable};
 use either::Either;
 use mz_ore::cast::CastFrom;
 use mz_ore::collections::HashMap;
-use mz_persist_client::batch::Batch;
+use mz_persist_client::batch::{Batch, ProtoBatch};
 use mz_persist_client::cache::PersistClientCache;
-use mz_persist_client::write::WriterEnrichedHollowBatch;
+use mz_persist_client::Diagnostics;
 use mz_persist_types::codec_impls::UnitSchema;
 use mz_persist_types::{Codec, Codec64};
 use mz_repr::{Diff, GlobalId, Row};
-use mz_storage_client::controller::CollectionMetadata;
-use mz_storage_client::types::errors::DataflowError;
-use mz_storage_client::types::sources::SourceData;
-use mz_timely_util::builder_async::{Event, OperatorBuilder as AsyncOperatorBuilder};
+use mz_storage_types::controller::CollectionMetadata;
+use mz_storage_types::errors::DataflowError;
+use mz_storage_types::sources::SourceData;
+use mz_timely_util::builder_async::{
+    Event, OperatorBuilder as AsyncOperatorBuilder, PressOnDropButton,
+};
 use serde::{Deserialize, Serialize};
 use timely::dataflow::channels::pact::{Exchange, Pipeline};
 use timely::dataflow::operators::{Broadcast, Capability, CapabilitySet, Inspect};
@@ -119,7 +120,7 @@ use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tracing::trace;
 
-use crate::source::types::SourcePersistSinkMetrics;
+use crate::metrics::source::SourcePersistSinkMetrics;
 use crate::storage_state::StorageState;
 
 /// Metrics about batches.
@@ -249,7 +250,7 @@ where
                 HollowBatchAndMetadata {
                     lower,
                     upper,
-                    batch: Either::Left(batch.into_writer_hollow_batch()),
+                    batch: Either::Left(batch.into_transmittable_batch()),
                     metrics: self.metrics,
                 }
             }
@@ -266,7 +267,7 @@ where
 struct HollowBatchAndMetadata<K, V, T, D> {
     lower: Antichain<T>,
     upper: Antichain<T>,
-    batch: Either<WriterEnrichedHollowBatch<T>, Vec<(K, V, T, D)>>,
+    batch: Either<ProtoBatch, Vec<(K, V, T, D)>>,
     metrics: BatchMetrics,
 }
 
@@ -307,14 +308,18 @@ struct BatchSet {
 /// This is done to avoid a clone of the underlying data so that both
 /// operators can have the collection as input.
 pub(crate) fn render<G>(
-    scope: &mut G,
+    scope: &G,
     collection_id: GlobalId,
     target: CollectionMetadata,
     desired_collection: Collection<G, Result<Row, DataflowError>, Diff>,
-    storage_state: &mut StorageState,
+    storage_state: &StorageState,
     metrics: SourcePersistSinkMetrics,
     output_index: usize,
-) -> Rc<dyn Any>
+) -> (
+    Stream<G, ()>,
+    Stream<G, Rc<anyhow::Error>>,
+    Vec<PressOnDropButton>,
+)
 where
     G: Scope<Timestamp = mz_repr::Timestamp>,
 {
@@ -342,7 +347,7 @@ where
         storage_state,
     );
 
-    let append_token = append_batches(
+    let (upper_stream, append_errors, append_token) = append_batches(
         scope,
         collection_id.clone(),
         operator_name,
@@ -355,7 +360,11 @@ where
         metrics,
     );
 
-    Rc::new((mint_token, write_token, append_token))
+    (
+        upper_stream,
+        append_errors,
+        vec![mint_token, write_token, append_token],
+    )
 }
 
 /// Whenever the frontier advances, this mints a new batch description (lower
@@ -367,7 +376,7 @@ where
 /// `broadcast()` to, ahem, broadcast, the one description to all downstream
 /// write operators/workers.
 fn mint_batch_descriptions<G>(
-    scope: &mut G,
+    scope: &G,
     collection_id: GlobalId,
     operator_name: &str,
     target: &CollectionMetadata,
@@ -376,7 +385,7 @@ fn mint_batch_descriptions<G>(
 ) -> (
     Stream<G, (Antichain<mz_repr::Timestamp>, Antichain<mz_repr::Timestamp>)>,
     Stream<G, (Result<Row, DataflowError>, mz_repr::Timestamp, Diff)>,
-    Rc<dyn Any>,
+    PressOnDropButton,
 )
 where
     G: Scope<Timestamp = mz_repr::Timestamp>,
@@ -406,7 +415,8 @@ where
 
     // The description and the data-passthrough outputs are both driven by this input, so
     // they use a standard input connection.
-    let mut desired_input = mint_op.new_input(&desired_collection.inner, Pipeline);
+    let mut desired_input =
+        mint_op.new_input_for_many(&desired_collection.inner, Pipeline, [&output, &data_output]);
 
     let shutdown_button = mint_op.build(move |capabilities| async move {
         // Non-active workers should just pass the data through.
@@ -415,10 +425,12 @@ where
             // its capability here. The data-passthrough output just uses the data
             // capabilities.
             drop(capabilities);
-            while let Some(event) = desired_input.next_mut().await {
+            while let Some(event) = desired_input.next().await {
                 match event {
-                    Event::Data(cap, data) => {
-                        data_output.give_container(&cap, data).await;
+                    Event::Data([_output_cap, data_output_cap], mut data) => {
+                        data_output
+                            .give_container(&data_output_cap, &mut data)
+                            .await;
                     }
                     Event::Progress(_) => {}
                 }
@@ -442,20 +454,27 @@ where
                 .await
                 .expect("could not open persist client");
 
-            let write = persist_client
+            let mut write = persist_client
                 .open_writer::<SourceData, (), mz_repr::Timestamp, Diff>(
                     shard_id,
-                    &format!(
-                        "compute::persist_sink::mint_batch_descriptions {}",
-                        collection_id
-                    ),
                     Arc::new(target_relation_desc),
                     Arc::new(UnitSchema),
+                    Diagnostics {
+                        shard_name: collection_id.to_string(),
+                        handle_purpose: format!(
+                            "storage::persist_sink::mint_batch_descriptions {}",
+                            collection_id
+                        ),
+                    },
                 )
                 .await
                 .expect("could not open persist shard");
 
-            let upper = write.upper().clone();
+            // TODO: this sink currently cannot tolerate a stale upper... which is bad because the
+            // upper can become stale as soon as it is read. (For example, if another concurrent
+            // instance of the sink has updated it.) Fetching a recent upper helps to mitigate this,
+            // but ideally we would just skip ahead if we discover that our upper is stale.
+            let upper = write.fetch_recent_upper().await.clone();
             // explicitly expire the once-used write handle.
             write.expire().await;
             upper
@@ -465,11 +484,13 @@ where
         let mut desired_frontier;
 
         loop {
-            if let Some(event) = desired_input.next_mut().await {
+            if let Some(event) = desired_input.next().await {
                 match event {
-                    Event::Data(cap, data) => {
+                    Event::Data([_output_cap, data_output_cap], mut data) => {
                         // Just passthrough the data.
-                        data_output.give_container(&cap, data).await;
+                        data_output
+                            .give_container(&data_output_cap, &mut data)
+                            .await;
                         continue;
                     }
                     Event::Progress(frontier) => {
@@ -525,8 +546,11 @@ where
         }
     });
 
-    let token = Rc::new(shutdown_button.press_on_drop());
-    (output_stream, data_output_stream, token)
+    (
+        output_stream,
+        data_output_stream,
+        shutdown_button.press_on_drop(),
+    )
 }
 
 /// Writes `desired_collection` to persist, but only for updates
@@ -538,17 +562,17 @@ where
 ///
 /// This also and updates various metrics.
 fn write_batches<G>(
-    scope: &mut G,
+    scope: &G,
     collection_id: GlobalId,
     operator_name: &str,
     target: &CollectionMetadata,
     batch_descriptions: &Stream<G, (Antichain<mz_repr::Timestamp>, Antichain<mz_repr::Timestamp>)>,
     desired_collection: &Collection<G, Result<Row, DataflowError>, Diff>,
     persist_clients: Arc<PersistClientCache>,
-    storage_state: &mut StorageState,
+    storage_state: &StorageState,
 ) -> (
     Stream<G, HollowBatchAndMetadata<SourceData, (), mz_repr::Timestamp, Diff>>,
-    Rc<dyn Any>,
+    PressOnDropButton,
 )
 where
     G: Scope<Timestamp = mz_repr::Timestamp>,
@@ -560,8 +584,8 @@ where
     let target_relation_desc = target.relation_desc.clone();
 
     let source_statistics = storage_state
-        .source_statistics
-        .get(&collection_id)
+        .aggregated_statistics
+        .get_source(&collection_id)
         .expect("statistics initialized")
         .clone();
 
@@ -570,8 +594,9 @@ where
 
     let (mut output, output_stream) = write_op.new_output();
 
-    let mut descriptions_input = write_op.new_input(&batch_descriptions.broadcast(), Pipeline);
-    let mut desired_input = write_op.new_input(&desired_collection.inner, Pipeline);
+    let mut descriptions_input =
+        write_op.new_input_for(&batch_descriptions.broadcast(), Pipeline, &output);
+    let mut desired_input = write_op.new_disconnected_input(&desired_collection.inner, Pipeline);
 
     // This operator accepts the current and desired update streams for a `persist` shard.
     // It attempts to write out updates, starting from the current's upper frontier, that
@@ -603,9 +628,12 @@ where
         let mut write = persist_client
             .open_writer::<SourceData, (), mz_repr::Timestamp, Diff>(
                 shard_id,
-                &format!("compute::persist_sink::write_batches {}", collection_id),
                 Arc::new(target_relation_desc),
                 Arc::new(UnitSchema),
+                Diagnostics {
+                    shard_name: collection_id.to_string(),
+                    handle_purpose: format!("storage::persist_sink::write_batches {}", collection_id),
+                },
             )
             .await
             .expect("could not open persist shard");
@@ -623,11 +651,11 @@ where
 
         loop {
             tokio::select! {
-                Some(event) = descriptions_input.next_mut() => {
+                Some(event) = descriptions_input.next() => {
                     match event {
                         Event::Data(cap, data) => {
                             // Ingest new batch descriptions.
-                            for description in data.drain(..) {
+                            for description in data {
                                 if collection_id.is_user() {
                                     trace!(
                                         "persist_sink {collection_id}/{shard_id}: \
@@ -670,7 +698,7 @@ where
                         }
                     }
                 }
-                Some(event) = desired_input.next_mut() => {
+                Some(event) = desired_input.next() => {
                     match event {
                         Event::Data(_cap, data) => {
                             // Extract desired rows as positive contributions to `correction`.
@@ -689,7 +717,7 @@ where
                             }
 
                             let minimum_batch_updates = persist_clients.cfg().storage_sink_minimum_batch_updates();
-                            for (row, ts, diff) in data.drain(..) {
+                            for (row, ts, diff) in data {
                                 if write.upper().less_equal(&ts){
                                     let builder = stashed_batches.entry(ts).or_insert_with(|| {
                                         BatchBuilderAndMetadata::new()
@@ -870,8 +898,7 @@ where
         output_stream.inspect(|d| trace!("batch: {:?}", d));
     }
 
-    let token = Rc::new(shutdown_button.press_on_drop());
-    (output_stream, token)
+    (output_stream, shutdown_button.press_on_drop())
 }
 
 /// Fuses written batches together and appends them to persist using one
@@ -884,17 +911,21 @@ where
 /// sync with the upper of the persist shard, and updates various metrics
 /// and statistics objects.
 fn append_batches<G>(
-    scope: &mut G,
+    scope: &G,
     collection_id: GlobalId,
     operator_name: String,
     target: &CollectionMetadata,
     batch_descriptions: &Stream<G, (Antichain<mz_repr::Timestamp>, Antichain<mz_repr::Timestamp>)>,
     batches: &Stream<G, HollowBatchAndMetadata<SourceData, (), mz_repr::Timestamp, Diff>>,
     persist_clients: Arc<PersistClientCache>,
-    storage_state: &mut StorageState,
+    storage_state: &StorageState,
     output_index: usize,
     metrics: SourcePersistSinkMetrics,
-) -> Rc<dyn Any>
+) -> (
+    Stream<G, ()>,
+    Stream<G, Rc<anyhow::Error>>,
+    PressOnDropButton,
+)
 where
     G: Scope<Timestamp = mz_repr::Timestamp>,
 {
@@ -912,13 +943,10 @@ where
     // any output of this operator is entirely driven by the `compare_and_append`s. Currently
     // this operator has no outputs, but they may be added in the future, when merging with
     // the compute `persist_sink`.
-    let mut descriptions_input = append_op.new_input_connection(
-        batch_descriptions,
-        Exchange::new(move |_| hashed_id),
-        vec![],
-    );
+    let mut descriptions_input =
+        append_op.new_disconnected_input(batch_descriptions, Exchange::new(move |_| hashed_id));
     let mut batches_input =
-        append_op.new_input_connection(batches, Exchange::new(move |_| hashed_id), vec![]);
+        append_op.new_disconnected_input(batches, Exchange::new(move |_| hashed_id));
 
     let current_upper = Rc::clone(&storage_state.source_uppers[&collection_id]);
     if !active_worker {
@@ -928,17 +956,22 @@ where
     }
 
     let source_statistics = storage_state
-        .source_statistics
-        .get(&collection_id)
+        .aggregated_statistics
+        .get_source(&collection_id)
         .expect("statistics initialized")
         .clone();
+
+    // An output whose frontier tracks the last successful compare and append of this operator
+    let (_upper_output, upper_stream) = append_op.new_output();
 
     // This operator accepts the batch descriptions and tokens that represent
     // written batches. Written batches get appended to persist when we learn
     // from our input frontiers that we have seen all batches for a given batch
     // description.
 
-    let shutdown_button = append_op.build(move |_| async move {
+    let (shutdown_button, errors) = append_op.build_fallible(move |caps| Box::pin(async move {
+        let [upper_cap_set]: &mut [_; 1] = caps.try_into().unwrap();
+
         // This may SEEM unnecessary, but metrics contains extra
         // `DeleteOnDrop`-wrapped fields that will NOT be moved into this
         // closure otherwise, dropping and destroying
@@ -965,28 +998,30 @@ where
             BatchSet,
         >::new();
 
+        source_statistics.initialize_rehydration_latency_ms();
         if !active_worker {
-            // The non-active workers report that they are done snapshotting.
-            source_statistics
-                .initialize_snapshot_committed(&Antichain::<mz_repr::Timestamp>::new());
-            return;
+            // The non-active workers report that they are done snapshotting and hydrating.
+            let empty_frontier = Antichain::new();
+            source_statistics.initialize_snapshot_committed(&empty_frontier);
+            source_statistics.update_rehydration_latency_ms(&empty_frontier);
+            return Ok(());
         }
 
-        // TODO(aljoscha): We need to figure out what to do with error results from these calls.
         let persist_client = persist_clients
             .open(persist_location)
-            .await
-            .expect("could not open persist client");
+            .await?;
 
         let mut write = persist_client
             .open_writer::<SourceData, (), mz_repr::Timestamp, Diff>(
                 shard_id,
-                &format!("persist_sink::append_batches {}", collection_id),
                 Arc::new(target_relation_desc),
                 Arc::new(UnitSchema),
+                Diagnostics {
+                    shard_name:collection_id.to_string(),
+                    handle_purpose: format!("persist_sink::append_batches {}", collection_id)
+                },
             )
-            .await
-            .expect("could not open persist shard");
+            .await?;
 
         // Initialize this sink's `upper` to the `upper` of the persist shard we are writing
         // to. Data from the source not beyond this time will be dropped, as it has already
@@ -996,6 +1031,7 @@ where
         // shared upper. All other workers have already cleared this
         // upper above.
         current_upper.borrow_mut().clone_from(write.upper());
+        upper_cap_set.downgrade(current_upper.borrow().iter());
         source_statistics.initialize_snapshot_committed(write.upper());
 
         // The current input frontiers.
@@ -1016,11 +1052,11 @@ where
 
         loop {
             tokio::select! {
-                Some(event) = descriptions_input.next_mut() => {
+                Some(event) = descriptions_input.next() => {
                     match event {
                         Event::Data(_cap, data) => {
                             // Ingest new batch descriptions.
-                            for batch_description in data.drain(..) {
+                            for batch_description in data {
                                 if collection_id.is_user() {
                                     trace!(
                                         "persist_sink {collection_id}/{shard_id}: \
@@ -1054,13 +1090,13 @@ where
                         }
                     }
                 }
-                Some(event) = batches_input.next_mut() => {
+                Some(event) = batches_input.next() => {
                     match event {
                         Event::Data(_cap, data) => {
-                            for batch in data.drain(..) {
+                            for batch in data {
                                 match batch.batch {
                                     Either::Left(hollow_batch) => {
-                                        let finished_batch = write.batch_from_hollow_batch(hollow_batch);
+                                        let finished_batch = write.batch_from_transmittable_batch(hollow_batch);
                                         let batch_description = (batch.lower.clone(), batch.upper.clone());
 
                                         let batches = in_flight_batches
@@ -1094,7 +1130,7 @@ where
                 }
                 else => {
                     // All inputs are exhausted, so we can shut down.
-                    return;
+                    return Ok(());
                 }
             };
 
@@ -1188,6 +1224,7 @@ where
                 source_statistics
                     .inc_updates_committed_by(batch_metrics.inserts + batch_metrics.retractions);
                 source_statistics.update_snapshot_committed(&batch_upper);
+                source_statistics.update_rehydration_latency_ms(&batch_upper);
 
                 metrics.processed_batches.inc();
                 metrics.row_inserts.inc_by(batch_metrics.inserts);
@@ -1213,6 +1250,7 @@ where
                 match result {
                     Ok(()) => {
                         current_upper.borrow_mut().clone_from(&batch_upper);
+                        upper_cap_set.downgrade(current_upper.borrow().iter());
                     }
                     Err(mismatch) => {
                         // _Best effort_ Clean up in case we didn't manage to append the
@@ -1220,7 +1258,8 @@ where
                         for batch in batches {
                             batch.delete().await;
                         }
-                        panic!(
+
+                        tracing::warn!(
                             "persist_sink({}): invalid upper! \
                                 Tried to append batch ({:?} -> {:?}) but upper \
                                 is {:?}. This is not a problem, it just means \
@@ -1228,11 +1267,12 @@ where
                                 again with a new batch description.",
                             collection_id, batch_lower, batch_upper, mismatch.current,
                         );
+                        anyhow::bail!("collection concurrently modified. Ingestion dataflow will be restarted");
                     }
                 }
             }
         }
-    });
+    }));
 
-    Rc::new(shutdown_button.press_on_drop())
+    (upper_stream, errors, shutdown_button.press_on_drop())
 }

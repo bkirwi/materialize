@@ -16,18 +16,24 @@
 from dbt.tests.adapter.hooks import test_model_hooks as core_base
 
 test_materialized_view = """
-{{ config(materialized='materializedview') }}
+{{ config(materialized='materialized_view') }}
 
-    SELECT * FROM (VALUES ('chicken', 'pig'), ('cow', 'horse'), (NULL, NULL)) _ (a, b)
+    SELECT * FROM (VALUES ('chicken', 'pig', 'bird'), ('cow', 'horse', 'bird'), (NULL, NULL, NULL)) _ (a, b, c)
 """
 
 test_materialized_view_index = """
 {{ config(
-    materialized='materializedview',
+    materialized='materialized_view',
     indexes=[{'columns': ['a', 'length(a)'], 'name': 'a_idx'}]
 ) }}
 
     SELECT * FROM (VALUES ('chicken', 'pig'), ('cow', 'horse')) _ (a, b)
+"""
+
+test_view = """
+{{ config(materialized='view') }}
+
+    SELECT * FROM (VALUES ('chicken', 'pig', 'bird'), ('cow', 'horse', 'bird'), (NULL, NULL, NULL)) _ (a, b, c)
 """
 
 test_view_index = """
@@ -39,16 +45,32 @@ test_view_index = """
     SELECT * FROM (VALUES ('chicken', 'pig'), ('cow', 'horse'), (NULL, NULL)) _ (a, b)
 """
 
+test_table_index = """
+{{ config(
+    materialized='table',
+    indexes=[{'columns': ['a', 'length(a)'], 'name': 'test_table_index_a_idx'}]
+) }}
+
+    SELECT * FROM (VALUES ('chicken', 'pig'), ('cow', 'horse')) _ (a, b)
+"""
+
+test_seed = """
+id,value
+1,100
+2,200
+3,300
+""".strip()
+
 test_source = """
 {{ config(
     materialized='source',
     database='materialize',
-    pre_hook="CREATE CONNECTION kafka_connection TO KAFKA (BROKER '{{ env_var('KAFKA_ADDR', 'localhost:9092') }}')"
+    pre_hook="CREATE CONNECTION IF NOT EXISTS kafka_connection TO KAFKA (BROKER '{{ env_var('KAFKA_ADDR', 'localhost:9092') }}', SECURITY PROTOCOL PLAINTEXT)"
     )
 }}
 
 CREATE SOURCE {{ this }}
-FROM KAFKA CONNECTION kafka_connection (TOPIC 'test-source')
+FROM KAFKA CONNECTION kafka_connection (TOPIC 'testdrive-test-source-1')
 FORMAT BYTES
 """
 
@@ -59,12 +81,27 @@ test_source_index = """
 ) }}
 
 CREATE SOURCE {{ this }}
-FROM KAFKA CONNECTION kafka_connection (TOPIC 'test-source')
+FROM KAFKA CONNECTION kafka_connection (TOPIC 'testdrive-test-source-1')
 FORMAT BYTES
 """
 
+test_subsources = """
+{{ config(
+    materialized='source',
+    database='materialize'
+    )
+}}
+
+CREATE SOURCE {{ this }}
+FROM LOAD GENERATOR AUCTION
+FOR ALL TABLES;
+"""
+
 test_sink = """
-{{ config(materialized='sink') }}
+{{ config(
+    materialized='sink'
+    )
+}}
  CREATE SINK {{ this }}
  FROM {{ ref('test_materialized_view') }}
  INTO KAFKA CONNECTION kafka_connection (TOPIC 'test-sink')
@@ -91,6 +128,8 @@ test_materialized_view_index,1,1,,a_idx
 test_materialized_view_index,2,,pg_catalog.length(a),a_idx
 test_source_index,1,1,,test_source_index_data_idx
 test_view_index,1,1,,test_view_index_primary_idx
+test_table_index,1,1,,test_table_index_a_idx
+test_table_index,2,,pg_catalog.length(a),test_table_index_a_idx
 """.lstrip()
 
 not_null = """
@@ -114,14 +153,14 @@ unique = """
 """
 
 expected_base_relation_types = {
-    "base": "materializedview",
+    "base": "materialized_view",
     "view_model": "view",
-    "table_model": "materializedview",
-    "swappable": "materializedview",
+    "table_model": "materialized_view",
+    "swappable": "materialized_view",
 }
 
 test_relation_name_length = """
-{{ config(materialized='materializedview') }}
+{{ config(materialized='materialized_view') }}
 
     SELECT * FROM (VALUES ('chicken', 'pig'), ('cow', 'horse'), (NULL, NULL)) _ (a, b)
 """
@@ -187,7 +226,8 @@ create table {schema}.on_model_hook (
     target_pass      TEXT,
     target_threads   INTEGER,
     run_started_at   TEXT,
-    invocation_id    TEXT
+    invocation_id    TEXT,
+    thread_id        TEXT
 )
 """
 
@@ -203,6 +243,45 @@ create table {schema}.on_run_hook (
     target_pass      TEXT,
     target_threads   INTEGER,
     run_started_at   TEXT,
-    invocation_id    TEXT
+    invocation_id    TEXT,
+    thread_id        TEXT
 )
+"""
+
+nullability_assertions_schema_yml = """
+version: 2
+models:
+  - name: test_nullability_assertions_ddl
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: a
+        data_type: string
+        constraints:
+          - type: not_null
+      - name: b
+        data_type: string
+        constraints:
+          - type: not_null
+      - name: c
+        data_type: string
+"""
+
+contract_invalid_cluster_schema_yml = """
+version: 2
+models:
+  - name: test_view
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: a
+        data_type: string
+        constraints:
+          - type: not_null
+      - name: b
+        data_type: string
+      - name: c
+        data_type: string
 """

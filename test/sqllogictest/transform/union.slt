@@ -34,14 +34,14 @@ INSERT INTO t3 VALUES (2, 3), (5, 5), (5, 5), (6, 1)
 
 # Test that nested unions are fused into a single Union operator
 query T multiline
-EXPLAIN WITH(arity, join_impls) (SELECT * FROM t1 UNION ALL SELECT * FROM t1) UNION ALL (SELECT * FROM t2 UNION ALL SELECT * FROM t2);
+EXPLAIN WITH(arity, join implementations) (SELECT * FROM t1 UNION ALL SELECT * FROM t1) UNION ALL (SELECT * FROM t2 UNION ALL SELECT * FROM t2);
 ----
 Explained Query:
   Union // { arity: 2 }
-    Get materialize.public.t1 // { arity: 2 }
-    Get materialize.public.t1 // { arity: 2 }
-    Get materialize.public.t2 // { arity: 2 }
-    Get materialize.public.t2 // { arity: 2 }
+    ReadStorage materialize.public.t1 // { arity: 2 }
+    ReadStorage materialize.public.t1 // { arity: 2 }
+    ReadStorage materialize.public.t2 // { arity: 2 }
+    ReadStorage materialize.public.t2 // { arity: 2 }
 
 EOF
 
@@ -61,20 +61,20 @@ query II
 
 # Test that nested negated unions are merged into the parent Union operator by pushing the Negate into their branches
 query T multiline
-EXPLAIN WITH(arity, join_impls) (SELECT * FROM t1 UNION ALL SELECT * FROM t1) EXCEPT ALL (SELECT * FROM t2 UNION ALL SELECT * FROM t2);
+EXPLAIN WITH(arity, join implementations) (SELECT * FROM t1 UNION ALL SELECT * FROM t1) EXCEPT ALL (SELECT * FROM t2 UNION ALL SELECT * FROM t2);
 ----
 Explained Query:
   Return // { arity: 2 }
     Threshold // { arity: 2 }
       Union // { arity: 2 }
-        Get materialize.public.t1 // { arity: 2 }
-        Get materialize.public.t1 // { arity: 2 }
+        ReadStorage materialize.public.t1 // { arity: 2 }
+        ReadStorage materialize.public.t1 // { arity: 2 }
         Get l0 // { arity: 2 }
         Get l0 // { arity: 2 }
   With
     cte l0 =
       Negate // { arity: 2 }
-        Get materialize.public.t2 // { arity: 2 }
+        ReadStorage materialize.public.t2 // { arity: 2 }
 
 EOF
 
@@ -87,19 +87,19 @@ query II
 4  5
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT * FROM t2  EXCEPT ALL SELECT * FROM t1 INTERSECT ALL SELECT * FROM t3;
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t2  EXCEPT ALL SELECT * FROM t1 INTERSECT ALL SELECT * FROM t3;
 ----
 Explained Query:
   Threshold // { arity: 2 }
     Union // { arity: 2 }
-      Get materialize.public.t2 // { arity: 2 }
+      ReadStorage materialize.public.t2 // { arity: 2 }
       Negate // { arity: 2 }
-        Get materialize.public.t1 // { arity: 2 }
+        ReadStorage materialize.public.t1 // { arity: 2 }
       Threshold // { arity: 2 }
         Union // { arity: 2 }
-          Get materialize.public.t1 // { arity: 2 }
+          ReadStorage materialize.public.t1 // { arity: 2 }
           Negate // { arity: 2 }
-            Get materialize.public.t3 // { arity: 2 }
+            ReadStorage materialize.public.t3 // { arity: 2 }
 
 EOF
 
@@ -109,21 +109,21 @@ SELECT * FROM t2  EXCEPT ALL SELECT * FROM t1 INTERSECT ALL SELECT * FROM t3;
 5  5
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT * FROM t2 EXCEPT ALL (SELECT * FROM t1 INTERSECT ALL SELECT f1, null::int FROM t3);
+EXPLAIN WITH(arity, join implementations) SELECT * FROM t2 EXCEPT ALL (SELECT * FROM t1 INTERSECT ALL SELECT f1, null::int FROM t3);
 ----
 Explained Query:
   Threshold // { arity: 2 }
     Union // { arity: 2 }
-      Get materialize.public.t2 // { arity: 2 }
+      ReadStorage materialize.public.t2 // { arity: 2 }
       Negate // { arity: 2 }
-        Get materialize.public.t1 // { arity: 2 }
+        ReadStorage materialize.public.t1 // { arity: 2 }
       Threshold // { arity: 2 }
         Union // { arity: 2 }
-          Get materialize.public.t1 // { arity: 2 }
-          Map (null) // { arity: 2 }
-            Negate // { arity: 1 }
-              Project (#0) // { arity: 1 }
-                Get materialize.public.t3 // { arity: 2 }
+          ReadStorage materialize.public.t1 // { arity: 2 }
+          Negate // { arity: 2 }
+            Project (#0, #2) // { arity: 2 }
+              Map (null) // { arity: 3 }
+                ReadStorage materialize.public.t3 // { arity: 2 }
 
 EOF
 
@@ -134,7 +134,7 @@ SELECT * FROM t2 EXCEPT ALL (SELECT * FROM t1 INTERSECT ALL SELECT f1, null::int
 5 5
 
 query T multiline
-EXPLAIN WITH(arity, join_impls) SELECT a1.* FROM t3 AS a1 LEFT JOIN t2 AS a2 ON (a1.f1 = a2.nokey);
+EXPLAIN WITH(arity, join implementations) SELECT a1.* FROM t3 AS a1 LEFT JOIN t2 AS a2 ON (a1.f1 = a2.nokey);
 ----
 Explained Query:
   Return // { arity: 2 }
@@ -145,12 +145,12 @@ Explained Query:
             implementation
               %1[#0]UKA » %0:t3[#0]K
             ArrangeBy keys=[[#0]] // { arity: 2 }
-              Get materialize.public.t3 // { arity: 2 }
+              ReadStorage materialize.public.t3 // { arity: 2 }
             ArrangeBy keys=[[#0]] // { arity: 1 }
-              Distinct group_by=[#0] // { arity: 1 }
+              Distinct project=[#0] // { arity: 1 }
                 Project (#0) // { arity: 1 }
                   Get l0 // { arity: 2 }
-      Get materialize.public.t3 // { arity: 2 }
+      ReadStorage materialize.public.t3 // { arity: 2 }
       Get l0 // { arity: 2 }
   With
     cte l0 =
@@ -160,11 +160,11 @@ Explained Query:
             %0:t3[#0]K » %1:t2[#0]K
           ArrangeBy keys=[[#0]] // { arity: 2 }
             Filter (#0) IS NOT NULL // { arity: 2 }
-              Get materialize.public.t3 // { arity: 2 }
+              ReadStorage materialize.public.t3 // { arity: 2 }
           ArrangeBy keys=[[#0]] // { arity: 1 }
             Project (#1) // { arity: 1 }
               Filter (#1) IS NOT NULL // { arity: 2 }
-                Get materialize.public.t2 // { arity: 2 }
+                ReadStorage materialize.public.t2 // { arity: 2 }
 
 Source materialize.public.t2
   filter=((#1) IS NOT NULL)

@@ -16,20 +16,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mz_repr::{ColumnType, GlobalId, RelationDesc, ScalarType};
 use mz_sql_parser::ast::{
-    ColumnDef, RawItemName, ShowStatement, TableConstraint, UnresolvedDatabaseName,
-    UnresolvedSchemaName,
+    ColumnDef, ConnectionDefaultAwsPrivatelink, CreateMaterializedViewStatement, RawItemName,
+    ShowStatement, StatementKind, TableConstraint, UnresolvedDatabaseName, UnresolvedSchemaName,
 };
-use mz_storage_client::types::connections::{AwsPrivatelink, Connection, SshTunnel, Tunnel};
+use mz_storage_types::connections::inline::ReferencedConnection;
+use mz_storage_types::connections::{AwsPrivatelink, Connection, SshTunnel, Tunnel};
 
 use crate::ast::{Ident, Statement, UnresolvedItemName};
 use crate::catalog::{
     CatalogCluster, CatalogDatabase, CatalogItem, CatalogItemType, CatalogSchema, ObjectType,
-    SessionCatalog,
+    SessionCatalog, SystemObjectType,
 };
 use crate::names::{
     self, Aug, DatabaseId, FullItemName, ItemQualifiers, ObjectId, PartialItemName,
-    QualifiedItemName, RawDatabaseSpecifier, ResolvedDataType, ResolvedDatabaseSpecifier,
-    ResolvedItemName, ResolvedSchemaName, SchemaSpecifier,
+    QualifiedItemName, RawDatabaseSpecifier, ResolvedColumnName, ResolvedDataType,
+    ResolvedDatabaseSpecifier, ResolvedIds, ResolvedItemName, ResolvedSchemaName, SchemaSpecifier,
+    SystemObjectId,
 };
 use crate::normalize;
 use crate::plan::error::PlanError;
@@ -43,8 +45,12 @@ mod raise;
 mod scl;
 pub(crate) mod show;
 mod tcl;
+mod validate;
 
+use crate::session::vars;
 pub(crate) use ddl::PgConfigOptionExtracted;
+use mz_controller_types::ClusterId;
+use mz_pgrepr::oid::{FIRST_MATERIALIZE_OID, FIRST_USER_OID};
 use mz_repr::role_id::RoleId;
 
 /// Describes the output of a SQL statement.
@@ -117,13 +123,16 @@ pub fn describe(
         Statement::AlterConnection(stmt) => ddl::describe_alter_connection(&scx, stmt)?,
         Statement::AlterIndex(stmt) => ddl::describe_alter_index_options(&scx, stmt)?,
         Statement::AlterObjectRename(stmt) => ddl::describe_alter_object_rename(&scx, stmt)?,
+        Statement::AlterObjectSwap(stmt) => ddl::describe_alter_object_swap(&scx, stmt)?,
         Statement::AlterRole(stmt) => ddl::describe_alter_role(&scx, stmt)?,
         Statement::AlterSecret(stmt) => ddl::describe_alter_secret_options(&scx, stmt)?,
+        Statement::AlterSetCluster(stmt) => ddl::describe_alter_set_cluster(&scx, stmt)?,
         Statement::AlterSink(stmt) => ddl::describe_alter_sink(&scx, stmt)?,
         Statement::AlterSource(stmt) => ddl::describe_alter_source(&scx, stmt)?,
         Statement::AlterSystemSet(stmt) => ddl::describe_alter_system_set(&scx, stmt)?,
         Statement::AlterSystemReset(stmt) => ddl::describe_alter_system_reset(&scx, stmt)?,
         Statement::AlterSystemResetAll(stmt) => ddl::describe_alter_system_reset_all(&scx, stmt)?,
+        Statement::Comment(stmt) => ddl::describe_comment(&scx, stmt)?,
         Statement::CreateCluster(stmt) => ddl::describe_create_cluster(&scx, stmt)?,
         Statement::CreateClusterReplica(stmt) => ddl::describe_create_cluster_replica(&scx, stmt)?,
         Statement::CreateConnection(stmt) => ddl::describe_create_connection(&scx, stmt)?,
@@ -133,6 +142,7 @@ pub fn describe(
         Statement::CreateSchema(stmt) => ddl::describe_create_schema(&scx, stmt)?,
         Statement::CreateSecret(stmt) => ddl::describe_create_secret(&scx, stmt)?,
         Statement::CreateSink(stmt) => ddl::describe_create_sink(&scx, stmt)?,
+        Statement::CreateWebhookSource(stmt) => ddl::describe_create_webhook_source(&scx, stmt)?,
         Statement::CreateSource(stmt) => ddl::describe_create_source(&scx, stmt)?,
         Statement::CreateSubsource(stmt) => ddl::describe_create_subsource(&scx, stmt)?,
         Statement::CreateTable(stmt) => ddl::describe_create_table(&scx, stmt)?,
@@ -187,7 +197,7 @@ pub fn describe(
         // SCL statements.
         Statement::Close(stmt) => scl::describe_close(&scx, stmt)?,
         Statement::Deallocate(stmt) => scl::describe_deallocate(&scx, stmt)?,
-        Statement::Declare(stmt) => scl::describe_declare(&scx, stmt)?,
+        Statement::Declare(stmt) => scl::describe_declare(&scx, stmt, param_types_in)?,
         Statement::Discard(stmt) => scl::describe_discard(&scx, stmt)?,
         Statement::Execute(stmt) => scl::describe_execute(&scx, stmt)?,
         Statement::Fetch(stmt) => scl::describe_fetch(&scx, stmt)?,
@@ -201,7 +211,10 @@ pub fn describe(
         // DML statements.
         Statement::Copy(stmt) => dml::describe_copy(&scx, stmt)?,
         Statement::Delete(stmt) => dml::describe_delete(&scx, stmt)?,
-        Statement::Explain(stmt) => dml::describe_explain(&scx, stmt)?,
+        Statement::ExplainPlan(stmt) => dml::describe_explain_plan(&scx, stmt)?,
+        Statement::ExplainPushdown(stmt) => dml::describe_explain_pushdown(&scx, stmt)?,
+        Statement::ExplainTimestamp(stmt) => dml::describe_explain_timestamp(&scx, stmt)?,
+        Statement::ExplainSinkSchema(stmt) => dml::describe_explain_schema(&scx, stmt)?,
         Statement::Insert(stmt) => dml::describe_insert(&scx, stmt)?,
         Statement::Select(stmt) => dml::describe_select(&scx, stmt)?,
         Statement::Subscribe(stmt) => dml::describe_subscribe(&scx, stmt)?,
@@ -215,6 +228,10 @@ pub fn describe(
 
         // Other statements.
         Statement::Raise(stmt) => raise::describe_raise(&scx, stmt)?,
+        Statement::Show(ShowStatement::InspectShard(stmt)) => {
+            scl::describe_inspect_shard(&scx, stmt)?
+        }
+        Statement::ValidateConnection(stmt) => validate::describe_validate_connection(&scx, stmt)?,
     };
 
     let desc = desc.with_params(scx.finalize_param_types()?);
@@ -224,19 +241,29 @@ pub fn describe(
 /// Produces a [`Plan`] from the purified statement `stmt`.
 ///
 /// Planning is a pure, synchronous function and so requires that the provided
-/// `stmt` does does not depend on any external state. Only `CREATE SOURCE`
-/// statements can depend on external state; remove that state prior to calling
-/// this function via [`crate::pure::purify_create_source`].
+/// `stmt` does does not depend on any external state. Statements that rely on
+/// external state must remove that state prior to calling this function via
+/// [`crate::pure::purify_statement`] or
+/// [`crate::pure::purify_create_materialized_view_options`].
+///
+/// TODO: sinks do not currently obey this rule, which is a bug
+/// <https://github.com/MaterializeInc/materialize/issues/20019>
 ///
 /// The returned plan is tied to the state of the provided catalog. If the state
 /// of the catalog changes after planning, the validity of the plan is not
 /// guaranteed.
-#[tracing::instrument(level = "debug", skip_all)]
+///
+/// Note that if you want to do something else asynchronously (e.g. validating
+/// connections), these might want to take different code paths than
+/// `purify_statement`. Feel free to rationalize this by thinking of those
+/// statements as not necessarily depending on external state.
+#[mz_ore::instrument(level = "debug")]
 pub fn plan(
     pcx: Option<&PlanContext>,
     catalog: &dyn SessionCatalog,
     stmt: Statement<Aug>,
     params: &Params,
+    resolved_ids: &ResolvedIds,
 ) -> Result<Plan, PlanError> {
     let param_types = params
         .types
@@ -245,7 +272,8 @@ pub fn plan(
         .map(|(i, ty)| (i + 1, ty.clone()))
         .collect();
 
-    let permitted_plans = Plan::generated_from((&stmt).into());
+    let kind: StatementKind = (&stmt).into();
+    let permitted_plans = Plan::generated_from(&kind);
 
     let scx = &mut StatementContext {
         pcx,
@@ -254,19 +282,36 @@ pub fn plan(
         ambiguous_columns: RefCell::new(false),
     };
 
+    if resolved_ids
+        .0
+        .iter()
+        // Filter out items that may not have been created yet, such as sub-sources.
+        .filter_map(|id| catalog.try_get_item(id))
+        .any(|item| {
+            item.func().is_ok()
+                && item.name().qualifiers.schema_spec
+                    == SchemaSpecifier::Id(*catalog.get_mz_unsafe_schema_id())
+        })
+    {
+        scx.require_feature_flag(&vars::ENABLE_UNSAFE_FUNCTIONS)?;
+    }
+
     let plan = match stmt {
         // DDL statements.
         Statement::AlterCluster(stmt) => ddl::plan_alter_cluster(scx, stmt),
         Statement::AlterConnection(stmt) => ddl::plan_alter_connection(scx, stmt),
         Statement::AlterIndex(stmt) => ddl::plan_alter_index_options(scx, stmt),
         Statement::AlterObjectRename(stmt) => ddl::plan_alter_object_rename(scx, stmt),
+        Statement::AlterObjectSwap(stmt) => ddl::plan_alter_object_swap(scx, stmt),
         Statement::AlterRole(stmt) => ddl::plan_alter_role(scx, stmt),
         Statement::AlterSecret(stmt) => ddl::plan_alter_secret(scx, stmt),
+        Statement::AlterSetCluster(stmt) => ddl::plan_alter_item_set_cluster(scx, stmt),
         Statement::AlterSink(stmt) => ddl::plan_alter_sink(scx, stmt),
         Statement::AlterSource(stmt) => ddl::plan_alter_source(scx, stmt),
         Statement::AlterSystemSet(stmt) => ddl::plan_alter_system_set(scx, stmt),
         Statement::AlterSystemReset(stmt) => ddl::plan_alter_system_reset(scx, stmt),
         Statement::AlterSystemResetAll(stmt) => ddl::plan_alter_system_reset_all(scx, stmt),
+        Statement::Comment(stmt) => ddl::plan_comment(scx, stmt),
         Statement::CreateCluster(stmt) => ddl::plan_create_cluster(scx, stmt),
         Statement::CreateClusterReplica(stmt) => ddl::plan_create_cluster_replica(scx, stmt),
         Statement::CreateConnection(stmt) => ddl::plan_create_connection(scx, stmt),
@@ -276,6 +321,7 @@ pub fn plan(
         Statement::CreateSchema(stmt) => ddl::plan_create_schema(scx, stmt),
         Statement::CreateSecret(stmt) => ddl::plan_create_secret(scx, stmt),
         Statement::CreateSink(stmt) => ddl::plan_create_sink(scx, stmt),
+        Statement::CreateWebhookSource(stmt) => ddl::plan_create_webhook_source(scx, stmt),
         Statement::CreateSource(stmt) => ddl::plan_create_source(scx, stmt),
         Statement::CreateSubsource(stmt) => ddl::plan_create_subsource(scx, stmt),
         Statement::CreateTable(stmt) => ddl::plan_create_table(scx, stmt),
@@ -299,10 +345,13 @@ pub fn plan(
         // DML statements.
         Statement::Copy(stmt) => dml::plan_copy(scx, stmt),
         Statement::Delete(stmt) => dml::plan_delete(scx, stmt, params),
-        Statement::Explain(stmt) => dml::plan_explain(scx, stmt, params),
+        Statement::ExplainPlan(stmt) => dml::plan_explain_plan(scx, stmt, params),
+        Statement::ExplainPushdown(stmt) => dml::plan_explain_pushdown(scx, stmt, params),
+        Statement::ExplainTimestamp(stmt) => dml::plan_explain_timestamp(scx, stmt, params),
+        Statement::ExplainSinkSchema(stmt) => dml::plan_explain_schema(scx, stmt),
         Statement::Insert(stmt) => dml::plan_insert(scx, stmt, params),
         Statement::Select(stmt) => dml::plan_select(scx, stmt, params, None),
-        Statement::Subscribe(stmt) => dml::plan_subscribe(scx, stmt, None),
+        Statement::Subscribe(stmt) => dml::plan_subscribe(scx, stmt, params, None),
         Statement::Update(stmt) => dml::plan_update(scx, stmt, params),
 
         // `SHOW` statements.
@@ -333,7 +382,7 @@ pub fn plan(
         // SCL statements.
         Statement::Close(stmt) => scl::plan_close(scx, stmt),
         Statement::Deallocate(stmt) => scl::plan_deallocate(scx, stmt),
-        Statement::Declare(stmt) => scl::plan_declare(scx, stmt),
+        Statement::Declare(stmt) => scl::plan_declare(scx, stmt, params),
         Statement::Discard(stmt) => scl::plan_discard(scx, stmt),
         Statement::Execute(stmt) => scl::plan_execute(scx, stmt),
         Statement::Fetch(stmt) => scl::plan_fetch(scx, stmt),
@@ -350,10 +399,12 @@ pub fn plan(
 
         // Other statements.
         Statement::Raise(stmt) => raise::plan_raise(scx, stmt),
+        Statement::Show(ShowStatement::InspectShard(stmt)) => scl::plan_inspect_shard(scx, stmt),
+        Statement::ValidateConnection(stmt) => validate::plan_validate_connection(scx, stmt),
     };
 
     if let Ok(plan) = &plan {
-        mz_ore::soft_assert!(
+        mz_ore::soft_assert_no_log!(
             permitted_plans.contains(&PlanKind::from(plan)),
             "plan {:?}, permitted plans {:?}",
             plan,
@@ -499,12 +550,12 @@ impl<'a> StatementContext<'a> {
         let database_spec = match full_name.database {
             RawDatabaseSpecifier::Ambient => ResolvedDatabaseSpecifier::Ambient,
             RawDatabaseSpecifier::Name(name) => ResolvedDatabaseSpecifier::Id(
-                self.resolve_database(&UnresolvedDatabaseName(Ident::new(name)))?
+                self.resolve_database(&UnresolvedDatabaseName(Ident::new(name)?))?
                     .id(),
             ),
         };
         let schema_spec = self
-            .resolve_schema_in_database(&database_spec, &Ident::new(full_name.schema))?
+            .resolve_schema_in_database(&database_spec, &Ident::new(full_name.schema)?)?
             .id()
             .clone();
         Ok(QualifiedItemName {
@@ -636,10 +687,6 @@ impl<'a> StatementContext<'a> {
         self.catalog.get_schema(database_spec, schema_spec)
     }
 
-    pub fn item_exists(&self, name: &QualifiedItemName) -> bool {
-        self.catalog.item_exists(name)
-    }
-
     pub fn resolve_item(&self, name: RawItemName) -> Result<&dyn CatalogItem, PlanError> {
         match name {
             RawItemName::Name(name) => {
@@ -665,6 +712,29 @@ impl<'a> StatementContext<'a> {
             ResolvedItemName::Item { id, .. } => Ok(self.get_item(id)),
             ResolvedItemName::Cte { .. } => sql_bail!("non-user item"),
             ResolvedItemName::Error => unreachable!("should have been caught in name resolution"),
+        }
+    }
+
+    pub fn get_column_by_resolved_name(
+        &self,
+        name: &ResolvedColumnName,
+    ) -> Result<(&dyn CatalogItem, usize), PlanError> {
+        match name {
+            ResolvedColumnName::Column {
+                relation: ResolvedItemName::Item { id, .. },
+                index,
+                ..
+            } => {
+                let item = self.get_item(id);
+                Ok((item, *index))
+            }
+            ResolvedColumnName::Column {
+                relation: ResolvedItemName::Cte { .. } | ResolvedItemName::Error,
+                ..
+            }
+            | ResolvedColumnName::Error => {
+                unreachable!("should have been caught in name resolution")
+            }
         }
     }
 
@@ -700,11 +770,17 @@ impl<'a> StatementContext<'a> {
         // representation on `pgrepr::Type` promises to
         // produce an unqualified type name that does
         // not require quoting.
-        //
+        let mut ty = if ty.oid() >= FIRST_USER_OID {
+            sql_bail!("internal error, unexpected user type: {ty:?} ");
+        } else if ty.oid() < FIRST_MATERIALIZE_OID {
+            format!("pg_catalog.{}", ty)
+        } else {
+            // This relies on all non-PG types existing in `mz_catalog`, which is annoying.
+            format!("mz_catalog.{}", ty)
+        };
         // TODO(benesch): converting `json` to `jsonb`
         // is wrong. We ought to support the `json` type
         // directly.
-        let mut ty = format!("pg_catalog.{}", ty);
         if ty == "pg_catalog.json" {
             ty = "pg_catalog.jsonb".into();
         }
@@ -715,6 +791,13 @@ impl<'a> StatementContext<'a> {
 
     pub fn get_object_type(&self, id: &ObjectId) -> ObjectType {
         self.catalog.get_object_type(id)
+    }
+
+    pub fn get_system_object_type(&self, id: &SystemObjectId) -> SystemObjectType {
+        match id {
+            SystemObjectId::Object(id) => SystemObjectType::Object(self.get_object_type(id)),
+            SystemObjectId::System => SystemObjectType::System,
+        }
     }
 
     /// Returns an error if the named `FeatureFlag` is not set to `on`.
@@ -758,23 +841,23 @@ impl<'a> StatementContext<'a> {
     pub(crate) fn build_tunnel_definition(
         &self,
         ssh_tunnel: Option<with_options::Object>,
-        aws_privatelink: Option<with_options::Object>,
-    ) -> Result<Tunnel, PlanError> {
+        aws_privatelink: Option<ConnectionDefaultAwsPrivatelink<Aug>>,
+    ) -> Result<Tunnel<ReferencedConnection>, PlanError> {
         match (ssh_tunnel, aws_privatelink) {
             (None, None) => Ok(Tunnel::Direct),
             (Some(ssh_tunnel), None) => {
                 let id = GlobalId::from(ssh_tunnel);
                 let ssh_tunnel = self.catalog.get_item(&id);
                 match ssh_tunnel.connection()? {
-                    Connection::Ssh(connection) => Ok(Tunnel::Ssh(SshTunnel {
+                    Connection::Ssh(_connection) => Ok(Tunnel::Ssh(SshTunnel {
                         connection_id: id,
-                        connection: connection.clone(),
+                        connection: id,
                     })),
                     _ => sql_bail!("{} is not an SSH connection", ssh_tunnel.name().item),
                 }
             }
             (None, Some(aws_privatelink)) => {
-                let id = GlobalId::from(aws_privatelink);
+                let id = aws_privatelink.connection.item_id().clone();
                 let entry = self.catalog.get_item(&id);
                 match entry.connection()? {
                     Connection::AwsPrivatelink(_) => Ok(Tunnel::AwsPrivatelink(AwsPrivatelink {
@@ -782,7 +865,7 @@ impl<'a> StatementContext<'a> {
                         // By default we do not specify an availability zone for the tunnel.
                         availability_zone: None,
                         // We always use the port as specified by the top-level connection.
-                        port: None,
+                        port: aws_privatelink.port,
                     })),
                     _ => sql_bail!("{} is not an AWS PRIVATELINK connection", entry.name().item),
                 }
@@ -800,7 +883,7 @@ impl<'a> StatementContext<'a> {
         let mut columns = vec![];
         let mut null_cols = BTreeSet::new();
         for (column_name, column_type) in desc.iter() {
-            let name = Ident::new(column_name.as_str().to_owned());
+            let name = Ident::new(column_name.as_str().to_owned())?;
 
             let ty = mz_pgrepr::Type::from(&column_type.scalar_type);
             let data_type = self.resolve_type(ty)?;
@@ -861,6 +944,8 @@ impl<'a> StatementContext<'a> {
     /// if objects do not exist) so should never be used to handle user input.
     pub fn dangerous_resolve_name(&self, name: Vec<&str>) -> ResolvedItemName {
         tracing::trace!("dangerous_resolve_name {:?}", name);
+        // Note: Using unchecked here is okay because this function is already dangerous.
+        let name: Vec<_> = name.into_iter().map(Ident::new_unchecked).collect();
         let name = UnresolvedItemName::qualified(&name);
         let entry = match self.resolve_item(RawItemName::Name(name.clone())) {
             Ok(entry) => entry,
@@ -879,4 +964,14 @@ impl<'a> StatementContext<'a> {
             print_id: true,
         }
     }
+}
+
+pub fn resolve_cluster_for_materialized_view<'a>(
+    catalog: &'a dyn SessionCatalog,
+    stmt: &CreateMaterializedViewStatement<Aug>,
+) -> Result<ClusterId, PlanError> {
+    Ok(match &stmt.in_cluster {
+        None => catalog.resolve_cluster(None)?.id(),
+        Some(in_cluster) => in_cluster.id,
+    })
 }

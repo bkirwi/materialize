@@ -18,11 +18,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use aws_config::default_provider::{credentials, region};
-use aws_config::meta::region::ProvideRegion;
 use aws_config::sts::AssumeRoleProvider;
 use aws_config::timeout::TimeoutConfig;
-use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{AsyncSleep, Sleep};
 use aws_sdk_s3::error::SdkError;
@@ -31,9 +28,10 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client as S3Client;
 use aws_types::region::Region;
 use bytes::Bytes;
-use futures_util::future::join_all;
-use futures_util::{FutureExt, TryFutureExt};
-use mz_ore::bytes::SegmentedBytes;
+use futures_util::stream::FuturesOrdered;
+use futures_util::{FutureExt, StreamExt};
+use mz_dyncfg::{Config, ConfigSet};
+use mz_ore::bytes::{MaybeLgBytes, SegmentedBytes};
 use mz_ore::cast::CastFrom;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::task::RuntimeExt;
@@ -43,7 +41,7 @@ use uuid::Uuid;
 
 use crate::cfg::BlobKnobs;
 use crate::error::Error;
-use crate::location::{Atomicity, Blob, BlobMetadata, ExternalError};
+use crate::location::{Atomicity, Blob, BlobMetadata, Determinate, ExternalError};
 use crate::metrics::S3BlobMetrics;
 
 /// Configuration for opening an [S3Blob].
@@ -53,6 +51,8 @@ pub struct S3BlobConfig {
     client: S3Client,
     bucket: String,
     prefix: String,
+    cfg: ConfigSet,
+    is_cc_active: bool,
 }
 
 // There is no simple way to hook into the S3 client to capture when its various timeouts
@@ -122,22 +122,23 @@ impl S3BlobConfig {
         credentials: Option<(String, String)>,
         knobs: Box<dyn BlobKnobs>,
         metrics: S3BlobMetrics,
+        cfg: ConfigSet,
     ) -> Result<Self, Error> {
-        let region = match region {
-            Some(region_name) => Some(Region::new(region_name)),
-            None => region::default_provider().region().await,
+        let is_cc_active = knobs.is_cc_active();
+        let mut loader = mz_aws_util::defaults();
+
+        if let Some(region) = region {
+            loader = loader.region(Region::new(region));
         };
 
-        let mut loader = aws_config::from_env().region(region.clone());
-
         if let Some(role_arn) = role_arn {
-            let mut role_provider = AssumeRoleProvider::builder(role_arn).session_name("persist");
-            if let Some(region) = region {
-                role_provider = role_provider.region(region);
-            }
-            let default_provider =
-                SharedCredentialsProvider::new(credentials::default_provider().await);
-            loader = loader.credentials_provider(role_provider.build(default_provider));
+            let assume_role_sdk_config = mz_aws_util::defaults().load().await;
+            let role_provider = AssumeRoleProvider::builder(role_arn)
+                .configure(&assume_role_sdk_config)
+                .session_name("persist")
+                .build()
+                .await;
+            loader = loader.credentials_provider(role_provider);
         }
 
         if let Some((access_key_id, secret_access_key)) = credentials {
@@ -170,12 +171,14 @@ impl S3BlobConfig {
                 .build(),
         );
 
-        let client = mz_aws_s3_util::new_client(&loader.load().await);
+        let client = mz_aws_util::s3::new_client(&loader.load().await);
         Ok(S3BlobConfig {
             metrics,
             client,
             bucket,
             prefix,
+            cfg,
+            is_cc_active,
         })
     }
 
@@ -248,6 +251,10 @@ impl S3BlobConfig {
             fn read_timeout(&self) -> Duration {
                 READ_TIMEOUT_MARKER
             }
+
+            fn is_cc_active(&self) -> bool {
+                false
+            }
         }
 
         // Give each test a unique prefix so they don't conflict. We don't have
@@ -265,6 +272,9 @@ impl S3BlobConfig {
             None,
             Box::new(TestBlobKnobs),
             metrics,
+            ConfigSet::default()
+                .add(&ENABLE_S3_LGALLOC_CC_SIZES)
+                .add(&ENABLE_S3_LGALLOC_NONCC_SIZES),
         )
         .await?;
         Ok(Some(config))
@@ -290,6 +300,8 @@ pub struct S3Blob {
     // Defaults to 1000 which is the current AWS max.
     max_keys: i32,
     multipart_config: MultipartConfig,
+    cfg: ConfigSet,
+    is_cc_active: bool,
 }
 
 impl S3Blob {
@@ -302,6 +314,8 @@ impl S3Blob {
             prefix: config.prefix,
             max_keys: 1_000,
             multipart_config: MultipartConfig::default(),
+            cfg: config.cfg,
+            is_cc_active: config.is_cc_active,
         };
         // Connect before returning success. We don't particularly care about
         // what's stored in this blob (nothing writes to it, so presumably it's
@@ -314,6 +328,18 @@ impl S3Blob {
         format!("{}/{}", self.prefix, key)
     }
 }
+
+pub(crate) const ENABLE_S3_LGALLOC_CC_SIZES: Config<bool> = Config::new(
+    "persist_enable_s3_lgalloc_cc_sizes",
+    true,
+    "An incident flag to disable copying fetched s3 data into lgalloc on cc sized clusters.",
+);
+
+pub(crate) const ENABLE_S3_LGALLOC_NONCC_SIZES: Config<bool> = Config::new(
+    "persist_enable_s3_lgalloc_noncc_sizes",
+    false,
+    "A feature flag to enable copying fetched s3 data into lgalloc on non-cc sized clusters.",
+);
 
 #[async_trait]
 impl Blob for S3Blob {
@@ -380,14 +406,14 @@ impl Blob for S3Blob {
 
         // Get the remaining number of parts
         let num_parts = match first_part.parts_count() {
-            // For a non-multipart upload, parts_count will be 0. The rest of  the code works
+            // For a non-multipart upload, parts_count will be None. The rest of  the code works
             // perfectly well if we just pretend this was a multipart upload of 1 part.
-            0 => 1,
+            None => 1,
             // For any positive value greater than 0, just return it.
-            parts @ 1.. => parts,
-            // A negative value is invalid.
-            bad => {
-                assert!(bad < 0);
+            Some(parts @ 1..) => parts,
+            // A non-positive value is invalid.
+            Some(bad) => {
+                assert!(bad <= 0);
                 return Err(anyhow!("unexpected number of s3 object parts: {}", bad).into());
             }
         };
@@ -397,92 +423,93 @@ impl Blob for S3Blob {
             start_overall.elapsed(),
         );
 
-        // Get handle to our runtime so we can concurrently fetch the remaining parts.
-        let async_runtime = AsyncHandle::try_current().map_err(anyhow::Error::msg)?;
+        let mut body_futures = FuturesOrdered::new();
+        let mut first_part = Some(first_part);
 
-        // Fetch the first part's body while we fetch the other parts.
-        let min_body_elapsed_ = Arc::clone(&min_body_elapsed);
-        let first_body_fut = async move {
-            let body_start = Instant::now();
-            let result = first_part
-                .body
-                .collect()
-                .map_err(|err| Error::from(format!("s3 get first body err: {}", err)))
-                .await;
-            let elapsed = body_start.elapsed();
-            min_body_elapsed_.observe(elapsed, "s3 download first part body");
-
-            result
-        };
-
-        let mut body_handles = Vec::new();
-        // TODO: Add the key and part number once this can be annotated with metadata.
-        body_handles.push(async_runtime.spawn_named(|| "persist_s3blob_get_body", first_body_fut));
-
-        if num_parts > 1 {
-            // Fetch the headers of the rest of the parts. (Starting at part 2 because we already
-            // did part 1.)
-            for part_num in 2..=num_parts {
-                let header_future = self
-                    .client
-                    .get_object()
-                    .bucket(&self.bucket)
-                    .key(&path)
-                    .part_number(part_num)
-                    .send();
-
-                // Clone a handle to our MinElapsed trackers so we can give one to
-                // each download task.
-                let min_header_elapsed_ = Arc::clone(&min_header_elapsed);
-                let min_body_elapsed_ = Arc::clone(&min_body_elapsed);
-
-                let request_future = async move {
-                    // Request our headers.
-                    let header_start = Instant::now();
-                    let object = header_future
-                        .await
-                        .map_err(|err| ExternalError::from(anyhow!("s3 get meta err: {}", err)))?;
-                    let header_elapsed = header_start.elapsed();
-                    min_header_elapsed_.observe(header_elapsed, "s3 download part header");
-
-                    // Request the body.
-                    let body_start = Instant::now();
-                    let body = object
-                        .body
-                        .collect()
-                        .await
-                        .map_err(|err| Error::from(format!("s3 get body err: {}", err)))?;
-                    let body_elapsed = body_start.elapsed();
-                    min_body_elapsed_.observe(body_elapsed, "s3 download part body");
-
-                    Ok(body)
+        // Fetch the headers of the rest of the parts. (Starting at part 2 because we already
+        // did part 1.)
+        for part_num in 1..=num_parts {
+            // Clone a handle to our MinElapsed trackers so we can give one to
+            // each download task.
+            let min_header_elapsed = Arc::clone(&min_header_elapsed);
+            let min_body_elapsed = Arc::clone(&min_body_elapsed);
+            let first_part = first_part.take();
+            let path = &path;
+            let request_future = async move {
+                // Fetch the headers of the rest of the parts. (Using the existing headers
+                // for part 1.
+                let mut object = match first_part {
+                    Some(first_part) => {
+                        assert_eq!(part_num, 1, "only the first part should be prefetched");
+                        first_part
+                    }
+                    None => {
+                        assert_ne!(part_num, 1, "first part should be prefetched");
+                        // Request our headers.
+                        let header_start = Instant::now();
+                        let object = self
+                            .client
+                            .get_object()
+                            .bucket(&self.bucket)
+                            .key(path)
+                            .part_number(part_num)
+                            .send()
+                            .await
+                            .map_err(|err| {
+                                ExternalError::from(anyhow!("s3 get meta err: {}", err))
+                            })?;
+                        min_header_elapsed
+                            .observe(header_start.elapsed(), "s3 download part header");
+                        object
+                    }
                 };
 
-                // TODO: Add the key and part number once this can be annotated
-                // with metadata.
-                //
-                // Spawn all of these futures on the runtime so they run concurrently.
-                let request_handle = async_runtime.spawn_named(|| "persist_s3blob_get_header", {
-                    self.metrics.get_part.inc();
-                    request_future
-                });
+                // Request the body.
+                let body_start = Instant::now();
+                let mut body = Vec::new();
+                while let Some(data) = object.body.next().await {
+                    let data =
+                        data.map_err(|err| Error::from(format!("s3 get body err: {}", err)))?;
+                    // Get the data into lgalloc at the absolute earliest
+                    // possible point without (yet) having to fork the s3 client
+                    // library.
+                    let enable_s3_lgalloc = if self.is_cc_active {
+                        ENABLE_S3_LGALLOC_CC_SIZES.get(&self.cfg)
+                    } else {
+                        ENABLE_S3_LGALLOC_NONCC_SIZES.get(&self.cfg)
+                    };
+                    let data = if enable_s3_lgalloc {
+                        MaybeLgBytes::LgBytes(self.metrics.lgbytes.persist_s3.try_mmap(&data))
+                    } else {
+                        // In the CYA fallback case, make sure we skip the
+                        // memcpy to preserve the previous behavior as closely
+                        // as possible.
+                        //
+                        // TODO: Once we've validated the LgBytes path, change
+                        // this fallback path to be a heap allocated LgBytes.
+                        // Then we can remove the pub from MaybeLgBytes.
+                        MaybeLgBytes::Bytes(data)
+                    };
+                    body.push(data)
+                }
+                let body_elapsed = body_start.elapsed();
+                min_body_elapsed.observe(body_elapsed, "s3 download part body");
 
-                body_handles.push(request_handle);
-            }
+                Ok::<_, Error>(body)
+            };
+
+            body_futures.push_back(request_future);
         }
 
         // Await on all of our parts requests.
-        let part_bodies = join_all(body_handles).await;
         let mut segments = vec![];
-        for result in part_bodies {
-            let part_body = result
-                // Tokio failure, we failed to spawn a task.
-                .map_err(|err| Error::from(format!("s3 spawn err: {}", err)))?
+        while let Some(result) = body_futures.next().await {
+            let mut part_body = result
                 // Download failure, we failed to fetch the body from S3.
                 .map_err(|err| Error::from(format!("s3 get body err: {}", err)))?;
 
             // Collect all of our segments.
-            segments.extend(part_body.into_segments());
+            segments.append(&mut part_body);
         }
 
         debug!(
@@ -521,13 +548,17 @@ impl Blob for S3Blob {
                 for object in contents.iter() {
                     if let Some(key) = object.key.as_ref() {
                         if let Some(key) = key.strip_prefix(&strippable_root_prefix) {
-                            f(BlobMetadata {
-                                key,
-                                size_in_bytes: object
-                                    .size
+                            let size_in_bytes = match object.size {
+                                None => {
+                                    return Err(ExternalError::from(anyhow!(
+                                        "object missing size: {key}"
+                                    )))
+                                }
+                                Some(size) => size
                                     .try_into()
                                     .expect("file in S3 cannot have negative size"),
-                            });
+                            };
+                            f(BlobMetadata { key, size_in_bytes });
                         } else {
                             return Err(ExternalError::from(anyhow!(
                                 "found key with invalid prefix: {}",
@@ -579,7 +610,16 @@ impl Blob for S3Blob {
             .send()
             .await;
         let size_bytes = match head_res {
-            Ok(x) => u64::try_from(x.content_length).expect("file in S3 cannot have negative size"),
+            Ok(x) => match x.content_length {
+                None => {
+                    return Err(ExternalError::from(anyhow!(
+                        "s3 delete content length was none"
+                    )))
+                }
+                Some(content_length) => {
+                    u64::try_from(content_length).expect("file in S3 cannot have negative size")
+                }
+            },
             Err(SdkError::ServiceError(err)) if err.err().is_not_found() => return Ok(None),
             Err(err) => return Err(ExternalError::from(anyhow!("s3 delete head err: {}", err))),
         };
@@ -593,6 +633,69 @@ impl Blob for S3Blob {
             .await
             .map_err(|err| Error::from(err.to_string()))?;
         Ok(Some(usize::cast_from(size_bytes)))
+    }
+
+    async fn restore(&self, key: &str) -> Result<(), ExternalError> {
+        let path = self.get_path(key);
+        // Fetch the latest version of the object. If it's a normal version, return true;
+        // if it's a delete marker, delete it and loop; if there is no such version,
+        // return false.
+        // TODO: limit the number of delete markers we'll peel back?
+        loop {
+            // S3 only lets us fetch the versions of an object with a list requests.
+            // Seems a bit wasteful to just fetch one at a time, but otherwise we can only
+            // guess the order of versions via the timestamp, and that feels brittle.
+            let list_res = self
+                .client
+                .list_object_versions()
+                .bucket(&self.bucket)
+                .prefix(&path)
+                .max_keys(1)
+                .send()
+                .await
+                .map_err(|err| Error::from(err.to_string()))?;
+
+            let current_delete = list_res
+                .delete_markers()
+                .into_iter()
+                .filter(|d| {
+                    // We need to check that any versions we're looking at have the right key,
+                    // not just a key with our key as a prefix.
+                    d.key() == Some(path.as_str())
+                })
+                .find(|d| d.is_latest().unwrap_or(false))
+                .and_then(|d| d.version_id());
+
+            if let Some(version) = current_delete {
+                let deleted = self
+                    .client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(&path)
+                    .version_id(version)
+                    .send()
+                    .await
+                    .map_err(|err| Error::from(err.to_string()))?;
+                assert!(
+                    deleted.delete_marker().unwrap_or(false),
+                    "deleting a delete marker"
+                );
+            } else {
+                let has_current_version = list_res
+                    .versions()
+                    .into_iter()
+                    .filter(|d| d.key() == Some(path.as_str()))
+                    .any(|v| v.is_latest().unwrap_or(false));
+
+                if !has_current_version {
+                    return Err(Determinate::new(anyhow!(
+                        "unable to restore {key} in s3: no valid version exists"
+                    ))
+                    .into());
+                }
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -926,7 +1029,7 @@ mod tests {
 
     #[mz_ore::test(tokio::test(flavor = "multi_thread"))]
     #[cfg_attr(coverage, ignore)] // https://github.com/MaterializeInc/materialize/issues/18898
-    #[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `epoll_wait` on OS `linux`
+    #[cfg_attr(miri, ignore)] // error: unsupported operation: can't call foreign function `TLS_method` on OS `linux`
     async fn s3_blob() -> Result<(), ExternalError> {
         let config = match S3BlobConfig::new_for_test().await? {
             Some(client) => client,
@@ -949,6 +1052,10 @@ mod tests {
                     client: config.client.clone(),
                     bucket: config.bucket.clone(),
                     prefix: format!("{}/s3_blob_impl_test/{}", config.prefix, path),
+                    cfg: ConfigSet::default()
+                        .add(&ENABLE_S3_LGALLOC_CC_SIZES)
+                        .add(&ENABLE_S3_LGALLOC_NONCC_SIZES),
+                    is_cc_active: true,
                 };
                 let mut blob = S3Blob::open(config).await?;
                 blob.max_keys = 2;

@@ -75,6 +75,9 @@ might be familiar with it from other command-line tools.)
 Without `--nocapture`, `println!()` and `dbg!()`, output from tests can go
 missing, making debugging a very frustrating experience.
 
+Most tests execute with the tracing log filter `info`.
+This can be changed by setting the environment variable `MZ_TEST_LOG_FILTER`.
+
 The second argument worth special mention is the filter argument, which only
 runs the tests that match the specified pattern. For example, to only run tests
 with `avro` in their name:
@@ -215,7 +218,7 @@ implementation is properly serializing dates.
 
 ### pgtest
 
-Pgtest is DSL to specify raw pgwire messages to send and their expected
+Pgtest is a DSL to specify raw pgwire messages to send and their expected
 responses. It can be used to test message sequences that are difficult
 or impossible to test with PostgreSQL drivers. Its output is generated
 against PostgreSQL and then tested against Materialize. Usage is

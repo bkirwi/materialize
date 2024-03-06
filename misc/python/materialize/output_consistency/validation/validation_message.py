@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 from enum import Enum
-from typing import Optional
+from typing import Any
 
 from materialize.output_consistency.execution.evaluation_strategy import (
     EvaluationStrategy,
@@ -28,7 +28,7 @@ class ValidationMessage:
     def __init__(
         self,
         message: str,
-        description: Optional[str] = None,
+        description: str | None = None,
     ):
         self.message = message
         self.description = description
@@ -38,8 +38,8 @@ class ValidationRemark(ValidationMessage):
     def __init__(
         self,
         message: str,
-        description: Optional[str] = None,
-        sql: Optional[str] = None,
+        description: str | None = None,
+        sql: str | None = None,
     ):
         super().__init__(message, description)
         self.sql = sql
@@ -54,9 +54,9 @@ class ValidationWarning(ValidationMessage):
     def __init__(
         self,
         message: str,
-        description: Optional[str] = None,
-        strategy: Optional[EvaluationStrategy] = None,
-        sql: Optional[str] = None,
+        description: str | None = None,
+        strategy: EvaluationStrategy | None = None,
+        sql: str | None = None,
     ):
         super().__init__(message, description)
         self.strategy = strategy
@@ -78,13 +78,16 @@ class ValidationError(ValidationMessage):
         message: str,
         strategy1: EvaluationStrategy,
         strategy2: EvaluationStrategy,
-        value1: str,
-        value2: str,
-        sql1: Optional[str] = None,
-        sql2: Optional[str] = None,
-        description: Optional[str] = None,
-        col_index: Optional[int] = None,
-        location: Optional[str] = None,
+        value1: Any,
+        value2: Any,
+        sql1: str | None = None,
+        sql2: str | None = None,
+        sql_error1: str | None = None,
+        sql_error2: str | None = None,
+        description: str | None = None,
+        col_index: int | None = None,
+        concerned_expression: str | None = None,
+        location: str | None = None,
     ):
         super().__init__(message, description)
         self.query_execution = query_execution
@@ -95,7 +98,10 @@ class ValidationError(ValidationMessage):
         self.strategy2 = strategy2
         self.sql1 = sql1
         self.sql2 = sql2
+        self.sql_error1 = sql_error1
+        self.sql_error2 = sql_error2
         self.col_index = col_index
+        self.concerned_expression = concerned_expression
         self.location = location
 
     def __str__(self) -> str:
@@ -108,6 +114,16 @@ class ValidationError(ValidationMessage):
             f"\n  Value 1{strategy1_desc}: '{self.value1}' (type: {type(self.value1)})"
             f"\n  Value 2{strategy2_desc}: '{self.value2}' (type: {type(self.value2)})"
         )
+
+        if self.error_type == ValidationErrorType.SUCCESS_MISMATCH:
+            if self.sql_error1 is not None:
+                value_and_strategy_desc = value_and_strategy_desc + (
+                    f"\n  Error 1: '{self.sql_error1}'"
+                )
+            if self.sql_error2 is not None:
+                value_and_strategy_desc = value_and_strategy_desc + (
+                    f"\n  Error 2: '{self.sql_error2}'"
+                )
 
         sql_desc = f"\n  Query 1: {self.sql1}\n  Query 2: {self.sql2}"
         return f"{self.error_type}: {self.message}{location_desc}{error_desc}.{value_and_strategy_desc}{sql_desc}"

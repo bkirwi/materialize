@@ -10,16 +10,14 @@
 from pathlib import Path
 
 from materialize import ci_util
-from materialize.mzcompose import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services import (
-    Kafka,
-    Localstack,
-    Materialized,
-    Redpanda,
-    SchemaRegistry,
-    Testdrive,
-    Zookeeper,
-)
+from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.services.kafka import Kafka
+from materialize.mzcompose.services.localstack import Localstack
+from materialize.mzcompose.services.materialized import Materialized
+from materialize.mzcompose.services.redpanda import Redpanda
+from materialize.mzcompose.services.schema_registry import SchemaRegistry
+from materialize.mzcompose.services.testdrive import Testdrive
+from materialize.mzcompose.services.zookeeper import Zookeeper
 
 SERVICES = [
     Zookeeper(),
@@ -59,12 +57,18 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     parser.add_argument("--replicas", type=int, default=1, help="use multiple replicas")
 
     parser.add_argument(
+        "--default-timeout",
+        type=str,
+        help="set the default timeout for Testdrive",
+    )
+
+    parser.add_argument(
         "files",
         nargs="*",
         default=["*.td"],
         help="run against the specified files",
     )
-    args = parser.parse_args()
+    (args, passthrough_args) = parser.parse_known_args()
 
     dependencies = ["materialized"]
     if args.redpanda:
@@ -79,7 +83,10 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
         forward_buildkite_shard=True,
         kafka_default_partitions=args.kafka_default_partitions,
         aws_region=args.aws_region,
-        validate_postgres_stash="materialized",
+        postgres_stash="materialized",
+        validate_catalog_store="persist",
+        default_timeout=args.default_timeout,
+        volumes_extra=["mzdata:/mzdata"],
     )
 
     materialized = Materialized(
@@ -89,8 +96,14 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     with c.override(testdrive, materialized):
         c.up(*dependencies)
 
+        c.sql(
+            "ALTER SYSTEM SET max_clusters = 50;",
+            port=6877,
+            user="mz_system",
+        )
+
         if args.replicas > 1:
-            c.sql("DROP CLUSTER default CASCADE", user="mz_system", port=6877)
+            c.sql("DROP CLUSTER quickstart CASCADE", user="mz_system", port=6877)
             # Make sure a replica named 'r1' always exists
             replica_names = [
                 "r1" if replica_id == 0 else f"replica{replica_id}"
@@ -101,21 +114,44 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
                 for replica_name in replica_names
             )
             c.sql(
-                f"CREATE CLUSTER default REPLICAS ({replica_string})",
+                f"CREATE CLUSTER quickstart REPLICAS ({replica_string})",
                 user="mz_system",
                 port=6877,
             )
 
+            # Note that any command that outputs SHOW CLUSTERS will have output
+            # that depends on the number of replicas testdrive has. This means
+            # it might be easier to skip certain tests if the number of replicas
+            # is > 1.
+            c.sql(
+                f"""
+                CREATE CLUSTER testdrive_single_replica_cluster SIZE = '{materialized.default_replica_size}';
+                GRANT ALL PRIVILEGES ON CLUSTER testdrive_single_replica_cluster TO materialize;
+                """,
+                user="mz_system",
+                port=6877,
+            )
+
+            single_replica_cluster = "testdrive_single_replica_cluster"
+        else:
+            single_replica_cluster = "quickstart"
+
+        junit_report = ci_util.junit_report_filename(c.name)
+
         try:
             junit_report = ci_util.junit_report_filename(c.name)
-            c.run(
-                "testdrive",
-                f"--junit-report={junit_report}",
-                f"--var=replicas={args.replicas}",
-                f"--var=default-replica-size={materialized.default_replica_size}",
-                f"--var=default-storage-size={materialized.default_storage_size}",
-                *args.files,
-            )
+            print(f"Passing through arguments to testdrive {passthrough_args}\n")
+            for file in args.files:
+                c.run_testdrive_files(
+                    f"--junit-report={junit_report}",
+                    f"--var=replicas={args.replicas}",
+                    f"--var=default-replica-size={materialized.default_replica_size}",
+                    f"--var=default-storage-size={materialized.default_storage_size}",
+                    f"--var=single-replica-cluster={single_replica_cluster}",
+                    *passthrough_args,
+                    file,
+                )
+                c.sanity_restart_mz()
         finally:
             ci_util.upload_junit_report(
                 "testdrive", Path(__file__).parent / junit_report

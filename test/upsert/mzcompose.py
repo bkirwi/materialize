@@ -11,17 +11,17 @@
 # TODO(guswynn): move ALL upsert-related tests into this directory.
 
 from pathlib import Path
+from textwrap import dedent
 
 from materialize import ci_util
-from materialize.mzcompose import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services import (
-    Clusterd,
-    Kafka,
-    Materialized,
-    SchemaRegistry,
-    Testdrive,
-    Zookeeper,
-)
+from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.services.clusterd import Clusterd
+from materialize.mzcompose.services.kafka import Kafka
+from materialize.mzcompose.services.materialized import Materialized
+from materialize.mzcompose.services.redpanda import Redpanda
+from materialize.mzcompose.services.schema_registry import SchemaRegistry
+from materialize.mzcompose.services.testdrive import Testdrive
+from materialize.mzcompose.services.zookeeper import Zookeeper
 
 materialized_environment_extra = ["MZ_PERSIST_COMPACTION_DISABLED=false"]
 
@@ -31,21 +31,20 @@ SERVICES = [
     SchemaRegistry(),
     Materialized(
         options=[
-            "--orchestrator-process-scratch-directory=/mzdata/source_data",
+            "--orchestrator-process-scratch-directory=/scratch",
         ],
         additional_system_parameter_defaults={
-            "upsert_source_disk_default": "true",
-            "enable_unmanaged_cluster_replicas": "true",
+            "disk_cluster_replicas_default": "true",
+            "enable_unorchestrated_cluster_replicas": "true",
+            "storage_dataflow_delay_sources_past_rehydration": "true",
         },
         environment_extra=materialized_environment_extra,
     ),
     Testdrive(),
     Clusterd(
         name="clusterd1",
-        options=[
-            "--scratch-directory=/mzdata/source_data",
-        ],
     ),
+    Redpanda(),
 ]
 
 
@@ -60,13 +59,9 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     if args.compaction_disabled:
         materialized_environment_extra[0] = "MZ_PERSIST_COMPACTION_DISABLED=true"
 
-    for name in [
-        "rehydration",
-        "testdrive",
-        "failpoint",
-        "incident-49",
-        "rocksdb-cleanup",
-    ]:
+    for name in c.workflows:
+        if name in ["default", "load-test"]:
+            continue
         with c.test_case(name):
             c.workflow(name)
 
@@ -101,15 +96,19 @@ def workflow_testdrive(c: Composition, parser: WorkflowArgumentParser) -> None:
     testdrive = Testdrive(
         forward_buildkite_shard=True,
         kafka_default_partitions=args.kafka_default_partitions,
-        validate_postgres_stash="materialized",
+        postgres_stash="materialized",
+        validate_catalog_store="persist",
+        volumes_extra=["mzdata:/mzdata"],
     )
 
     materialized = Materialized(
         default_size=args.default_size,
         options=[
-            "--orchestrator-process-scratch-directory=/mzdata/source_data",
+            "--orchestrator-process-scratch-directory=/scratch",
         ],
-        additional_system_parameter_defaults={"upsert_source_disk_default": "true"},
+        additional_system_parameter_defaults={
+            "disk_cluster_replicas_default": "true",
+        },
         environment_extra=materialized_environment_extra,
     )
 
@@ -117,7 +116,7 @@ def workflow_testdrive(c: Composition, parser: WorkflowArgumentParser) -> None:
         c.up(*dependencies)
 
         if args.replicas > 1:
-            c.sql("DROP CLUSTER default CASCADE")
+            c.sql("DROP CLUSTER quickstart")
             # Make sure a replica named 'r1' always exists
             replica_names = [
                 "r1" if replica_id == 0 else f"replica{replica_id}"
@@ -127,18 +126,21 @@ def workflow_testdrive(c: Composition, parser: WorkflowArgumentParser) -> None:
                 f"{replica_name} (SIZE '{materialized.default_replica_size}')"
                 for replica_name in replica_names
             )
-            c.sql(f"CREATE CLUSTER default REPLICAS ({replica_string})")
+            c.sql(f"CREATE CLUSTER quickstart REPLICAS ({replica_string})")
+
+        junit_report = ci_util.junit_report_filename(c.name)
 
         try:
             junit_report = ci_util.junit_report_filename(c.name)
-            c.run(
-                "testdrive",
-                f"--junit-report={junit_report}",
-                f"--var=replicas={args.replicas}",
-                f"--var=default-replica-size={materialized.default_replica_size}",
-                f"--var=default-storage-size={materialized.default_storage_size}",
-                *args.files,
-            )
+            for file in args.files:
+                c.run_testdrive_files(
+                    f"--junit-report={junit_report}",
+                    f"--var=replicas={args.replicas}",
+                    f"--var=default-replica-size={materialized.default_replica_size}",
+                    f"--var=default-storage-size={materialized.default_storage_size}",
+                    file,
+                )
+                c.sanity_restart_mz()
         finally:
             ci_util.upload_junit_report(
                 "testdrive", Path(__file__).parent / junit_report
@@ -148,8 +150,6 @@ def workflow_testdrive(c: Composition, parser: WorkflowArgumentParser) -> None:
 def workflow_rehydration(c: Composition) -> None:
     """Test creating sources in a remote clusterd process."""
 
-    c.down(destroy_volumes=True)
-
     dependencies = [
         "materialized",
         "zookeeper",
@@ -158,69 +158,94 @@ def workflow_rehydration(c: Composition) -> None:
         "clusterd1",
     ]
 
-    c.up("materialized")
-    c.run("testdrive", "rehydration/01-setup.td")
-
-    for (style, mz) in [
+    for style, mz, clusterd in [
         (
             "with DISK",
             Materialized(
                 options=[
-                    "--orchestrator-process-scratch-directory=/mzdata/source_data",
+                    "--orchestrator-process-scratch-directory=/scratch",
                 ],
                 additional_system_parameter_defaults={
-                    "upsert_source_disk_default": "true"
+                    "enable_unorchestrated_cluster_replicas": "true",
+                    "disk_cluster_replicas_default": "true",
+                    "enable_disk_cluster_replicas": "true",
+                    # Force backpressure to be enabled.
+                    "storage_dataflow_max_inflight_bytes": "1",
+                    "storage_dataflow_max_inflight_bytes_to_cluster_size_fraction": "0.01",
+                    "storage_dataflow_max_inflight_bytes_disk_only": "false",
+                    "storage_dataflow_delay_sources_past_rehydration": "true",
+                    # Enabling shrinking buffers
+                    "upsert_rocksdb_shrink_allocated_buffers_by_ratio": "4",
+                    "storage_shrink_upsert_unused_buffers_by_ratio": "4",
                 },
                 environment_extra=materialized_environment_extra,
+            ),
+            Clusterd(
+                name="clusterd1",
+                options=[
+                    "--scratch-directory=/scratch",
+                    "--announce-memory-limit=1048376000",  # 1GiB
+                ],
             ),
         ),
         (
             "without DISK",
-            Materialized(environment_extra=materialized_environment_extra),
+            Materialized(
+                options=[
+                    "--orchestrator-process-scratch-directory=/scratch",
+                ],
+                additional_system_parameter_defaults={
+                    "enable_unorchestrated_cluster_replicas": "true",
+                    # Force backpressure to be enabled.
+                    "storage_dataflow_max_inflight_bytes": "1",
+                    "storage_dataflow_max_inflight_bytes_to_cluster_size_fraction": "0.01",
+                    "storage_dataflow_max_inflight_bytes_disk_only": "false",
+                    "storage_dataflow_delay_sources_past_rehydration": "true",
+                },
+                environment_extra=materialized_environment_extra,
+            ),
+            Clusterd(
+                name="clusterd1",
+            ),
         ),
     ]:
-
         with c.override(
             mz,
+            clusterd,
             Testdrive(no_reset=True, consistent_seed=True),
         ):
             print(f"Running rehydration workflow {style}")
+            c.down(destroy_volumes=True)
 
             c.up(*dependencies)
-
-            c.run("testdrive", "rehydration/02-source-setup.td")
+            c.run_testdrive_files("rehydration/01-setup.td")
+            c.run_testdrive_files("rehydration/02-source-setup.td")
 
             c.kill("materialized")
             c.kill("clusterd1")
             c.up("materialized")
             c.up("clusterd1")
 
-            c.run("testdrive", "rehydration/03-after-rehydration.td")
+            c.run_testdrive_files("rehydration/03-after-rehydration.td")
 
-        c.run("testdrive", "rehydration/04-reset.td")
-        c.kill("clusterd1")
+        c.run_testdrive_files("rehydration/04-reset.td")
 
 
 def workflow_failpoint(c: Composition) -> None:
     """Test behaviour when upsert state errors"""
-    print("Running failpoint workflow")
-
-    c.down(destroy_volumes=True)
-    c.up("materialized")
-    c.run("testdrive", "failpoint/01-setup.td")
 
     for failpoint in [
         (
             "fail_merge_snapshot_chunk",
-            "Failed to rehydrate state: Error merging snapshot values",
+            "upsert: Failed to rehydrate state: Error merging snapshot values",
         ),
         (
             "fail_state_multi_put",
-            "Failed to update records in state: Error putting values into state",
+            "upsert: Failed to update records in state: Error putting values into state",
         ),
         (
             "fail_state_multi_get",
-            "Failed to fetch records from state: Error getting values from state",
+            "upsert: Failed to fetch records from state: Error getting values from state",
         ),
     ]:
         run_one_failpoint(c, failpoint[0], failpoint[1])
@@ -229,37 +254,34 @@ def workflow_failpoint(c: Composition) -> None:
 def run_one_failpoint(c: Composition, failpoint: str, error_message: str) -> None:
     print(f">>> Running failpoint test for failpoint {failpoint}")
 
+    dependencies = ["zookeeper", "kafka", "materialized"]
+    c.kill("clusterd1")
+    c.up(*dependencies)
+    c.run_testdrive_files("failpoint/00-reset.td")
     with c.override(
         Testdrive(no_reset=True, consistent_seed=True),
     ):
-
-        dependencies = ["zookeeper", "kafka", "clusterd1", "materialized"]
-        c.up(*dependencies)
-        c.run("testdrive", "failpoint/02-source.td")
+        c.run_testdrive_files("failpoint/01-setup.td")
+        c.up("clusterd1")
+        c.run_testdrive_files("failpoint/02-source.td")
         c.kill("clusterd1")
 
         with c.override(
             # Start clusterd with failpoint
             Clusterd(
                 name="clusterd1",
-                options=[
-                    "--scratch-directory=/mzdata/source_data",
-                ],
                 environment_extra=[f"FAILPOINTS={failpoint}=return"],
             ),
         ):
             c.up("clusterd1")
-            c.run(
-                "testdrive", f"--var=error={error_message}", "failpoint/03-failpoint.td"
+            c.run_testdrive_files(
+                f"--var=error={error_message}", "failpoint/03-failpoint.td"
             )
             c.kill("clusterd1")
 
         # Running without set failpoint
         c.up("clusterd1")
-        c.run("testdrive", "failpoint/04-recover.td")
-
-    c.run("testdrive", "failpoint/05-reset.td")
-    c.kill("clusterd1")
+        c.run_testdrive_files("failpoint/04-recover.td")
 
 
 def workflow_incident_49(c: Composition) -> None:
@@ -274,41 +296,44 @@ def workflow_incident_49(c: Composition) -> None:
         "schema-registry",
     ]
 
-    for (style, mz) in [
+    for style, mz in [
         (
             "with DISK",
             Materialized(
-                options=[
-                    "--orchestrator-process-scratch-directory=/mzdata/source_data",
-                ],
                 additional_system_parameter_defaults={
-                    "upsert_source_disk_default": "true"
+                    "disk_cluster_replicas_default": "true",
+                    "storage_dataflow_delay_sources_past_rehydration": "true",
                 },
                 environment_extra=materialized_environment_extra,
             ),
         ),
         (
             "without DISK",
-            Materialized(environment_extra=materialized_environment_extra),
+            Materialized(
+                additional_system_parameter_defaults={
+                    "disk_cluster_replicas_default": "false",
+                    "storage_dataflow_delay_sources_past_rehydration": "true",
+                },
+                environment_extra=materialized_environment_extra,
+            ),
         ),
     ]:
-
         with c.override(
             mz,
             Testdrive(no_reset=True, consistent_seed=True),
         ):
-            print(f"Running rehydration workflow {style}")
-
+            print(f"Running incident-49 workflow {style}")
+            c.down(destroy_volumes=True)
             c.up(*dependencies)
 
-            c.run("testdrive", "incident-49/01-setup.td")
+            c.run_testdrive_files("incident-49/01-setup.td")
 
             c.kill("materialized")
             c.up("materialized")
 
-            c.run("testdrive", "incident-49/02-after-rehydration.td")
+            c.run_testdrive_files("incident-49/02-after-rehydration.td")
 
-        c.run("testdrive", "incident-49/03-reset.td")
+        c.run_testdrive_files("incident-49/03-reset.td")
 
 
 def workflow_rocksdb_cleanup(c: Composition) -> None:
@@ -331,9 +356,13 @@ def workflow_rocksdb_cleanup(c: Composition) -> None:
             on s.cluster_id = c.cluster_id
             where s.name ='{source_name}'"""
         )[0]
-        prefix = "/mzdata/source_data"
-        cluster_prefix = f"{cluster_id}-replica-{replica_id[1:]}"
-        return f"{prefix}/{cluster_prefix}", f"{prefix}/{cluster_prefix}/{source_id}"
+        prefix = "/scratch"
+        cluster_prefix = f"cluster-{cluster_id}-replica-{replica_id}"
+        postfix = "storage/upsert"
+        return (
+            f"{prefix}/{cluster_prefix}/{postfix}",
+            f"{prefix}/{cluster_prefix}/{postfix}/{source_id}",
+        )
 
     # Returns the number of files recursive in a given directory
     def num_files(dir: str) -> int:
@@ -343,12 +372,12 @@ def workflow_rocksdb_cleanup(c: Composition) -> None:
         return int(num_files)
 
     scenarios = [
-        ("drop-source.td", "DROP SOURCE dropped_upsert", True),
+        ("drop-source.td", "DROP SOURCE dropped_upsert", False),
         ("drop-cluster-cascade.td", "DROP CLUSTER c1 CASCADE", True),
         ("drop-source-in-cluster.td", "DROP SOURCE dropped_upsert", False),
     ]
 
-    for (testdrive_file, drop_stmt, cluster_dropped) in scenarios:
+    for testdrive_file, drop_stmt, cluster_dropped in scenarios:
         with c.override(
             Testdrive(no_reset=True),
         ):
@@ -370,4 +399,225 @@ def workflow_rocksdb_cleanup(c: Composition) -> None:
             else:
                 assert num_files(dropped_source_path) == 0
 
-        c.testdrive("#reset testdrive")
+        c.testdrive(
+            dedent(
+                """
+            $ nop
+
+            # this is to reset testdrive
+            """
+            )
+        )
+
+
+def workflow_autospill(c: Composition) -> None:
+    """Testing auto spill to disk"""
+    c.down(destroy_volumes=True)
+    dependencies = [
+        "zookeeper",
+        "kafka",
+        "materialized",
+        "schema-registry",
+        "clusterd1",
+    ]
+
+    with c.override(
+        Materialized(
+            options=[
+                "--orchestrator-process-scratch-directory=/mzdata/source_data",
+            ],
+            additional_system_parameter_defaults={
+                "disk_cluster_replicas_default": "true",
+                "upsert_rocksdb_auto_spill_to_disk": "true",
+                "upsert_rocksdb_auto_spill_threshold_bytes": "200",
+                "enable_unorchestrated_cluster_replicas": "true",
+                "storage_dataflow_delay_sources_past_rehydration": "true",
+            },
+        ),
+        Clusterd(
+            name="clusterd1",
+            options=[
+                "--scratch-directory=/scratch",
+            ],
+        ),
+        Testdrive(no_reset=True, consistent_seed=True),
+    ):
+
+        # Helper function to get worker 0 autospill metrics for clusterd.
+        def fetch_auto_spill_metric() -> int | None:
+            metrics = c.exec(
+                "clusterd1", "curl", "localhost:6878/metrics", capture=True
+            ).stdout
+
+            value = None
+            for metric in metrics.splitlines():
+                if metric.startswith(
+                    "mz_storage_upsert_state_rocksdb_autospill_in_use"
+                ):
+                    if value:
+                        value += int(metric.split()[1])
+                    else:
+                        value = int(metric.split()[1])
+
+            return value
+
+        c.up(*dependencies)
+        c.run_testdrive_files("autospill/01-setup.td")
+
+        c.run_testdrive_files("autospill/02-memory.td")
+        assert fetch_auto_spill_metric() == 0
+
+        c.run_testdrive_files("autospill/03-rocksdb.td")
+        assert fetch_auto_spill_metric() == 1
+
+
+# This should not be run on ci and is not added to workflow_default above!
+# This test is there to compare rehydration metrics with different configs.
+# Can be run locally with the command ./mzcompose run load-test
+def workflow_load_test(c: Composition, parser: WorkflowArgumentParser) -> None:
+    from textwrap import dedent
+
+    # Following variables can be updated to tweak how much data the kafka
+    # topic should be populated with and what should be the upsert state size.
+    pad_len = 1024
+    string_pad = "x" * pad_len  # 1KB
+    repeat = 250 * 1024  # repeat * string_pad = 250MB upsert state size
+    updates_count = 2  # repeat * updates_count = 500MB total kafka topic size with multiple updates for the same key
+
+    backpressure_bytes = 50 * 1024 * 1024  # 50MB
+
+    c.down(destroy_volumes=True)
+    c.up("redpanda", "materialized", "clusterd1")
+    # initial hydration
+    with c.override(
+        Testdrive(no_reset=True, consistent_seed=True, default_timeout=f"{5 * 60}s"),
+        Materialized(
+            options=[
+                "--orchestrator-process-scratch-directory=/scratch",
+            ],
+            additional_system_parameter_defaults={
+                "disk_cluster_replicas_default": "true",
+                "enable_disk_cluster_replicas": "true",
+                # Force backpressure to be enabled.
+                "storage_dataflow_max_inflight_bytes": f"{backpressure_bytes}",
+                "storage_dataflow_max_inflight_bytes_disk_only": "true",
+            },
+            environment_extra=materialized_environment_extra,
+        ),
+        Clusterd(
+            name="clusterd1",
+            options=[
+                "--scratch-directory=/scratch",
+            ],
+        ),
+    ):
+        c.up("testdrive", persistent=True)
+        c.exec("testdrive", "load-test/setup.td")
+        c.testdrive(
+            dedent(
+                """
+                $ kafka-ingest format=bytes topic=topic1 key-format=bytes key-terminator=:
+                "AAA":"START MARKER"
+                """
+            )
+        )
+        for number in range(updates_count):
+            c.exec(
+                "testdrive",
+                f"--var=value={number}{string_pad}",
+                f"--var=repeat={repeat}",
+                "load-test/insert.td",
+            )
+
+        c.testdrive(
+            dedent(
+                """
+                $ kafka-ingest format=bytes topic=topic1 key-format=bytes key-terminator=:
+                "ZZZ":"END MARKER"
+                """
+            )
+        )
+
+        c.testdrive(
+            dedent(
+                f"""
+                > select * from v1;
+                {repeat + 2}
+                """
+            )
+        )
+
+        scenarios = [
+            (
+                "default",
+                {
+                    "disk_cluster_replicas_default": "true",
+                    "enable_disk_cluster_replicas": "true",
+                    # Force backpressure to be enabled.
+                    "storage_dataflow_max_inflight_bytes": f"{backpressure_bytes}",
+                    "storage_dataflow_max_inflight_bytes_disk_only": "true",
+                },
+            ),
+            (
+                "with write_buffer_manager no stall",
+                {
+                    "disk_cluster_replicas_default": "true",
+                    "enable_disk_cluster_replicas": "true",
+                    # Force backpressure to be enabled.
+                    "storage_dataflow_max_inflight_bytes": f"{backpressure_bytes}",
+                    "storage_dataflow_max_inflight_bytes_disk_only": "true",
+                    "upsert_rocksdb_write_buffer_manager_memory_bytes": f"{5 * 1024 * 1024}",
+                    "upsert_rocksdb_write_buffer_manager_allow_stall": "false",
+                },
+            ),
+            (
+                "with write_buffer_manager stall enabled",
+                {
+                    "disk_cluster_replicas_default": "true",
+                    "enable_disk_cluster_replicas": "true",
+                    # Force backpressure to be enabled.
+                    "storage_dataflow_max_inflight_bytes": f"{backpressure_bytes}",
+                    "storage_dataflow_max_inflight_bytes_disk_only": "true",
+                    "upsert_rocksdb_write_buffer_manager_memory_bytes": f"{5 * 1024 * 1024}",
+                    "upsert_rocksdb_write_buffer_manager_allow_stall": "true",
+                },
+            ),
+        ]
+        for scenario_name, mz_configs in scenarios:
+            with c.override(
+                Materialized(
+                    options=[
+                        "--orchestrator-process-scratch-directory=/scratch",
+                    ],
+                    additional_system_parameter_defaults=mz_configs,
+                    environment_extra=materialized_environment_extra,
+                ),
+            ):
+                c.kill("materialized", "clusterd1")
+                print(f"Running rehydration for scenario {scenario_name}")
+                c.up("materialized", "clusterd1")
+                c.testdrive(
+                    dedent(
+                        f"""
+                > select sum(records_indexed)
+                  from mz_internal.mz_source_statistics_raw st
+                  join mz_sources s on s.id = st.id
+                  where name = 's1';
+                {repeat + 2}
+
+                > select bool_and(rehydration_latency IS NOT NULL)
+                  from mz_internal.mz_source_statistics_raw st
+                  join mz_sources s on s.id = st.id
+                  where name = 's1';
+                true
+                """
+                    )
+                )
+
+                rehydration_latency = c.sql_query(
+                    """select max(rehydration_latency)
+                    from mz_internal.mz_source_statistics_raw st
+                    join mz_sources s on s.id = st.id
+                    where name = 's1';"""
+                )[0]
+                print(f"Scenario {scenario_name} took {rehydration_latency} ms")

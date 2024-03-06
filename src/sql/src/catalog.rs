@@ -22,17 +22,18 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use mz_build_info::BuildInfo;
-use mz_controller::clusters::{ClusterId, ReplicaId};
+use mz_controller_types::{ClusterId, ReplicaId};
 use mz_expr::MirScalarExpr;
 use mz_ore::now::{EpochMillis, NowFn};
+use mz_ore::str::StrExt;
 use mz_repr::adt::mz_acl_item::{AclMode, MzAclItem, PrivilegeMap};
 use mz_repr::explain::ExprHumanizer;
 use mz_repr::role_id::RoleId;
 use mz_repr::{ColumnName, GlobalId, RelationDesc};
-use mz_sql_parser::ast::{Expr, QualifiedReplica, UnresolvedItemName};
-use mz_stash::objects::{proto, RustType, TryFromProtoError};
-use mz_storage_client::types::connections::Connection;
-use mz_storage_client::types::sources::SourceDesc;
+use mz_sql_parser::ast::{Expr, Ident, QualifiedReplica, UnresolvedItemName};
+use mz_storage_types::connections::inline::{ConnectionResolver, ReferencedConnection};
+use mz_storage_types::connections::{Connection, ConnectionContext};
+use mz_storage_types::sources::SourceDesc;
 use once_cell::sync::Lazy;
 use proptest_derive::Arbitrary;
 use regex::Regex;
@@ -41,14 +42,15 @@ use uuid::Uuid;
 
 use crate::func::Func;
 use crate::names::{
-    Aug, DatabaseId, FullItemName, FullSchemaName, ObjectId, PartialItemName, QualifiedItemName,
-    QualifiedSchemaName, ResolvedDatabaseSpecifier, SchemaId, SchemaSpecifier,
+    Aug, CommentObjectId, DatabaseId, FullItemName, FullSchemaName, ObjectId, PartialItemName,
+    QualifiedItemName, QualifiedSchemaName, ResolvedDatabaseSpecifier, ResolvedIds, SchemaId,
+    SchemaSpecifier, SystemObjectId,
 };
 use crate::normalize;
 use crate::plan::statement::ddl::PlannedRoleAttributes;
 use crate::plan::statement::StatementDesc;
-use crate::plan::{PlanError, PlanNotice};
-use crate::session::vars::SystemVars;
+use crate::plan::{query, PlanError, PlanNotice};
+use crate::session::vars::{OwnedVarInput, SystemVars};
 
 /// A catalog keeps track of SQL objects and session state available to the
 /// planner.
@@ -78,7 +80,7 @@ use crate::session::vars::SystemVars;
 /// [`list_databases`]: Catalog::list_databases
 /// [`get_item`]: Catalog::resolve_item
 /// [`resolve_item`]: SessionCatalog::resolve_item
-pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync {
+pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync + ConnectionResolver {
     /// Returns the id of the role that is issuing the query.
     fn active_role_id(&self) -> &RoleId;
 
@@ -148,6 +150,12 @@ pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync {
     /// Gets all schemas.
     fn get_schemas(&self) -> Vec<&dyn CatalogSchema>;
 
+    /// Gets the mz_internal schema id.
+    fn get_mz_internal_schema_id(&self) -> &SchemaId;
+
+    /// Gets the mz_unsafe schema id.
+    fn get_mz_unsafe_schema_id(&self) -> &SchemaId;
+
     /// Returns true if `schema` is an internal system schema, false otherwise
     fn is_system_schema(&self, schema: &str) -> bool;
 
@@ -168,6 +176,9 @@ pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync {
     /// Gets all roles.
     fn get_roles(&self) -> Vec<&dyn CatalogRole>;
 
+    /// Gets the id of the `mz_system` role.
+    fn mz_system_role_id(&self) -> RoleId;
+
     /// Collects all role IDs that `id` is transitively a member of.
     fn collect_role_membership(&self, id: &RoleId) -> BTreeSet<RoleId>;
 
@@ -185,7 +196,9 @@ pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync {
         cluster_replica_name: &'b QualifiedReplica,
     ) -> Result<&dyn CatalogClusterReplica<'a>, CatalogError>;
 
-    /// Resolves a partially-specified item name.
+    /// Resolves a partially-specified item name, that is NOT a function or
+    /// type. (For resolving functions or types, please use
+    /// [SessionCatalog::resolve_function] or [SessionCatalog::resolve_type].)
     ///
     /// If the partial name has a database component, it searches only the
     /// specified database; otherwise, it searches the active database. If the
@@ -206,6 +219,28 @@ pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync {
         item_name: &PartialItemName,
     ) -> Result<&dyn CatalogItem, CatalogError>;
 
+    /// Performs the same operation as [`SessionCatalog::resolve_item`] but for
+    /// types within the catalog.
+    fn resolve_type(&self, item_name: &PartialItemName) -> Result<&dyn CatalogItem, CatalogError>;
+
+    /// Resolves `name` to a type or item, preferring the type if both exist.
+    fn resolve_item_or_type(
+        &self,
+        name: &PartialItemName,
+    ) -> Result<&dyn CatalogItem, CatalogError> {
+        if let Ok(ty) = self.resolve_type(name) {
+            return Ok(ty);
+        }
+        self.resolve_item(name)
+    }
+
+    /// Gets a type named `name` from exactly one of the system schemas.
+    ///
+    /// # Panics
+    /// - If `name` is not an entry in any system schema
+    /// - If more than one system schema has an entry named `name`.
+    fn get_system_type(&self, name: &str) -> &dyn CatalogItem;
+
     /// Gets an item by its ID.
     fn try_get_item(&self, id: &GlobalId) -> Option<&dyn CatalogItem>;
 
@@ -217,8 +252,11 @@ pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync {
     /// Gets all items.
     fn get_items(&self) -> Vec<&dyn CatalogItem>;
 
-    /// Reports whether the specified type exists in the catalog.
-    fn item_exists(&self, name: &QualifiedItemName) -> bool;
+    /// Looks up an item by its name.
+    fn get_item_by_name(&self, name: &QualifiedItemName) -> Option<&dyn CatalogItem>;
+
+    /// Looks up a type by its name.
+    fn get_type_by_name(&self, name: &QualifiedItemName) -> Option<&dyn CatalogItem>;
 
     /// Gets a cluster by ID.
     fn get_cluster(&self, id: ClusterId) -> &dyn CatalogCluster;
@@ -235,6 +273,9 @@ pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync {
 
     /// Gets all cluster replicas.
     fn get_cluster_replicas(&self) -> Vec<&dyn CatalogClusterReplica>;
+
+    /// Gets all system privileges.
+    fn get_system_privileges(&self) -> &PrivilegeMap;
 
     /// Gets all default privileges.
     fn get_default_privileges(
@@ -279,7 +320,7 @@ pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync {
     fn get_owner_id(&self, id: &ObjectId) -> Option<RoleId>;
 
     /// Returns the [`PrivilegeMap`] of the object.
-    fn get_privileges(&self, id: &ObjectId) -> Option<&PrivilegeMap>;
+    fn get_privileges(&self, id: &SystemObjectId) -> Option<&PrivilegeMap>;
 
     /// Returns all the IDs of all objects that depend on `ids`, including `ids` themselves.
     ///
@@ -296,13 +337,13 @@ pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync {
     fn item_dependents(&self, id: GlobalId) -> Vec<ObjectId>;
 
     /// Returns all possible privileges associated with an object type.
-    fn all_object_privileges(&self, object_type: ObjectType) -> AclMode;
+    fn all_object_privileges(&self, object_type: SystemObjectType) -> AclMode;
 
     /// Returns the object type of `object_id`.
     fn get_object_type(&self, object_id: &ObjectId) -> ObjectType;
 
-    /// Returns the name of `object_id`. For use only in error messages and notices.
-    fn get_object_name(&self, object_id: &ObjectId) -> String;
+    /// Returns the system object type of `id`.
+    fn get_system_object_type(&self, id: &SystemObjectId) -> SystemObjectType;
 
     /// Returns the minimal qualification required to unambiguously specify
     /// `qualified_name`.
@@ -311,6 +352,9 @@ pub trait SessionCatalog: fmt::Debug + ExprHumanizer + Send + Sync {
     /// Adds a [`PlanNotice`] that will be displayed to the user if the plan
     /// successfully executes.
     fn add_notice(&self, notice: PlanNotice);
+
+    /// Returns the associated comments for the given `id`
+    fn get_item_comments(&self, id: &GlobalId) -> Option<&BTreeMap<Option<usize>, String>>;
 }
 
 /// Configuration associated with a catalog.
@@ -336,17 +380,8 @@ pub struct CatalogConfig {
     /// Function that returns a wall clock now time; can safely be mocked to return
     /// 0.
     pub now: NowFn,
-}
-
-impl CatalogConfig {
-    /// Returns the default progress topic name for a Kafka sink for a given
-    /// connection.
-    pub fn default_kafka_sink_progress_topic(&self, connection_id: GlobalId) -> String {
-        format!(
-            "_materialize-progress-{}-{connection_id}",
-            self.environment_id
-        )
-    }
+    /// Context for source and sink connections.
+    pub connection_context: ConnectionContext,
 }
 
 /// A database in a [`SessionCatalog`].
@@ -388,9 +423,8 @@ pub trait CatalogSchema {
     /// Lists the `CatalogItem`s for the schema.
     fn has_items(&self) -> bool;
 
-    /// Returns the items of the schema as a map from item name to
-    /// item ID.
-    fn item_ids(&self) -> &BTreeMap<String, GlobalId>;
+    /// Returns the IDs of the items in the schema.
+    fn item_ids(&self) -> Box<dyn Iterator<Item = GlobalId> + '_>;
 
     /// Returns the ID of the owning role.
     fn owner_id(&self) -> RoleId;
@@ -399,125 +433,51 @@ pub trait CatalogSchema {
     fn privileges(&self) -> &PrivilegeMap;
 }
 
-// TODO(jkosh44) When https://github.com/MaterializeInc/materialize/issues/17824 is implemented
-//  then switch this to a bitflag (https://docs.rs/bitflags/latest/bitflags/)
 /// Attributes belonging to a [`CatalogRole`].
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Arbitrary)]
 pub struct RoleAttributes {
     /// Indicates whether the role has inheritance of privileges.
     pub inherit: bool,
-    /// Indicates whether the role is allowed to create more roles.
-    pub create_role: bool,
-    /// Indicates whether the role is allowed to create databases.
-    pub create_db: bool,
-    /// Indicates whether the role is allowed to create clusters.
-    pub create_cluster: bool,
     // Force use of constructor.
     _private: (),
 }
 
 impl RoleAttributes {
     /// Creates a new [`RoleAttributes`] with default attributes.
-    pub fn new() -> RoleAttributes {
+    pub const fn new() -> RoleAttributes {
         RoleAttributes {
             inherit: true,
-            create_role: false,
-            create_db: false,
-            create_cluster: false,
             _private: (),
         }
     }
 
-    /// Adds the create role attribute.
-    pub fn with_create_role(mut self) -> RoleAttributes {
-        self.create_role = true;
-        self
-    }
-
-    /// Adds the create db attribute.
-    pub fn with_create_db(mut self) -> RoleAttributes {
-        self.create_db = true;
-        self
-    }
-
-    /// Adds the create cluster attribute.
-    pub fn with_create_cluster(mut self) -> RoleAttributes {
-        self.create_cluster = true;
-        self
-    }
-
     /// Adds all attributes.
-    pub fn with_all(mut self) -> RoleAttributes {
+    pub const fn with_all(mut self) -> RoleAttributes {
         self.inherit = true;
-        self.create_role = true;
-        self.create_db = true;
-        self.create_cluster = true;
         self
+    }
+
+    /// Returns whether or not the role has inheritence of privileges.
+    pub const fn is_inherit(&self) -> bool {
+        self.inherit
     }
 }
 
 impl From<PlannedRoleAttributes> for RoleAttributes {
-    fn from(
-        PlannedRoleAttributes {
-            inherit,
-            create_role,
-            create_db,
-            create_cluster,
-        }: PlannedRoleAttributes,
-    ) -> RoleAttributes {
+    fn from(PlannedRoleAttributes { inherit }: PlannedRoleAttributes) -> RoleAttributes {
         let default_attributes = RoleAttributes::new();
         RoleAttributes {
             inherit: inherit.unwrap_or(default_attributes.inherit),
-            create_role: create_role.unwrap_or(default_attributes.create_role),
-            create_db: create_db.unwrap_or(default_attributes.create_db),
-            create_cluster: create_cluster.unwrap_or(default_attributes.create_cluster),
             _private: (),
         }
     }
 }
 
-impl From<(&dyn CatalogRole, PlannedRoleAttributes)> for RoleAttributes {
-    fn from(
-        (
-            role,
-            PlannedRoleAttributes {
-                inherit,
-                create_role,
-                create_db,
-                create_cluster,
-            },
-        ): (&dyn CatalogRole, PlannedRoleAttributes),
-    ) -> RoleAttributes {
-        RoleAttributes {
-            inherit: inherit.unwrap_or_else(|| role.is_inherit()),
-            create_role: create_role.unwrap_or_else(|| role.create_role()),
-            create_db: create_db.unwrap_or_else(|| role.create_db()),
-            create_cluster: create_cluster.unwrap_or_else(|| role.create_cluster()),
-            _private: (),
-        }
-    }
-}
-
-impl RustType<proto::RoleAttributes> for RoleAttributes {
-    fn into_proto(&self) -> proto::RoleAttributes {
-        proto::RoleAttributes {
-            inherit: self.inherit,
-            create_role: self.create_role,
-            create_db: self.create_db,
-            create_cluster: self.create_cluster,
-        }
-    }
-
-    fn from_proto(proto: proto::RoleAttributes) -> Result<Self, TryFromProtoError> {
-        let mut attributes = RoleAttributes::new();
-
-        attributes.inherit = proto.inherit;
-        attributes.create_cluster = proto.create_cluster;
-        attributes.create_role = proto.create_role;
-        attributes.create_db = proto.create_db;
-
-        Ok(attributes)
-    }
+/// Default variable values for a [`CatalogRole`].
+#[derive(Default, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct RoleVars {
+    /// Map of variable names to their value.
+    pub map: BTreeMap<String, OwnedVarInput>,
 }
 
 /// A role in a [`SessionCatalog`].
@@ -528,23 +488,17 @@ pub trait CatalogRole {
     /// Returns a stable ID for the role.
     fn id(&self) -> RoleId;
 
-    /// Indicates whether the role has inheritance of privileges.
-    fn is_inherit(&self) -> bool;
-
-    /// Indicates whether the role has the role creation attribute.
-    fn create_role(&self) -> bool;
-
-    /// Indicates whether the role has the database creation attribute.
-    fn create_db(&self) -> bool;
-
-    /// Indicates whether the role has the cluster creation attribute.
-    fn create_cluster(&self) -> bool;
-
     /// Returns all role IDs that this role is an immediate a member of, and the grantor of that
     /// membership.
     ///
     /// Key is the role that some role is a member of, value is the grantor role ID.
     fn membership(&self) -> &BTreeMap<RoleId, RoleId>;
+
+    /// Returns the attributes associated with this role.
+    fn attributes(&self) -> &RoleAttributes;
+
+    /// Returns all variables that this role has a default value stored for.
+    fn vars(&self) -> &BTreeMap<String, OwnedVarInput>;
 }
 
 /// A cluster in a [`SessionCatalog`].
@@ -554,10 +508,6 @@ pub trait CatalogCluster<'a> {
 
     /// Returns a stable ID for the cluster.
     fn id(&self) -> ClusterId;
-
-    /// Returns the ID of the object this cluster is linked to, if
-    /// any.
-    fn linked_object_id(&self) -> Option<GlobalId>;
 
     /// Returns the objects that are bound to this cluster.
     fn bound_objects(&self) -> &BTreeSet<GlobalId>;
@@ -580,10 +530,13 @@ pub trait CatalogCluster<'a> {
 
     /// Returns true if this cluster is a managed cluster.
     fn is_managed(&self) -> bool;
+
+    /// Returns the size of the cluster, if the cluster is a managed cluster.
+    fn managed_size(&self) -> Option<&str>;
 }
 
 /// A cluster replica in a [`SessionCatalog`]
-pub trait CatalogClusterReplica<'a> {
+pub trait CatalogClusterReplica<'a>: Debug {
     /// Returns the name of the cluster replica.
     fn name(&self) -> &str;
 
@@ -595,6 +548,9 @@ pub trait CatalogClusterReplica<'a> {
 
     /// Returns the ID of the owning role.
     fn owner_id(&self) -> RoleId;
+
+    /// Returns whether or not the replica is internal
+    fn internal(&self) -> bool;
 }
 
 /// An item in a [`SessionCatalog`].
@@ -627,12 +583,12 @@ pub trait CatalogItem {
     ///
     /// If the catalog item is not of a type that contains a `SourceDesc`
     /// (i.e., anything other than sources), it returns an error.
-    fn source_desc(&self) -> Result<Option<&SourceDesc>, CatalogError>;
+    fn source_desc(&self) -> Result<Option<&SourceDesc<ReferencedConnection>>, CatalogError>;
 
     /// Returns the resolved connection.
     ///
     /// If the catalog item is not a connection, it returns an error.
-    fn connection(&self) -> Result<&Connection, CatalogError>;
+    fn connection(&self) -> Result<&Connection<ReferencedConnection>, CatalogError>;
 
     /// Returns the type of the catalog item.
     fn item_type(&self) -> CatalogItemType;
@@ -642,13 +598,26 @@ pub trait CatalogItem {
     fn create_sql(&self) -> &str;
 
     /// Returns the IDs of the catalog items upon which this catalog item
+    /// directly references.
+    fn references(&self) -> &ResolvedIds;
+
+    /// Returns the IDs of the catalog items upon which this catalog item
     /// depends.
-    fn uses(&self) -> &[GlobalId];
+    fn uses(&self) -> BTreeSet<GlobalId>;
+
+    /// Returns the IDs of the catalog items that directly reference this catalog item.
+    fn referenced_by(&self) -> &[GlobalId];
 
     /// Returns the IDs of the catalog items that depend upon this catalog item.
     fn used_by(&self) -> &[GlobalId];
 
-    /// If this catalog item is a source, it return the IDs of its subsources
+    /// Reports whether this catalog item is a subsource.
+    fn is_subsource(&self) -> bool;
+
+    /// Reports whether this catalog item is a progress source.
+    fn is_progress_source(&self) -> bool;
+
+    /// If this catalog item is a source, it return the IDs of its subsources.
     fn subsources(&self) -> BTreeSet<GlobalId>;
 
     /// If this catalog item is a source, it return the IDs of its progress collection.
@@ -671,6 +640,9 @@ pub trait CatalogItem {
 
     /// Returns the privileges associated with the item.
     fn privileges(&self) -> &PrivilegeMap;
+
+    /// Returns the cluster the item belongs to.
+    fn cluster_id(&self) -> Option<ClusterId>;
 }
 
 /// The type of a [`CatalogItem`].
@@ -696,6 +668,41 @@ pub enum CatalogItemType {
     Secret,
     /// A connection.
     Connection,
+}
+
+impl CatalogItemType {
+    /// Reports whether the given type of item conflicts with items of type
+    /// `CatalogItemType::Type`.
+    ///
+    /// In PostgreSQL, even though types live in a separate namespace from other
+    /// schema objects, creating a table, view, or materialized view creates a
+    /// type named after that relation. This prevents creating a type with the
+    /// same name as a relational object, even though types and relational
+    /// objects live in separate namespaces. (Indexes are even weirder; while
+    /// they don't get a type with the same name, they get an entry in
+    /// `pg_class` that prevents *record* types of the same name as the index,
+    /// but not other types of types, like enums.)
+    ///
+    /// We don't presently construct types that mirror relational objects,
+    /// though we likely will need to in the future for full PostgreSQL
+    /// compatibility (see #23789). For now, we use this method to prevent
+    /// creating types and relational objects that have the same name, so that
+    /// it is a backwards compatible change in the future to introduce a type
+    /// named after each relational object in the system.
+    pub fn conflicts_with_type(&self) -> bool {
+        match self {
+            CatalogItemType::Table => true,
+            CatalogItemType::Source => true,
+            CatalogItemType::View => true,
+            CatalogItemType::MaterializedView => true,
+            CatalogItemType::Index => true,
+            CatalogItemType::Type => true,
+            CatalogItemType::Sink => false,
+            CatalogItemType::Func => false,
+            CatalogItemType::Secret => false,
+            CatalogItemType::Connection => false,
+        }
+    }
 }
 
 impl fmt::Display for CatalogItemType {
@@ -732,42 +739,6 @@ impl From<CatalogItemType> for ObjectType {
     }
 }
 
-impl RustType<proto::CatalogItemType> for CatalogItemType {
-    fn into_proto(&self) -> proto::CatalogItemType {
-        match self {
-            CatalogItemType::Table => proto::CatalogItemType::Table,
-            CatalogItemType::Source => proto::CatalogItemType::Source,
-            CatalogItemType::Sink => proto::CatalogItemType::Sink,
-            CatalogItemType::View => proto::CatalogItemType::View,
-            CatalogItemType::MaterializedView => proto::CatalogItemType::MaterializedView,
-            CatalogItemType::Index => proto::CatalogItemType::Index,
-            CatalogItemType::Type => proto::CatalogItemType::Type,
-            CatalogItemType::Func => proto::CatalogItemType::Func,
-            CatalogItemType::Secret => proto::CatalogItemType::Secret,
-            CatalogItemType::Connection => proto::CatalogItemType::Connection,
-        }
-    }
-
-    fn from_proto(proto: proto::CatalogItemType) -> Result<Self, TryFromProtoError> {
-        let item_type = match proto {
-            proto::CatalogItemType::Table => CatalogItemType::Table,
-            proto::CatalogItemType::Source => CatalogItemType::Source,
-            proto::CatalogItemType::Sink => CatalogItemType::Sink,
-            proto::CatalogItemType::View => CatalogItemType::View,
-            proto::CatalogItemType::MaterializedView => CatalogItemType::MaterializedView,
-            proto::CatalogItemType::Index => CatalogItemType::Index,
-            proto::CatalogItemType::Type => CatalogItemType::Type,
-            proto::CatalogItemType::Func => CatalogItemType::Func,
-            proto::CatalogItemType::Secret => CatalogItemType::Secret,
-            proto::CatalogItemType::Connection => CatalogItemType::Connection,
-            proto::CatalogItemType::Unknown => {
-                return Err(TryFromProtoError::unknown_enum_variant("CatalogItemType"))
-            }
-        };
-        Ok(item_type)
-    }
-}
-
 /// Details about a type in the catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogTypeDetails<T: TypeReference> {
@@ -775,6 +746,17 @@ pub struct CatalogTypeDetails<T: TypeReference> {
     pub array_id: Option<GlobalId>,
     /// The description of this type.
     pub typ: CatalogType<T>,
+    /// Additional metadata about the type in PostgreSQL, if relevant.
+    pub pg_metadata: Option<CatalogTypePgMetadata>,
+}
+
+/// Additional PostgreSQL metadata about a type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogTypePgMetadata {
+    /// The OID of the `typinput` function in PostgreSQL.
+    pub typinput_oid: u32,
+    /// The OID of the `typreceive` function in PostgreSQL.
+    pub typreceive_oid: u32,
 }
 
 /// Represents a reference to type in the catalog
@@ -807,6 +789,7 @@ impl TypeReference for IdReference {
 #[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogType<T: TypeReference> {
+    AclItem,
     Array {
         element_reference: T::Reference,
     },
@@ -827,20 +810,24 @@ pub enum CatalogType<T: TypeReference> {
     Jsonb,
     List {
         element_reference: T::Reference,
+        element_modifiers: Vec<i64>,
     },
     Map {
         key_reference: T::Reference,
+        key_modifiers: Vec<i64>,
         value_reference: T::Reference,
+        value_modifiers: Vec<i64>,
     },
     Numeric,
     Oid,
     PgLegacyChar,
+    PgLegacyName,
     Pseudo,
     Range {
         element_reference: T::Reference,
     },
     Record {
-        fields: Vec<(ColumnName, T::Reference)>,
+        fields: Vec<CatalogRecordField<T>>,
     },
     RegClass,
     RegProc,
@@ -853,6 +840,43 @@ pub enum CatalogType<T: TypeReference> {
     VarChar,
     Int2Vector,
     MzAclItem,
+}
+
+impl CatalogType<IdReference> {
+    /// Returns the relation description for the type, if the type is a record
+    /// type.
+    pub fn desc(&self, catalog: &dyn SessionCatalog) -> Result<Option<RelationDesc>, PlanError> {
+        match &self {
+            CatalogType::Record { fields } => {
+                let mut desc = RelationDesc::empty();
+                for f in fields {
+                    let name = f.name.clone();
+                    let ty = query::scalar_type_from_catalog(
+                        catalog,
+                        f.type_reference,
+                        &f.type_modifiers,
+                    )?;
+                    // TODO: support plumbing `NOT NULL` constraints through
+                    // `CREATE TYPE`.
+                    let ty = ty.nullable(true);
+                    desc = desc.with_column(name, ty);
+                }
+                Ok(Some(desc))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// A description of a field in a [`CatalogType::Record`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogRecordField<T: TypeReference> {
+    /// The name of the field.
+    pub name: ColumnName,
+    /// The ID of the type of the field.
+    pub type_reference: T::Reference,
+    /// Modifiers to apply to the type.
+    pub type_modifiers: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -971,6 +995,14 @@ impl EnvironmentId {
     /// Returns the cloud provider region associated with this environment ID.
     pub fn cloud_provider_region(&self) -> &str {
         &self.cloud_provider_region
+    }
+
+    /// Returns the name of the region associted with this environment ID.
+    ///
+    /// A region is a combination of [`EnvironmentId::cloud_provider`] and
+    /// [`EnvironmentId::cloud_provider_region`].
+    pub fn region(&self) -> String {
+        format!("{}/{}", self.cloud_provider, self.cloud_provider_region)
     }
 
     /// Returns the organization ID associated with this environment ID.
@@ -1103,22 +1135,39 @@ impl Error for InvalidCloudProviderError {}
 pub enum CatalogError {
     /// Unknown database.
     UnknownDatabase(String),
+    /// Database already exists.
+    DatabaseAlreadyExists(String),
     /// Unknown schema.
     UnknownSchema(String),
+    /// Schema already exists.
+    SchemaAlreadyExists(String),
     /// Unknown role.
     UnknownRole(String),
+    /// Role already exists.
+    RoleAlreadyExists(String),
     /// Unknown cluster.
     UnknownCluster(String),
+    /// Cluster already exists.
+    ClusterAlreadyExists(String),
     /// Unknown cluster replica.
     UnknownClusterReplica(String),
+    /// Duplicate Replica. #[error("cannot create multiple replicas named '{0}' on cluster '{1}'")]
+    DuplicateReplica(String, String),
     /// Unknown item.
     UnknownItem(String),
+    /// Item already exists.
+    ItemAlreadyExists(GlobalId, String),
     /// Unknown function.
     UnknownFunction {
         /// The identifier of the function we couldn't find
         name: String,
         /// A suggested alternative to the named function.
         alternative: Option<String>,
+    },
+    /// Unknown type.
+    UnknownType {
+        /// The identifier of the type we couldn't find.
+        name: String,
     },
     /// Unknown connection.
     UnknownConnection(String),
@@ -1138,21 +1187,38 @@ pub enum CatalogError {
         /// The invalid item's type.
         typ: CatalogItemType,
     },
+    /// Ran out of unique IDs.
+    IdExhaustion,
+    /// Timeline already exists.
+    TimelineAlreadyExists(String),
+    /// Id Allocator already exists.
+    IdAllocatorAlreadyExists(String),
+    /// Config already exists.
+    ConfigAlreadyExists(String),
+    /// Builtin migrations failed.
+    FailedBuiltinSchemaMigration(String),
 }
 
 impl fmt::Display for CatalogError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::UnknownDatabase(name) => write!(f, "unknown database '{}'", name),
+            Self::DatabaseAlreadyExists(name) => write!(f, "database '{name}' already exists"),
             Self::UnknownFunction { name, .. } => write!(f, "function \"{}\" does not exist", name),
+            Self::UnknownType { name, .. } => write!(f, "type \"{}\" does not exist", name),
             Self::UnknownConnection(name) => write!(f, "connection \"{}\" does not exist", name),
             Self::UnknownSchema(name) => write!(f, "unknown schema '{}'", name),
+            Self::SchemaAlreadyExists(name) => write!(f, "schema '{name}' already exists"),
             Self::UnknownRole(name) => write!(f, "unknown role '{}'", name),
+            Self::RoleAlreadyExists(name) => write!(f, "role '{name}' already exists"),
             Self::UnknownCluster(name) => write!(f, "unknown cluster '{}'", name),
+            Self::ClusterAlreadyExists(name) => write!(f, "cluster '{name}' already exists"),
             Self::UnknownClusterReplica(name) => {
                 write!(f, "unknown cluster replica '{}'", name)
             }
+            Self::DuplicateReplica(replica_name, cluster_name) => write!(f, "cannot create multiple replicas named '{replica_name}' on cluster '{cluster_name}'"),
             Self::UnknownItem(name) => write!(f, "unknown catalog item '{}'", name),
+            Self::ItemAlreadyExists(_gid, name) => write!(f, "catalog item '{name}' already exists"),
             Self::UnexpectedType {
                 name,
                 actual_type,
@@ -1171,6 +1237,11 @@ impl fmt::Display for CatalogError {
                 },
                 typ,
             ),
+            Self::IdExhaustion => write!(f, "id counter overflows i64"),
+            Self::TimelineAlreadyExists(name) => write!(f, "timeline '{name}' already exists"),
+            Self::IdAllocatorAlreadyExists(name) => write!(f, "ID allocator '{name}' already exists"),
+            Self::ConfigAlreadyExists(key) => write!(f, "config '{key}' already exists"),
+            Self::FailedBuiltinSchemaMigration(objects) => write!(f, "failed to migrate schema of builtin objects: {objects}"),
         }
     }
 }
@@ -1194,11 +1265,9 @@ impl Error for CatalogError {}
 
 /// Provides a method of generating a 3-layer catalog on the fly, and then
 /// resolving objects within it.
-pub(crate) struct ErsatzCatalog<'a, T>(
-    pub BTreeMap<String, BTreeMap<String, BTreeMap<String, &'a T>>>,
-);
+pub(crate) struct SubsourceCatalog<T>(pub BTreeMap<String, BTreeMap<String, BTreeMap<String, T>>>);
 
-impl<'a, T> ErsatzCatalog<'a, T> {
+impl<T> SubsourceCatalog<T> {
     /// Returns the fully qualified name for `item`, as well as the `T` that it
     /// describes.
     ///
@@ -1206,10 +1275,10 @@ impl<'a, T> ErsatzCatalog<'a, T> {
     /// - If `item` cannot be normalized to a [`PartialItemName`]
     /// - If the normalized `PartialItemName` does not resolve to an item in
     ///   `self.0`.
-    pub fn resolve(
+    pub(crate) fn resolve(
         &self,
         item: UnresolvedItemName,
-    ) -> Result<(UnresolvedItemName, &'a T), PlanError> {
+    ) -> Result<(UnresolvedItemName, &T), PlanError> {
         let name = normalize::unresolved_item_name(item)?;
 
         let schemas = match self.0.get(&name.item) {
@@ -1243,12 +1312,17 @@ impl<'a, T> ErsatzCatalog<'a, T> {
         };
 
         let desc = match databases.get(database) {
-            Some(desc) => *desc,
+            Some(desc) => desc,
             None => sql_bail!("database {database} not found source"),
         };
 
+        // Note: Using unchecked here is okay because all of these values were originally Idents.
         Ok((
-            UnresolvedItemName::qualified(&[database, schema, &name.item]),
+            UnresolvedItemName::qualified(&[
+                Ident::new_unchecked(database),
+                Ident::new_unchecked(schema),
+                Ident::new_unchecked(&name.item),
+            ]),
             desc,
         ))
     }
@@ -1322,6 +1396,28 @@ impl From<mz_sql_parser::ast::ObjectType> for ObjectType {
     }
 }
 
+impl From<CommentObjectId> for ObjectType {
+    fn from(value: CommentObjectId) -> ObjectType {
+        match value {
+            CommentObjectId::Table(_) => ObjectType::Table,
+            CommentObjectId::View(_) => ObjectType::View,
+            CommentObjectId::MaterializedView(_) => ObjectType::MaterializedView,
+            CommentObjectId::Source(_) => ObjectType::Source,
+            CommentObjectId::Sink(_) => ObjectType::Sink,
+            CommentObjectId::Index(_) => ObjectType::Index,
+            CommentObjectId::Func(_) => ObjectType::Func,
+            CommentObjectId::Connection(_) => ObjectType::Connection,
+            CommentObjectId::Type(_) => ObjectType::Type,
+            CommentObjectId::Secret(_) => ObjectType::Secret,
+            CommentObjectId::Role(_) => ObjectType::Role,
+            CommentObjectId::Database(_) => ObjectType::Database,
+            CommentObjectId::Schema(_) => ObjectType::Schema,
+            CommentObjectId::Cluster(_) => ObjectType::Cluster,
+            CommentObjectId::ClusterReplica(_) => ObjectType::ClusterReplica,
+        }
+    }
+}
+
 impl Display for ObjectType {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -1344,53 +1440,169 @@ impl Display for ObjectType {
     }
 }
 
-impl RustType<proto::ObjectType> for ObjectType {
-    fn into_proto(&self) -> proto::ObjectType {
-        match self {
-            ObjectType::Table => proto::ObjectType::Table,
-            ObjectType::View => proto::ObjectType::View,
-            ObjectType::MaterializedView => proto::ObjectType::MaterializedView,
-            ObjectType::Source => proto::ObjectType::Source,
-            ObjectType::Sink => proto::ObjectType::Sink,
-            ObjectType::Index => proto::ObjectType::Index,
-            ObjectType::Type => proto::ObjectType::Type,
-            ObjectType::Role => proto::ObjectType::Role,
-            ObjectType::Cluster => proto::ObjectType::Cluster,
-            ObjectType::ClusterReplica => proto::ObjectType::ClusterReplica,
-            ObjectType::Secret => proto::ObjectType::Secret,
-            ObjectType::Connection => proto::ObjectType::Connection,
-            ObjectType::Database => proto::ObjectType::Database,
-            ObjectType::Schema => proto::ObjectType::Schema,
-            ObjectType::Func => proto::ObjectType::Func,
-        }
-    }
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Copy, Deserialize, Serialize)]
+/// The types of objects in the system.
+pub enum SystemObjectType {
+    /// Catalog object type.
+    Object(ObjectType),
+    /// Entire system.
+    System,
+}
 
-    fn from_proto(proto: proto::ObjectType) -> Result<Self, TryFromProtoError> {
-        match proto {
-            proto::ObjectType::Table => Ok(ObjectType::Table),
-            proto::ObjectType::View => Ok(ObjectType::View),
-            proto::ObjectType::MaterializedView => Ok(ObjectType::MaterializedView),
-            proto::ObjectType::Source => Ok(ObjectType::Source),
-            proto::ObjectType::Sink => Ok(ObjectType::Sink),
-            proto::ObjectType::Index => Ok(ObjectType::Index),
-            proto::ObjectType::Type => Ok(ObjectType::Type),
-            proto::ObjectType::Role => Ok(ObjectType::Role),
-            proto::ObjectType::Cluster => Ok(ObjectType::Cluster),
-            proto::ObjectType::ClusterReplica => Ok(ObjectType::ClusterReplica),
-            proto::ObjectType::Secret => Ok(ObjectType::Secret),
-            proto::ObjectType::Connection => Ok(ObjectType::Connection),
-            proto::ObjectType::Database => Ok(ObjectType::Database),
-            proto::ObjectType::Schema => Ok(ObjectType::Schema),
-            proto::ObjectType::Func => Ok(ObjectType::Func),
-            proto::ObjectType::Unknown => Err(TryFromProtoError::unknown_enum_variant(
-                "ObjectType::Unknown",
-            )),
+impl SystemObjectType {
+    /// Reports if the object type can be treated as a relation.
+    pub fn is_relation(&self) -> bool {
+        match self {
+            SystemObjectType::Object(object_type) => object_type.is_relation(),
+            SystemObjectType::System => false,
         }
     }
 }
 
+impl Display for SystemObjectType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            SystemObjectType::Object(object_type) => std::fmt::Display::fmt(&object_type, f),
+            SystemObjectType::System => f.write_str("SYSTEM"),
+        }
+    }
+}
+
+/// Enum used to format object names in error messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorMessageObjectDescription {
+    /// The name of a specific object.
+    Object {
+        /// Type of object.
+        object_type: ObjectType,
+        /// Name of object.
+        object_name: Option<String>,
+    },
+    /// The name of the entire system.
+    System,
+}
+
+impl ErrorMessageObjectDescription {
+    /// Generate a new [`ErrorMessageObjectDescription`] from an [`ObjectId`].
+    pub fn from_id(
+        object_id: &ObjectId,
+        catalog: &dyn SessionCatalog,
+    ) -> ErrorMessageObjectDescription {
+        let object_name = match object_id {
+            ObjectId::Cluster(cluster_id) => catalog.get_cluster(*cluster_id).name().to_string(),
+            ObjectId::ClusterReplica((cluster_id, replica_id)) => catalog
+                .get_cluster_replica(*cluster_id, *replica_id)
+                .name()
+                .to_string(),
+            ObjectId::Database(database_id) => catalog.get_database(database_id).name().to_string(),
+            ObjectId::Schema((database_spec, schema_spec)) => {
+                let name = catalog.get_schema(database_spec, schema_spec).name();
+                catalog.resolve_full_schema_name(name).to_string()
+            }
+            ObjectId::Role(role_id) => catalog.get_role(role_id).name().to_string(),
+            ObjectId::Item(id) => {
+                let name = catalog.get_item(id).name();
+                catalog.resolve_full_name(name).to_string()
+            }
+        };
+        ErrorMessageObjectDescription::Object {
+            object_type: catalog.get_object_type(object_id),
+            object_name: Some(object_name),
+        }
+    }
+
+    /// Generate a new [`ErrorMessageObjectDescription`] from a [`SystemObjectId`].
+    pub fn from_sys_id(
+        object_id: &SystemObjectId,
+        catalog: &dyn SessionCatalog,
+    ) -> ErrorMessageObjectDescription {
+        match object_id {
+            SystemObjectId::Object(object_id) => {
+                ErrorMessageObjectDescription::from_id(object_id, catalog)
+            }
+            SystemObjectId::System => ErrorMessageObjectDescription::System,
+        }
+    }
+
+    /// Generate a new [`ErrorMessageObjectDescription`] from a [`SystemObjectType`].
+    pub fn from_object_type(object_type: SystemObjectType) -> ErrorMessageObjectDescription {
+        match object_type {
+            SystemObjectType::Object(object_type) => ErrorMessageObjectDescription::Object {
+                object_type,
+                object_name: None,
+            },
+            SystemObjectType::System => ErrorMessageObjectDescription::System,
+        }
+    }
+}
+
+impl Display for ErrorMessageObjectDescription {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ErrorMessageObjectDescription::Object {
+                object_type,
+                object_name,
+            } => {
+                let object_name = object_name
+                    .as_ref()
+                    .map(|object_name| format!(" {}", object_name.quoted()))
+                    .unwrap_or_else(|| "".to_string());
+                write!(f, "{object_type}{object_name}")
+            }
+            ErrorMessageObjectDescription::System => f.write_str("SYSTEM"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+// These attributes are needed because the key of a map must be a string. We also
+// get the added benefit of flattening this struct in it's serialized form.
+#[serde(into = "BTreeMap<String, RoleId>")]
+#[serde(try_from = "BTreeMap<String, RoleId>")]
+/// Represents the grantee and a grantor of a role membership.
+pub struct RoleMembership {
+    /// Key is the role that some role is a member of, value is the grantor role ID.
+    // TODO(jkosh44) This structure does not allow a role to have multiple of the same membership
+    // from different grantors. This isn't a problem now since we don't implement ADMIN OPTION, but
+    // we should figure this out before implementing ADMIN OPTION. It will likely require a messy
+    // migration.
+    pub map: BTreeMap<RoleId, RoleId>,
+}
+
+impl RoleMembership {
+    /// Creates a new [`RoleMembership`].
+    pub fn new() -> RoleMembership {
+        RoleMembership {
+            map: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<RoleMembership> for BTreeMap<String, RoleId> {
+    fn from(value: RoleMembership) -> Self {
+        value
+            .map
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
+    }
+}
+
+impl TryFrom<BTreeMap<String, RoleId>> for RoleMembership {
+    type Error = anyhow::Error;
+
+    fn try_from(value: BTreeMap<String, RoleId>) -> Result<Self, Self::Error> {
+        Ok(RoleMembership {
+            map: value
+                .into_iter()
+                .map(|(k, v)| Ok((RoleId::from_str(&k)?, v)))
+                .collect::<Result<_, anyhow::Error>>()?,
+        })
+    }
+}
+
 /// Specification for objects that will be affected by a default privilege.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct DefaultPrivilegeObject {
     /// The role id that created the object.
     pub role_id: RoleId,
@@ -1419,8 +1631,15 @@ impl DefaultPrivilegeObject {
     }
 }
 
+impl std::fmt::Display for DefaultPrivilegeObject {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // TODO: Don't just wrap Debug.
+        write!(f, "{self:?}")
+    }
+}
+
 /// Specification for the privileges that will be granted from default privileges.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct DefaultPrivilegeAclItem {
     /// The role that will receive the privileges.
     pub grantee: RoleId,

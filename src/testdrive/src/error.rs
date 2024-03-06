@@ -70,15 +70,15 @@ impl Error {
                 color_spec.set_bold(false);
                 stderr.set_color(&color_spec)?;
                 write!(&mut stderr, "{}", location.snippet)?;
-                writeln!(&mut stderr, "{}^", " ".repeat(location.col - 1))
+                writeln!(&mut stderr, "{}^", " ".repeat(location.col - 1))?;
             }
             None => {
                 let color_spec = ColorSpec::new();
                 write_error_heading(&mut stderr, &color_spec)?;
                 writeln!(&mut stderr, "{}", self.source.display_with_causes())?;
-                Ok(())
             }
         }
+        std::io::stderr().flush()
     }
 }
 
@@ -120,8 +120,18 @@ impl ErrorLocation {
         let mut snippet = String::new();
         writeln!(&mut snippet, "     |").unwrap();
         for (i, l) in contents.lines().enumerate() {
+            let l_lc = l.to_lowercase();
             if i >= line {
                 break;
+            } else if l_lc.contains("postgres-") || l_lc.contains("secret") || l_lc.contains("url")
+            {
+                writeln!(
+                    &mut snippet,
+                    "{:4} | {} ... [rest of line truncated for security]",
+                    i + 1,
+                    l.get(0..20).unwrap_or(l)
+                )
+                .unwrap();
             } else if i + 2 >= line {
                 writeln!(&mut snippet, "{:4} | {}", i + 1, l).unwrap();
             }

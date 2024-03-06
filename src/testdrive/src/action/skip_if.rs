@@ -13,10 +13,7 @@ use tokio_postgres::types::Type;
 use crate::action::{ControlFlow, State};
 use crate::parser::BuiltinCommand;
 
-pub async fn run_skip_if(
-    cmd: BuiltinCommand,
-    state: &mut State,
-) -> Result<ControlFlow, anyhow::Error> {
+pub async fn run_skip_if(cmd: BuiltinCommand, state: &State) -> Result<ControlFlow, anyhow::Error> {
     let query = cmd.input.join("\n");
     let stmt = state
         .pgclient
@@ -36,8 +33,8 @@ pub async fn run_skip_if(
         .get(0);
 
     if should_skip {
-        println!("skip-if query returned true; skipping rest of file");
-        Ok(ControlFlow::Break)
+        println!("skip-if query returned true; skipping until next skip-end or end of the file");
+        Ok(ControlFlow::SkipBegin)
     } else {
         println!("skip-if query returned false; continuing");
         Ok(ControlFlow::Continue)

@@ -7,69 +7,67 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-// `EnumKind` unconditionally introduces a lifetime. TODO: remove this once
-// https://github.com/rust-lang/rust-clippy/pull/9037 makes it into stable
-#![allow(clippy::extra_unused_lifetimes)]
-
-use std::collections::BTreeMap;
-use std::fmt;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use derivative::Derivative;
 use enum_kinds::EnumKind;
-use mz_ore::str::StrExt;
+use futures::future::BoxFuture;
+use mz_adapter_types::connection::{ConnectionId, ConnectionIdType};
+use mz_ore::collections::CollectionExt;
+use mz_ore::soft_assert_no_log;
+use mz_ore::tracing::OpenTelemetryContext;
 use mz_pgcopy::CopyFormatParams;
-use mz_repr::{GlobalId, Row, ScalarType};
+use mz_repr::role_id::RoleId;
+use mz_repr::{GlobalId, Row};
 use mz_sql::ast::{FetchDirection, Raw, Statement};
 use mz_sql::catalog::ObjectType;
-use mz_sql::plan::{ExecuteTimeout, PlanKind};
-use mz_sql::session::vars::Var;
-use tokio::sync::{oneshot, watch};
+use mz_sql::plan::{ExecuteTimeout, Plan, PlanKind};
+use mz_sql::session::user::User;
+use mz_sql::session::vars::{OwnedVarInput, Var};
+use mz_sql_parser::ast::{AlterObjectRenameStatement, AlterOwnerStatement, DropObjectsStatement};
+use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
-use crate::client::{ConnectionId, ConnectionIdType};
+use crate::catalog::Catalog;
+use crate::coord::consistency::CoordinatorInconsistencies;
 use crate::coord::peek::PeekResponseUnary;
 use crate::coord::ExecuteContextExtra;
 use crate::error::AdapterError;
 use crate::session::{EndTransactionAction, RowBatchStream, Session};
+use crate::statement_logging::StatementEndedExecutionReason;
 use crate::util::Transmittable;
+use crate::webhook::AppendWebhookResponse;
+use crate::{AdapterNotice, AppendWebhookError};
+
+#[derive(Debug)]
+pub struct CatalogSnapshot {
+    pub catalog: Arc<Catalog>,
+}
 
 #[derive(Debug)]
 pub enum Command {
+    CatalogSnapshot {
+        tx: oneshot::Sender<CatalogSnapshot>,
+    },
+
     Startup {
-        session: Session,
-        cancel_tx: Arc<watch::Sender<Canceled>>,
-        tx: oneshot::Sender<Response<StartupResponse>>,
-    },
-
-    Declare {
-        name: String,
-        stmt: Statement<Raw>,
-        param_types: Vec<Option<ScalarType>>,
-        session: Session,
-        tx: oneshot::Sender<Response<ExecuteResponse>>,
-    },
-
-    Prepare {
-        name: String,
-        stmt: Option<Statement<Raw>>,
-        param_types: Vec<Option<ScalarType>>,
-        session: Session,
-        tx: oneshot::Sender<Response<()>>,
-    },
-
-    VerifyPreparedStatement {
-        name: String,
-        session: Session,
-        tx: oneshot::Sender<Response<()>>,
+        tx: oneshot::Sender<Result<StartupResponse, AdapterError>>,
+        user: User,
+        conn_id: ConnectionId,
+        secret_key: u32,
+        uuid: Uuid,
+        application_name: String,
+        notice_tx: mpsc::UnboundedSender<AdapterNotice>,
     },
 
     Execute {
         portal_name: String,
         session: Session,
         tx: oneshot::Sender<Response<ExecuteResponse>>,
-        span: tracing::Span,
+        outer_ctx_extra: Option<ExecuteContextExtra>,
     },
 
     Commit {
@@ -87,69 +85,75 @@ pub enum Command {
         conn_id: ConnectionId,
     },
 
-    DumpCatalog {
-        session: Session,
-        tx: oneshot::Sender<Response<CatalogDump>>,
-    },
-
-    CopyRows {
-        id: GlobalId,
-        columns: Vec<usize>,
-        rows: Vec<Row>,
-        session: Session,
-        tx: oneshot::Sender<Response<ExecuteResponse>>,
-        ctx_extra: ExecuteContextExtra,
+    GetWebhook {
+        database: String,
+        schema: String,
+        name: String,
+        tx: oneshot::Sender<Result<AppendWebhookResponse, AppendWebhookError>>,
     },
 
     GetSystemVars {
-        session: Session,
-        tx: oneshot::Sender<Response<GetVariablesResponse>>,
+        conn_id: ConnectionId,
+        tx: oneshot::Sender<Result<GetVariablesResponse, AdapterError>>,
     },
 
     SetSystemVars {
         vars: BTreeMap<String, String>,
-        session: Session,
-        tx: oneshot::Sender<Response<()>>,
+        conn_id: ConnectionId,
+        tx: oneshot::Sender<Result<(), AdapterError>>,
     },
 
     Terminate {
-        session: Session,
-        tx: Option<oneshot::Sender<Response<()>>>,
+        conn_id: ConnectionId,
+        tx: Option<oneshot::Sender<Result<(), AdapterError>>>,
+    },
+
+    /// Performs any cleanup and logging actions necessary for
+    /// finalizing a statement execution.
+    ///
+    /// Only used for cases that terminate in the protocol layer and
+    /// otherwise have no reason to hand control back to the coordinator.
+    /// In other cases, we piggy-back on another command.
+    RetireExecute {
+        data: ExecuteContextExtra,
+        reason: StatementEndedExecutionReason,
+    },
+
+    CheckConsistency {
+        tx: oneshot::Sender<Result<(), CoordinatorInconsistencies>>,
     },
 }
 
 impl Command {
     pub fn session(&self) -> Option<&Session> {
         match self {
-            Command::Startup { session, .. }
-            | Command::Declare { session, .. }
-            | Command::Prepare { session, .. }
-            | Command::VerifyPreparedStatement { session, .. }
-            | Command::Execute { session, .. }
-            | Command::Commit { session, .. }
-            | Command::DumpCatalog { session, .. }
-            | Command::CopyRows { session, .. }
-            | Command::GetSystemVars { session, .. }
-            | Command::SetSystemVars { session, .. }
-            | Command::Terminate { session, .. } => Some(session),
-            Command::CancelRequest { .. } | Command::PrivilegedCancelRequest { .. } => None,
+            Command::Execute { session, .. } | Command::Commit { session, .. } => Some(session),
+            Command::CancelRequest { .. }
+            | Command::Startup { .. }
+            | Command::CatalogSnapshot { .. }
+            | Command::PrivilegedCancelRequest { .. }
+            | Command::GetWebhook { .. }
+            | Command::Terminate { .. }
+            | Command::GetSystemVars { .. }
+            | Command::SetSystemVars { .. }
+            | Command::RetireExecute { .. }
+            | Command::CheckConsistency { .. } => None,
         }
     }
 
     pub fn session_mut(&mut self) -> Option<&mut Session> {
         match self {
-            Command::Startup { session, .. }
-            | Command::Declare { session, .. }
-            | Command::Prepare { session, .. }
-            | Command::VerifyPreparedStatement { session, .. }
-            | Command::Execute { session, .. }
-            | Command::Commit { session, .. }
-            | Command::DumpCatalog { session, .. }
-            | Command::CopyRows { session, .. }
-            | Command::GetSystemVars { session, .. }
-            | Command::SetSystemVars { session, .. }
-            | Command::Terminate { session, .. } => Some(session),
-            Command::CancelRequest { .. } | Command::PrivilegedCancelRequest { .. } => None,
+            Command::Execute { session, .. } | Command::Commit { session, .. } => Some(session),
+            Command::CancelRequest { .. }
+            | Command::Startup { .. }
+            | Command::CatalogSnapshot { .. }
+            | Command::PrivilegedCancelRequest { .. }
+            | Command::GetWebhook { .. }
+            | Command::Terminate { .. }
+            | Command::GetSystemVars { .. }
+            | Command::SetSystemVars { .. }
+            | Command::RetireExecute { .. }
+            | Command::CheckConsistency { .. } => None,
         }
     }
 }
@@ -158,15 +162,23 @@ impl Command {
 pub struct Response<T> {
     pub result: Result<T, AdapterError>,
     pub session: Session,
+    pub otel_ctx: OpenTelemetryContext,
 }
 
 pub type RowsFuture = Pin<Box<dyn Future<Output = PeekResponseUnary> + Send>>;
 
 /// The response to [`Client::startup`](crate::Client::startup).
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct StartupResponse {
-    /// Notifications associated with session startup.
-    pub messages: Vec<StartupMessage>,
+    /// RoleId for the user.
+    pub role_id: RoleId,
+    /// A future that completes when all necessary Builtin Table writes have completed.
+    #[derivative(Debug = "ignore")]
+    pub write_notify: BoxFuture<'static, ()>,
+    /// Map of (name, VarInput::Flat) tuples of session default variables that should be set.
+    pub session_defaults: BTreeMap<String, OwnedVarInput>,
+    pub catalog: Arc<Catalog>,
 }
 
 // Facile implementation for `StartupResponse`, which does not use the `allowed`
@@ -175,42 +187,6 @@ impl Transmittable for StartupResponse {
     type Allowed = bool;
     fn to_allowed(&self) -> Self::Allowed {
         true
-    }
-}
-
-/// Messages in a [`StartupResponse`].
-#[derive(Debug)]
-pub enum StartupMessage {
-    /// The database specified in the initial session does not exist.
-    UnknownSessionDatabase(String),
-}
-
-impl StartupMessage {
-    /// Reports additional details about the error, if any are available.
-    pub fn detail(&self) -> Option<String> {
-        None
-    }
-
-    /// Reports a hint for the user about how the error could be fixed.
-    pub fn hint(&self) -> Option<String> {
-        match self {
-            StartupMessage::UnknownSessionDatabase(_) => Some(
-                "Create the database with CREATE DATABASE \
-                 or pick an extant database with SET DATABASE = name. \
-                 List available databases with SHOW DATABASES."
-                    .into(),
-            ),
-        }
-    }
-}
-
-impl fmt::Display for StartupMessage {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            StartupMessage::UnknownSessionDatabase(name) => {
-                write!(f, "session database {} does not exist", name.quoted())
-            }
-        }
     }
 }
 
@@ -246,6 +222,10 @@ impl GetVariablesResponse {
                 .collect(),
         )
     }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(|s| s.as_str())
+    }
 }
 
 impl Transmittable for GetVariablesResponse {
@@ -267,7 +247,7 @@ impl IntoIterator for GetVariablesResponse {
 /// The response to [`SessionClient::execute`](crate::SessionClient::execute).
 #[derive(EnumKind, Derivative)]
 #[derivative(Debug)]
-#[enum_kind(ExecuteResponseKind)]
+#[enum_kind(ExecuteResponseKind, derive(PartialOrd, Ord))]
 pub enum ExecuteResponse {
     /// The default privileges were altered.
     AlteredDefaultPrivileges,
@@ -279,10 +259,13 @@ pub enum ExecuteResponse {
     AlteredRole,
     /// The system configuration was altered.
     AlteredSystemConfiguration,
-    /// The query was canceled.
-    Canceled,
     /// The requested cursor was closed.
     ClosedCursor,
+    /// The provided comment was created.
+    Comment,
+    /// The specified number of rows were copied into the requested output.
+    Copied(usize),
+    /// The response for a COPY TO STDOUT query.
     CopyTo {
         format: mz_sql::plan::CopyFormat,
         resp: Box<ExecuteResponse>,
@@ -313,8 +296,6 @@ pub enum ExecuteResponse {
     CreatedSink,
     /// The requested source was created.
     CreatedSource,
-    /// The requested sources were created.
-    CreatedSources,
     /// The requested table was created.
     CreatedTable,
     /// The requested view was created.
@@ -349,6 +330,7 @@ pub enum ExecuteResponse {
         count: Option<FetchDirection>,
         /// How long to wait for results to arrive.
         timeout: ExecuteTimeout,
+        ctx_extra: ExecuteContextExtra,
     },
     /// The requested privilege was granted.
     GrantedPrivilege,
@@ -370,9 +352,10 @@ pub enum ExecuteResponse {
     SendingRows {
         #[derivative(Debug = "ignore")]
         future: RowsFuture,
-        #[derivative(Debug = "ignore")]
-        span: tracing::Span,
     },
+    /// Like `SendingRows`, but the rows are known to be available
+    /// immediately, and thus the execution is considered ended in the coordinator.
+    SendingRowsImmediate { rows: Vec<Row> },
     /// The specified variable was set to a new value.
     SetVariable {
         name: String,
@@ -383,7 +366,10 @@ pub enum ExecuteResponse {
     StartedTransaction,
     /// Updates to the requested source or view will be streamed to the
     /// contained receiver.
-    Subscribing { rx: RowBatchStream },
+    Subscribing {
+        rx: RowBatchStream,
+        ctx_extra: ExecuteContextExtra,
+    },
     /// The active transaction committed.
     TransactionCommitted {
         /// Session parameters that changed because the transaction ended.
@@ -396,6 +382,121 @@ pub enum ExecuteResponse {
     },
     /// The specified number of rows were updated in the requested table.
     Updated(usize),
+    /// A connection was validated.
+    ValidatedConnection,
+}
+
+impl TryFrom<&Statement<Raw>> for ExecuteResponse {
+    type Error = ();
+
+    /// Returns Ok if this Statement always produces a single, trivial ExecuteResponse.
+    fn try_from(stmt: &Statement<Raw>) -> Result<Self, Self::Error> {
+        let resp_kinds = Plan::generated_from(&stmt.into())
+            .iter()
+            .map(ExecuteResponse::generated_from)
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<ExecuteResponseKind>>();
+        let resps = resp_kinds
+            .iter()
+            .map(|r| (*r).try_into())
+            .collect::<Result<Vec<ExecuteResponse>, _>>();
+        // Check if this statement's possible plans yield exactly one possible ExecuteResponse.
+        if let Ok(resps) = resps {
+            if resps.len() == 1 {
+                return Ok(resps.into_element());
+            }
+        }
+        let resp = match stmt {
+            Statement::DropObjects(DropObjectsStatement { object_type, .. }) => {
+                ExecuteResponse::DroppedObject((*object_type).into())
+            }
+            Statement::AlterObjectRename(AlterObjectRenameStatement { object_type, .. })
+            | Statement::AlterOwner(AlterOwnerStatement { object_type, .. }) => {
+                ExecuteResponse::AlteredObject((*object_type).into())
+            }
+            _ => return Err(()),
+        };
+        // Ensure that if the planner ever adds possible plans we complain here.
+        soft_assert_no_log!(
+            resp_kinds.len() == 1
+                && resp_kinds.first().expect("must exist") == &ExecuteResponseKind::from(&resp),
+            "ExecuteResponses out of sync with planner"
+        );
+        Ok(resp)
+    }
+}
+
+impl TryInto<ExecuteResponse> for ExecuteResponseKind {
+    type Error = ();
+
+    /// Attempts to convert into an ExecuteResponse. Returns an error if not possible without
+    /// actually executing a statement.
+    fn try_into(self) -> Result<ExecuteResponse, Self::Error> {
+        match self {
+            ExecuteResponseKind::AlteredDefaultPrivileges => {
+                Ok(ExecuteResponse::AlteredDefaultPrivileges)
+            }
+            ExecuteResponseKind::AlteredObject => Err(()),
+            ExecuteResponseKind::AlteredIndexLogicalCompaction => {
+                Ok(ExecuteResponse::AlteredIndexLogicalCompaction)
+            }
+            ExecuteResponseKind::AlteredRole => Ok(ExecuteResponse::AlteredRole),
+            ExecuteResponseKind::AlteredSystemConfiguration => {
+                Ok(ExecuteResponse::AlteredSystemConfiguration)
+            }
+            ExecuteResponseKind::ClosedCursor => Ok(ExecuteResponse::ClosedCursor),
+            ExecuteResponseKind::Comment => Ok(ExecuteResponse::Comment),
+            ExecuteResponseKind::Copied => Err(()),
+            ExecuteResponseKind::CopyTo => Err(()),
+            ExecuteResponseKind::CopyFrom => Err(()),
+            ExecuteResponseKind::CreatedConnection => Ok(ExecuteResponse::CreatedConnection),
+            ExecuteResponseKind::CreatedDatabase => Ok(ExecuteResponse::CreatedDatabase),
+            ExecuteResponseKind::CreatedSchema => Ok(ExecuteResponse::CreatedSchema),
+            ExecuteResponseKind::CreatedRole => Ok(ExecuteResponse::CreatedRole),
+            ExecuteResponseKind::CreatedCluster => Ok(ExecuteResponse::CreatedCluster),
+            ExecuteResponseKind::CreatedClusterReplica => {
+                Ok(ExecuteResponse::CreatedClusterReplica)
+            }
+            ExecuteResponseKind::CreatedIndex => Ok(ExecuteResponse::CreatedIndex),
+            ExecuteResponseKind::CreatedSecret => Ok(ExecuteResponse::CreatedSecret),
+            ExecuteResponseKind::CreatedSink => Ok(ExecuteResponse::CreatedSink),
+            ExecuteResponseKind::CreatedSource => Ok(ExecuteResponse::CreatedSource),
+            ExecuteResponseKind::CreatedTable => Ok(ExecuteResponse::CreatedTable),
+            ExecuteResponseKind::CreatedView => Ok(ExecuteResponse::CreatedView),
+            ExecuteResponseKind::CreatedViews => Ok(ExecuteResponse::CreatedViews),
+            ExecuteResponseKind::CreatedMaterializedView => {
+                Ok(ExecuteResponse::CreatedMaterializedView)
+            }
+            ExecuteResponseKind::CreatedType => Ok(ExecuteResponse::CreatedType),
+            ExecuteResponseKind::Deallocate => Err(()),
+            ExecuteResponseKind::DeclaredCursor => Ok(ExecuteResponse::DeclaredCursor),
+            ExecuteResponseKind::Deleted => Err(()),
+            ExecuteResponseKind::DiscardedTemp => Ok(ExecuteResponse::DiscardedTemp),
+            ExecuteResponseKind::DiscardedAll => Ok(ExecuteResponse::DiscardedAll),
+            ExecuteResponseKind::DroppedObject => Err(()),
+            ExecuteResponseKind::DroppedOwned => Ok(ExecuteResponse::DroppedOwned),
+            ExecuteResponseKind::EmptyQuery => Ok(ExecuteResponse::EmptyQuery),
+            ExecuteResponseKind::Fetch => Err(()),
+            ExecuteResponseKind::GrantedPrivilege => Ok(ExecuteResponse::GrantedPrivilege),
+            ExecuteResponseKind::GrantedRole => Ok(ExecuteResponse::GrantedRole),
+            ExecuteResponseKind::Inserted => Err(()),
+            ExecuteResponseKind::Prepare => Ok(ExecuteResponse::Prepare),
+            ExecuteResponseKind::Raised => Ok(ExecuteResponse::Raised),
+            ExecuteResponseKind::ReassignOwned => Ok(ExecuteResponse::ReassignOwned),
+            ExecuteResponseKind::RevokedPrivilege => Ok(ExecuteResponse::RevokedPrivilege),
+            ExecuteResponseKind::RevokedRole => Ok(ExecuteResponse::RevokedRole),
+            ExecuteResponseKind::SendingRows => Err(()),
+            ExecuteResponseKind::SetVariable => Err(()),
+            ExecuteResponseKind::StartedTransaction => Ok(ExecuteResponse::StartedTransaction),
+            ExecuteResponseKind::Subscribing => Err(()),
+            ExecuteResponseKind::TransactionCommitted => Err(()),
+            ExecuteResponseKind::TransactionRolledBack => Err(()),
+            ExecuteResponseKind::Updated => Err(()),
+            ExecuteResponseKind::ValidatedConnection => Ok(ExecuteResponse::ValidatedConnection),
+            ExecuteResponseKind::SendingRowsImmediate => Err(()),
+        }
+    }
 }
 
 impl ExecuteResponse {
@@ -407,8 +508,9 @@ impl ExecuteResponse {
             AlteredIndexLogicalCompaction => Some("ALTER INDEX".into()),
             AlteredRole => Some("ALTER ROLE".into()),
             AlteredSystemConfiguration => Some("ALTER SYSTEM".into()),
-            Canceled => None,
             ClosedCursor => Some("CLOSE CURSOR".into()),
+            Comment => Some("COMMENT".into()),
+            Copied(n) => Some(format!("COPY {}", n)),
             CopyTo { .. } => None,
             CopyFrom { .. } => None,
             CreatedConnection { .. } => Some("CREATE CONNECTION".into()),
@@ -421,7 +523,6 @@ impl ExecuteResponse {
             CreatedSecret { .. } => Some("CREATE SECRET".into()),
             CreatedSink { .. } => Some("CREATE SINK".into()),
             CreatedSource { .. } => Some("CREATE SOURCE".into()),
-            CreatedSources => Some("CREATE SOURCES".into()),
             CreatedTable { .. } => Some("CREATE TABLE".into()),
             CreatedView { .. } => Some("CREATE VIEW".into()),
             CreatedViews { .. } => Some("CREATE VIEWS".into()),
@@ -453,7 +554,7 @@ impl ExecuteResponse {
             ReassignOwned => Some("REASSIGN OWNED".into()),
             RevokedPrivilege => Some("REVOKE".into()),
             RevokedRole => Some("REVOKE ROLE".into()),
-            SendingRows { .. } => None,
+            SendingRows { .. } | SendingRowsImmediate { .. } => None,
             SetVariable { reset: true, .. } => Some("RESET".into()),
             SetVariable { reset: false, .. } => Some("SET".into()),
             StartedTransaction { .. } => Some("BEGIN".into()),
@@ -461,81 +562,97 @@ impl ExecuteResponse {
             TransactionCommitted { .. } => Some("COMMIT".into()),
             TransactionRolledBack { .. } => Some("ROLLBACK".into()),
             Updated(n) => Some(format!("UPDATE {}", n)),
+            ValidatedConnection => Some("VALIDATE CONNECTION".into()),
         }
     }
 
-    /// Expresses which [`PlanKind`] generate which set of
-    /// [`ExecuteResponseKind`].
-    pub fn generated_from(plan: PlanKind) -> Vec<ExecuteResponseKind> {
+    /// Expresses which [`PlanKind`] generate which set of [`ExecuteResponseKind`].
+    /// `ExecuteResponseKind::Canceled` could be generated at any point as well, but that is
+    /// excluded from this function.
+    pub fn generated_from(plan: &PlanKind) -> &'static [ExecuteResponseKind] {
         use ExecuteResponseKind::*;
         use PlanKind::*;
 
         match plan {
-            AbortTransaction => vec![TransactionRolledBack],
+            AbortTransaction => &[TransactionRolledBack],
             AlterClusterRename
+            | AlterClusterSwap
             | AlterCluster
             | AlterClusterReplicaRename
             | AlterOwner
             | AlterItemRename
+            | AlterItemSwap
             | AlterNoop
+            | AlterSchemaRename
+            | AlterSchemaSwap
             | AlterSecret
-            | AlterSink
+            | AlterConnection
             | AlterSource
-            | RotateKeys => {
-                vec![AlteredObject]
-            }
-            AlterDefaultPrivileges => vec![AlteredDefaultPrivileges],
+            | PurifiedAlterSource => &[AlteredObject],
+            AlterDefaultPrivileges => &[AlteredDefaultPrivileges],
+            AlterSetCluster => &[AlteredObject],
             AlterIndexSetOptions | AlterIndexResetOptions => {
-                vec![AlteredObject, AlteredIndexLogicalCompaction]
+                &[AlteredObject, AlteredIndexLogicalCompaction]
             }
-            AlterRole => vec![AlteredRole],
+            AlterRole => &[AlteredRole],
             AlterSystemSet | AlterSystemReset | AlterSystemResetAll => {
-                vec![AlteredSystemConfiguration]
+                &[AlteredSystemConfiguration]
             }
-            Close => vec![ClosedCursor],
-            PlanKind::CopyFrom => vec![ExecuteResponseKind::CopyFrom],
-            CommitTransaction => vec![TransactionCommitted, TransactionRolledBack],
-            CreateConnection => vec![CreatedConnection],
-            CreateDatabase => vec![CreatedDatabase],
-            CreateSchema => vec![CreatedSchema],
-            CreateRole => vec![CreatedRole],
-            CreateCluster => vec![CreatedCluster],
-            CreateClusterReplica => vec![CreatedClusterReplica],
-            CreateSource | CreateSources => vec![CreatedSource, CreatedSources],
-            CreateSecret => vec![CreatedSecret],
-            CreateSink => vec![CreatedSink],
-            CreateTable => vec![CreatedTable],
-            CreateView => vec![CreatedView],
-            CreateMaterializedView => vec![CreatedMaterializedView],
-            CreateIndex => vec![CreatedIndex],
-            CreateType => vec![CreatedType],
-            PlanKind::Deallocate => vec![ExecuteResponseKind::Deallocate],
-            Declare => vec![DeclaredCursor],
-            DiscardTemp => vec![DiscardedTemp],
-            DiscardAll => vec![DiscardedAll],
-            DropObjects => vec![DroppedObject],
-            DropOwned => vec![DroppedOwned],
-            PlanKind::EmptyQuery => vec![ExecuteResponseKind::EmptyQuery],
-            Explain | Peek | ShowAllVariables | ShowCreate | ShowVariable => {
-                vec![CopyTo, SendingRows]
-            }
-            Execute | ReadThenWrite => vec![Deleted, Inserted, SendingRows, Updated],
-            PlanKind::Fetch => vec![ExecuteResponseKind::Fetch],
-            GrantPrivileges => vec![GrantedPrivilege],
-            GrantRole => vec![GrantedRole],
-            CopyRows => vec![Inserted],
-            Insert => vec![Inserted, SendingRows],
-            PlanKind::Prepare => vec![ExecuteResponseKind::Prepare],
-            PlanKind::Raise => vec![ExecuteResponseKind::Raised],
-            PlanKind::ReassignOwned => vec![ExecuteResponseKind::ReassignOwned],
-            RevokePrivileges => vec![RevokedPrivilege],
-            RevokeRole => vec![RevokedRole],
+            Close => &[ClosedCursor],
+            PlanKind::CopyFrom => &[ExecuteResponseKind::CopyFrom],
+            PlanKind::CopyTo => &[ExecuteResponseKind::Copied],
+            PlanKind::Comment => &[ExecuteResponseKind::Comment],
+            CommitTransaction => &[TransactionCommitted, TransactionRolledBack],
+            CreateConnection => &[CreatedConnection],
+            CreateDatabase => &[CreatedDatabase],
+            CreateSchema => &[CreatedSchema],
+            CreateRole => &[CreatedRole],
+            CreateCluster => &[CreatedCluster],
+            CreateClusterReplica => &[CreatedClusterReplica],
+            CreateSource | CreateSources => &[CreatedSource],
+            CreateSecret => &[CreatedSecret],
+            CreateSink => &[CreatedSink],
+            CreateTable => &[CreatedTable],
+            CreateView => &[CreatedView],
+            CreateMaterializedView => &[CreatedMaterializedView],
+            CreateIndex => &[CreatedIndex],
+            CreateType => &[CreatedType],
+            PlanKind::Deallocate => &[ExecuteResponseKind::Deallocate],
+            Declare => &[DeclaredCursor],
+            DiscardTemp => &[DiscardedTemp],
+            DiscardAll => &[DiscardedAll],
+            DropObjects => &[DroppedObject],
+            DropOwned => &[DroppedOwned],
+            PlanKind::EmptyQuery => &[ExecuteResponseKind::EmptyQuery],
+            ExplainPlan | ExplainPushdown | ExplainTimestamp | Select | ShowAllVariables
+            | ShowCreate | ShowColumns | ShowVariable | InspectShard | ExplainSinkSchema => &[
+                ExecuteResponseKind::CopyTo,
+                SendingRows,
+                SendingRowsImmediate,
+            ],
+            Execute | ReadThenWrite => &[
+                Deleted,
+                Inserted,
+                SendingRows,
+                SendingRowsImmediate,
+                Updated,
+            ],
+            PlanKind::Fetch => &[ExecuteResponseKind::Fetch],
+            GrantPrivileges => &[GrantedPrivilege],
+            GrantRole => &[GrantedRole],
+            Insert => &[Inserted, SendingRowsImmediate],
+            PlanKind::Prepare => &[ExecuteResponseKind::Prepare],
+            PlanKind::Raise => &[ExecuteResponseKind::Raised],
+            PlanKind::ReassignOwned => &[ExecuteResponseKind::ReassignOwned],
+            RevokePrivileges => &[RevokedPrivilege],
+            RevokeRole => &[RevokedRole],
             PlanKind::SetVariable | ResetVariable | PlanKind::SetTransaction => {
-                vec![ExecuteResponseKind::SetVariable]
+                &[ExecuteResponseKind::SetVariable]
             }
-            PlanKind::Subscribe => vec![Subscribing, CopyTo],
-            StartTransaction => vec![StartedTransaction],
-            SideEffectingFunc => vec![SendingRows],
+            PlanKind::Subscribe => &[Subscribing, ExecuteResponseKind::CopyTo],
+            StartTransaction => &[StartedTransaction],
+            SideEffectingFunc => &[SendingRows, SendingRowsImmediate],
+            ValidateConnection => &[ExecuteResponseKind::ValidatedConnection],
         }
     }
 }
@@ -548,14 +665,4 @@ impl Transmittable for ExecuteResponse {
     fn to_allowed(&self) -> Self::Allowed {
         ExecuteResponseKind::from(self)
     }
-}
-
-/// The state of a cancellation request.
-#[derive(Debug, Clone, Copy)]
-pub enum Canceled {
-    /// A cancellation request has occurred.
-    Canceled,
-    /// No cancellation request has yet occurred, or a previous request has been
-    /// cleared.
-    NotCanceled,
 }

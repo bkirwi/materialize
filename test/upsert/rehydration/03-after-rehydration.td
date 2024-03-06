@@ -28,7 +28,7 @@ $ set schema={
 > SELECT * from upsert
 key           f1       f2
 ---------------------------
-fish          fish     1000
+fish          fish     1001
 birdmore      geese    56
 mammalmore    moose    2
 
@@ -36,21 +36,22 @@ mammalmore    moose    2
 # byte count could be lower or higher than before restarting,
 # as rehydration has to store values differently.
 > SELECT
-    SUM(u.envelope_state_bytes) > 0,
-    SUM(u.envelope_state_count)
+    SUM(u.bytes_indexed) > 0,
+    SUM(u.records_indexed),
+    bool_and(u.rehydration_latency IS NOT NULL)
   FROM mz_sources s
-  JOIN mz_internal.mz_source_statistics u ON s.id = u.id
+  JOIN mz_internal.mz_source_statistics_raw u ON s.id = u.id
   WHERE s.name IN ('upsert')
   GROUP BY s.name
   ORDER BY s.name
-true 3
+true 3 true
 
 # Save the size of the rehydrated state.
 $ set-from-sql var=rehydrated-state-bytes
 SELECT
-    (SUM(u.envelope_state_bytes))::text
+    (SUM(u.bytes_indexed))::text
   FROM mz_sources s
-  JOIN mz_internal.mz_source_statistics u ON s.id = u.id
+  JOIN mz_internal.mz_source_statistics_raw u ON s.id = u.id
   WHERE s.name IN ('upsert')
 
 # Ensure we process updates correctly.
@@ -72,10 +73,10 @@ mammalmore    moose               2
 # This is also != because different implementations use
 # space differently during rehydration and normal operation.
 > SELECT
-    SUM(u.envelope_state_bytes) != ${rehydrated-state-bytes},
-    SUM(u.envelope_state_count)
+    SUM(u.bytes_indexed) != ${rehydrated-state-bytes},
+    SUM(u.records_indexed)
   FROM mz_sources s
-  JOIN mz_internal.mz_source_statistics u ON s.id = u.id
+  JOIN mz_internal.mz_source_statistics_raw u ON s.id = u.id
   WHERE s.name IN ('upsert')
   GROUP BY s.name
   ORDER BY s.name
@@ -83,19 +84,19 @@ true 3
 
 $ set-from-sql var=state-bytes
 SELECT
-    (SUM(u.envelope_state_bytes))::text
+    (SUM(u.bytes_indexed))::text
   FROM mz_sources s
-  JOIN mz_internal.mz_source_statistics u ON s.id = u.id
+  JOIN mz_internal.mz_source_statistics_raw u ON s.id = u.id
   WHERE s.name IN ('upsert')
 
 $ kafka-ingest format=avro topic=upsert key-format=avro key-schema=${keyschema} schema=${schema}
 {"key": "fish"} {"f1": "MUCHMUCHMUCHLONGERVALUE", "f2": 9000}
 
 > SELECT
-    SUM(u.envelope_state_bytes) > ${state-bytes},
-    SUM(u.envelope_state_count)
+    SUM(u.bytes_indexed) > ${state-bytes},
+    SUM(u.records_indexed)
   FROM mz_sources s
-  JOIN mz_internal.mz_source_statistics u ON s.id = u.id
+  JOIN mz_internal.mz_source_statistics_raw u ON s.id = u.id
   WHERE s.name IN ('upsert')
   GROUP BY s.name
   ORDER BY s.name
@@ -113,9 +114,9 @@ birdmore      geese               56
 mammalmore    moose               2
 
 > SELECT
-    SUM(u.envelope_state_count)
+    SUM(u.records_indexed)
   FROM mz_sources s
-  JOIN mz_internal.mz_source_statistics u ON s.id = u.id
+  JOIN mz_internal.mz_source_statistics_raw u ON s.id = u.id
   WHERE s.name IN ('upsert')
   GROUP BY s.name
   ORDER BY s.name

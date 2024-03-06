@@ -33,10 +33,14 @@
 //!     .filter(vec![predicate2.clone()]);
 //!
 //! // .transform() will deduplicate any predicates
-//! use mz_transform::{Transform, TransformArgs};
-//! Filter.transform(&mut expr, TransformArgs {
+//! use mz_transform::{Transform, TransformCtx};
+//! use mz_transform::dataflow::DataflowMetainfo;
+//! Filter.transform(&mut expr, &mut TransformCtx {
 //!   indexes: &mz_transform::EmptyIndexOracle,
+//!   stats: &mz_transform::EmptyStatisticsOracle,
 //!   global_id: None,
+//!   enable_eager_delta_joins: false,
+//!   dataflow_metainfo: &mut DataflowMetainfo::default(),
 //! });
 //!
 //! let correct = input.filter(vec![predicate0]);
@@ -44,28 +48,26 @@
 //! assert_eq!(expr, correct);
 //! ```
 
-use mz_expr::visit::Visit;
 use mz_expr::MirRelationExpr;
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Fuses multiple `Filter` operators into one and deduplicates predicates.
 #[derive(Debug)]
 pub struct Filter;
 
 impl crate::Transform for Filter {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "filter_fusion")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
-        relation.visit_mut_pre(&mut Self::action)?;
+        relation.visit_pre_mut(Self::action);
         mz_repr::explain::trace_plan(&*relation);
         Ok(())
     }

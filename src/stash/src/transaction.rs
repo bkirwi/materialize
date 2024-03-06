@@ -12,39 +12,41 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use futures::future::join_all;
+use futures::FutureExt;
 use futures::{
     future::{self, try_join, try_join3, try_join_all, BoxFuture},
     TryFutureExt,
 };
+use mz_ore::metrics::MetricsFutureExt;
 use mz_ore::{cast::CastFrom, collections::CollectionExt};
+use mz_stash_types::{InternalStashError, StashError};
 use timely::progress::Antichain;
 use timely::PartialOrder;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_postgres::{types::ToSql, Client};
 
 use crate::postgres::{ConsolidateRequest, CountedStatements};
-use crate::{
-    AntichainFormatter, AppendBatch, Data, Diff, Id, InternalStashError, Stash, StashCollection,
-    StashError, Timestamp,
-};
+use crate::{AntichainFormatter, AppendBatch, Data, Diff, Id, Stash, StashCollection, Timestamp};
 
-// The limit AFTER which to split an update batch (that is, we will ship an update that
-// exceeds this number, but then start another batch).
-//
-// Cockroach's default limit for sql.conn.max_read_buffer_message_size is 16MiB
-// (https://github.com/cockroachdb/cockroach/blob/7e4e0b195cd61da6cd7a719a5b9aa2e84f68d475/pkg/sql/pgwire/pgwirebase/encoding.go#L50).
-// Use a number well under that but still big ish that most things won't ever need to
-// batch. Because we are only estimating the value size and ignoring various other
-// things that contribute to the total pgwire message size, having a 14MiB headspace
-// seems safe here.
+/// The limit AFTER which to split an update batch (that is, we will ship an update that
+/// exceeds this number, but then start another batch).
+///
+/// Cockroach's default limit for sql.conn.max_read_buffer_message_size is 16MiB
+/// <https://github.com/cockroachdb/cockroach/blob/7e4e0b195cd61da6cd7a719a5b9aa2e84f68d475/pkg/sql/pgwire/pgwirebase/encoding.go#L50>.
+/// Use a number well under that but still big ish that most things won't ever need to
+/// batch. Because we are only estimating the value size and ignoring various other
+/// things that contribute to the total pgwire message size, having a 14MiB headspace
+/// seems safe here.
 pub const INSERT_BATCH_SPLIT_SIZE: usize = 2 * 1024 * 1024;
 
 /// [`tokio_postgres`] has a maximum number of arguments it supports when executing a query. This
 /// is the limit at which to split a batch to make sure we don't try to include too many elements
 /// in any one update.
-pub const MAX_INSERT_ARGUMENTS: u16 = u16::MAX / 4;
+pub(crate) const MAX_INSERT_ARGUMENTS: u16 = u16::MAX / 4;
 
 impl Stash {
+    /// Transactionally executes closure `f`.
     pub async fn with_transaction<F, T>(&mut self, f: F) -> Result<T, StashError>
     where
         F: FnOnce(Transaction) -> BoxFuture<Result<T, StashError>> + Clone + Sync + Send + 'static,
@@ -145,7 +147,7 @@ impl<'a> Transaction<'a> {
         res
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[mz_ore::instrument(level = "debug")]
     pub async fn collection<K, V>(&self, name: &str) -> Result<StashCollection<K, V>, StashError>
     where
         K: Data,
@@ -155,9 +157,12 @@ impl<'a> Transaction<'a> {
             return Ok(StashCollection::new(*id));
         }
 
+        let (statement, histogram) = self.stmts.collection();
         let collection_id_opt: Option<_> = self
             .client
-            .query_one(self.stmts.collection(), &[&name])
+            .query_one(statement, &[&name])
+            .wall_time()
+            .observe(histogram)
             .await
             .map(|row| row.get("collection_id"))
             .ok();
@@ -197,7 +202,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Returns the ids and names of all collections.
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[mz_ore::instrument(level = "debug")]
     pub async fn collections(&self) -> Result<BTreeMap<Id, String>, StashError> {
         let rows = self
             .client
@@ -209,27 +214,9 @@ impl<'a> Transaction<'a> {
         Ok(BTreeMap::from_iter(names))
     }
 
-    /// Returns the raw sealed rows as serialized protobuf, not consolidated.
-    #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn peek_raw(
-        &self,
-        id: Id,
-    ) -> Result<impl Iterator<Item = ((Vec<u8>, Vec<u8>), Diff)>, StashError> {
-        let peek_timestamp = self.peek_timestamp_id(id).await?;
-        Ok(self
-            .iter_raw(id)
-            .await?
-            .filter_map(move |((k, v), time, diff)| {
-                if time.less_equal(&peek_timestamp) {
-                    Some(((k, v), diff))
-                } else {
-                    None
-                }
-            }))
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn consolidate(&self, id: Id) -> Result<(), StashError> {
+    // TODO(jkosh44) Only used in tests.
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn consolidate(&self, id: Id) -> Result<(), StashError> {
         let since = self.since(id).await?;
         self.consolidations
             .send(ConsolidateRequest {
@@ -241,16 +228,22 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn upper(&self, collection_id: Id) -> Result<Antichain<Timestamp>, StashError> {
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn upper(
+        &self,
+        collection_id: Id,
+    ) -> Result<Antichain<Timestamp>, StashError> {
         // We can't use .entry here because that would require holding the
         // MutexGuard across the .await.
         if let Some(entry) = self.uppers.lock().unwrap().get(&collection_id) {
             return Ok(entry.clone());
         }
+        let (statement, histogram) = self.stmts.upper();
         let upper: Option<Timestamp> = self
             .client
-            .query_one(self.stmts.upper(), &[&collection_id])
+            .query_one(statement, &[&collection_id])
+            .wall_time()
+            .observe(histogram)
             .await?
             .get("upper");
         let upper = Antichain::from_iter(upper);
@@ -258,15 +251,21 @@ impl<'a> Transaction<'a> {
         Ok(upper)
     }
 
-    pub async fn since(&self, collection_id: Id) -> Result<Antichain<Timestamp>, StashError> {
+    pub(crate) async fn since(
+        &self,
+        collection_id: Id,
+    ) -> Result<Antichain<Timestamp>, StashError> {
         // We can't use .entry here because that would require holding the
         // MutexGuard across the .await.
         if let Some(entry) = self.sinces.lock().unwrap().get(&collection_id) {
             return Ok(entry.clone());
         }
+        let (statement, histogram) = self.stmts.since();
         let since: Option<Timestamp> = self
             .client
-            .query_one(self.stmts.since(), &[&collection_id])
+            .query_one(statement, &[&collection_id])
+            .wall_time()
+            .observe(histogram)
             .await?
             .get("since");
         let since = Antichain::from_iter(since);
@@ -274,27 +273,8 @@ impl<'a> Transaction<'a> {
         Ok(since)
     }
 
-    /// Returns sinces for the requested collections.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn sinces_batch(
-        &self,
-        collections: &[Id],
-    ) -> Result<BTreeMap<Id, Antichain<Timestamp>>, StashError> {
-        let mut futures = Vec::with_capacity(collections.len());
-        for collection_id in collections {
-            futures.push(async move {
-                let since = self.since(*collection_id).await?;
-                // Without this type assertion, we get a "type inside `async fn` body must be
-                // known in this context" error.
-                Result::<_, StashError>::Ok((*collection_id, since))
-            });
-        }
-        let sinces = BTreeMap::from_iter(try_join_all(futures).await?);
-        Ok(sinces)
-    }
-
     /// Iterates over a collection.
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[mz_ore::instrument(level = "debug")]
     pub async fn iter<K, V>(
         &self,
         collection: StashCollection<K, V>,
@@ -321,8 +301,8 @@ impl<'a> Transaction<'a> {
     }
 
     /// Iterates over a collection, returning the raw data on disk, unconsolidated.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn iter_raw(
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn iter_raw(
         &self,
         id: Id,
     ) -> Result<impl Iterator<Item = ((Vec<u8>, Vec<u8>), Timestamp, Diff)>, StashError> {
@@ -334,9 +314,12 @@ impl<'a> Transaction<'a> {
                 ));
             }
         };
+        let (statement, histogram) = self.stmts.iter();
         let rows = self
             .client
-            .query(self.stmts.iter(), &[&id])
+            .query(statement, &[&id])
+            .wall_time()
+            .observe(histogram)
             .await?
             .into_iter()
             .map(move |row| {
@@ -350,8 +333,8 @@ impl<'a> Transaction<'a> {
     }
 
     /// Iterates over the values of a key.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn iter_key<K, V>(
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn iter_key<K, V>(
         &self,
         collection: StashCollection<K, V>,
         key: &K,
@@ -361,11 +344,14 @@ impl<'a> Transaction<'a> {
         V: Data,
     {
         let key = key.encode_to_vec();
+        let (statement, histogram) = self.stmts.iter_key();
         let (since, rows) = future::try_join(
             self.since(collection.id),
             self.client
-                .query(self.stmts.iter_key(), &[&collection.id, &key])
-                .map_err(|err| err.into()),
+                .query(statement, &[&collection.id, &key])
+                .map_err(|err| err.into())
+                .wall_time()
+                .observe(histogram),
         )
         .await?;
         let since = match since.into_option() {
@@ -391,8 +377,8 @@ impl<'a> Transaction<'a> {
     }
 
     /// Returns the most recent timestamp at which sealed entries can be read.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn peek_timestamp_id(&self, id: Id) -> Result<Timestamp, StashError> {
+    #[mz_ore::instrument(level = "debug")]
+    async fn peek_timestamp_id(&self, id: Id) -> Result<Timestamp, StashError> {
         let (since, upper) = try_join(self.since(id), self.upper(id)).await?;
         if PartialOrder::less_equal(&upper, &since) {
             return Err(StashError {
@@ -414,8 +400,8 @@ impl<'a> Transaction<'a> {
     }
 
     /// Returns the most recent timestamp at which sealed entries can be read.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn peek_timestamp<K, V>(
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn peek_timestamp<K, V>(
         &self,
         collection: StashCollection<K, V>,
     ) -> Result<Timestamp, StashError>
@@ -433,8 +419,8 @@ impl<'a> Transaction<'a> {
     ///
     /// Sealed entries are those with timestamps less than the collection's upper
     /// frontier.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn peek<K, V>(
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn peek<K, V>(
         &self,
         collection: StashCollection<K, V>,
     ) -> Result<Vec<(K, V, Diff)>, StashError>
@@ -464,7 +450,7 @@ impl<'a> Transaction<'a> {
     ///
     /// Sealed entries are those with timestamps less than the collection's upper
     /// frontier.
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[mz_ore::instrument(level = "debug")]
     pub async fn peek_one<K, V>(
         &self,
         collection: StashCollection<K, V>,
@@ -477,7 +463,7 @@ impl<'a> Transaction<'a> {
         let mut res = BTreeMap::new();
         for (k, v, diff) in rows {
             if diff != 1 {
-                return Err("unexpected peek multiplicity".into());
+                return Err(format!("unexpected peek multiplicity of {diff}").into());
             }
             if res.insert(k, v).is_some() {
                 return Err(format!("duplicate peek keys for collection {}", collection.id).into());
@@ -491,7 +477,7 @@ impl<'a> Transaction<'a> {
     ///
     /// Sealed entries are those with timestamps less than the collection's upper
     /// frontier.
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[mz_ore::instrument(level = "debug")]
     pub async fn peek_key_one<K, V>(
         &self,
         collection: StashCollection<K, V>,
@@ -532,10 +518,13 @@ impl<'a> Transaction<'a> {
 
     /// Applies batches to the current transaction. If any batch fails and in
     /// error returned, all other applications are rolled back.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn append(&self, batches: Vec<AppendBatch>) -> Result<(), StashError> {
+    #[mz_ore::instrument(level = "debug")]
+    pub async fn append(
+        &self,
+        batches: Vec<AppendBatch>,
+    ) -> Result<BoxFuture<'static, ()>, StashError> {
         if batches.is_empty() {
-            return Ok(());
+            return Ok(Box::pin(futures::future::ready(())));
         }
 
         let consolidations = self
@@ -581,11 +570,15 @@ impl<'a> Transaction<'a> {
                                     },
                                 )
                                 .await?;
-                            Ok::<_, StashError>(ConsolidateRequest {
+
+                            let (tx, rx) = oneshot::channel();
+                            let request = ConsolidateRequest {
                                 id: collection_id,
                                 since: self.since(collection_id).await?,
-                                done: None,
-                            })
+                                done: Some(tx),
+                            };
+
+                            Ok::<_, StashError>((request, rx))
                         },
                     );
                     try_join_all(futures).await
@@ -593,15 +586,19 @@ impl<'a> Transaction<'a> {
             })
             .await?;
 
-        for cons in consolidations {
-            self.consolidations.send(cons).unwrap();
+        let mut notifs = Vec::with_capacity(consolidations.len());
+        for (req, notif) in consolidations {
+            self.consolidations.send(req).unwrap();
+            notifs.push(notif);
         }
-        Ok(())
+
+        // Note: we ignore the result of the Consolidation requests because consolidation cannot fail.
+        Ok(Box::pin(join_all(notifs).map(|_| ())))
     }
 
     /// Like update, but starts a savepoint.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn update_savepoint<K, V>(
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn update_savepoint<K, V>(
         &self,
         collection_id: Id,
         entries: &[((K, V), Timestamp, Diff)],
@@ -625,15 +622,15 @@ impl<'a> Transaction<'a> {
         .await
     }
 
-    /// Directly add k, v, ts, diff tuples to a collection.`upper` can be `Some`
+    /// Directly add k, v, ts, diff tuples to a collection. `upper` can be `Some`
     /// if the collection's upper is already known. Caller must have already
     /// called in_savepoint.
     ///
     /// This function should not be called outside of the stash crate since it
     /// allows for arbitrary bytes, non-unit diffs in collections, and doesn't
     /// support transaction safety. Use `TypedCollection`'s methods instead.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn update(
+    #[mz_ore::instrument(level = "debug")]
+    async fn update(
         &self,
         collection_id: Id,
         entries: &[((Vec<u8>, Vec<u8>), Timestamp, Diff)],
@@ -706,8 +703,8 @@ impl<'a> Transaction<'a> {
 
     /// Sets the since of a collection. The current upper can be `Some` if it is
     /// already known.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn compact<'ts>(
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn compact<'ts>(
         &self,
         id: Id,
         new_since: &'ts Antichain<Timestamp>,
@@ -744,9 +741,12 @@ impl<'a> Transaction<'a> {
         .await?;
 
         // If successful, execute the change in the txn.
+        let (statement, histogram) = self.stmts.compact();
         self.client
-            .execute(self.stmts.compact(), &[&new_since.as_option(), &id])
+            .execute(statement, &[&new_since.as_option(), &id])
             .map_err(StashError::from)
+            .wall_time()
+            .observe(histogram)
             .await?;
         maybe_update_antichain(&self.sinces, id, new_since.clone());
         Ok(())
@@ -754,8 +754,8 @@ impl<'a> Transaction<'a> {
 
     /// Sets the upper of a collection. The current upper can be `Some` if it is
     /// already known.
-    #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn seal(
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn seal(
         &self,
         id: Id,
         new_upper: Antichain<Timestamp>,
@@ -773,19 +773,22 @@ impl<'a> Transaction<'a> {
             )));
         }
 
+        let (statement, histogram) = self.stmts.seal();
         self.client
-            .execute(self.stmts.seal(), &[&new_upper.as_option(), &id])
+            .execute(statement, &[&new_upper.as_option(), &id])
             .map_err(StashError::from)
+            .wall_time()
+            .observe(histogram)
             .await?;
         maybe_update_antichain(&self.uppers, id, new_upper);
         Ok(())
     }
 }
 
-// Updates an antichain cache if the new value has advanced. Needed because the
-// functions here are often called in try_joins where the futures execute in
-// unknown order and we want to prevent a race condition poisioning the cache by
-// going backward.
+/// Updates an antichain cache if the new value has advanced. Needed because the
+/// functions here are often called in try_joins where the futures execute in
+/// unknown order and we want to prevent a race condition poisioning the cache by
+/// going backward.
 fn maybe_update_antichain(
     map: &Arc<Mutex<BTreeMap<Id, Antichain<Timestamp>>>>,
     id: Id,

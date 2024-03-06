@@ -1,11 +1,17 @@
 // Copyright Materialize, Inc. and contributors. All rights reserved.
 //
-// Use of this software is governed by the Business Source License
-// included in the LICENSE file.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License in the LICENSE file at the
+// root of this repository, or online at
 //
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Now utilities.
 
@@ -27,9 +33,15 @@ pub type EpochMillis = u64;
 #[allow(clippy::as_conversions)]
 pub fn to_datetime(millis: EpochMillis) -> DateTime<Utc> {
     let dur = std::time::Duration::from_millis(millis);
-    Utc.timestamp_opt(dur.as_secs() as i64, dur.subsec_nanos())
+    match Utc
+        .timestamp_opt(dur.as_secs() as i64, dur.subsec_nanos())
         .single()
-        .expect("ambiguous timestamp")
+    {
+        Some(single) => single,
+        None => {
+            panic!("Ambiguous timestamp: {millis} millis")
+        }
+    }
 }
 
 /// A function that returns system or mocked time.
@@ -37,12 +49,10 @@ pub fn to_datetime(millis: EpochMillis) -> DateTime<Utc> {
 // implement `Debug` by default. It derefs to a callable so that it is
 // ergonomically equivalent to a closure.
 #[derive(Clone)]
-pub struct NowFn(Arc<dyn Fn() -> EpochMillis + Send + Sync>);
+pub struct NowFn<T = EpochMillis>(Arc<dyn Fn() -> T + Send + Sync>);
 
-impl NowFn {
+impl NowFn<EpochMillis> {
     /// Returns now in seconds.
-    // TODO(benesch): rewrite to avoid dangerous use of `as`.
-    #[allow(clippy::as_conversions)]
     pub fn as_secs(&self) -> i64 {
         let millis: u64 = (self)();
         // Justification for `unwrap`:
@@ -51,25 +61,25 @@ impl NowFn {
     }
 }
 
-impl fmt::Debug for NowFn {
+impl<T> fmt::Debug for NowFn<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("<now_fn>")
     }
 }
 
-impl Deref for NowFn {
-    type Target = dyn Fn() -> EpochMillis + Send + Sync;
+impl<T> Deref for NowFn<T> {
+    type Target = dyn Fn() -> T + Send + Sync;
 
     fn deref(&self) -> &Self::Target {
         &(*self.0)
     }
 }
 
-impl<F> From<F> for NowFn
+impl<F, T> From<F> for NowFn<T>
 where
-    F: Fn() -> EpochMillis + Send + Sync + 'static,
+    F: Fn() -> T + Send + Sync + 'static,
 {
-    fn from(f: F) -> NowFn {
+    fn from(f: F) -> NowFn<T> {
         NowFn(Arc::new(f))
     }
 }
@@ -101,7 +111,7 @@ mod tests {
 
     use super::to_datetime;
 
-    #[mz_test_macro::test]
+    #[crate::test]
     fn test_to_datetime() {
         let test_cases = [
             (

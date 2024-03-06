@@ -13,23 +13,22 @@
 use mz_expr::visit::Visit;
 use mz_expr::{MirRelationExpr, TableFunc};
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 /// Turns `FlatMap` into `Map` if only one row is produced by flatmap.
 #[derive(Debug)]
 pub struct FlatMapToMap;
 
 impl crate::Transform for FlatMapToMap {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "flatmap_to_map")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _: TransformArgs,
+        _: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         relation.visit_mut_post(&mut Self::action)?;
         mz_repr::explain::trace_plan(&*relation);

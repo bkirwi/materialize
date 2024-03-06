@@ -7,26 +7,23 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::any::Any;
 use std::convert::Infallible;
-use std::rc::Rc;
 use std::time::Duration;
 
 use differential_dataflow::{AsCollection, Collection};
-use mz_ore::cast::CastFrom;
-use mz_ore::collections::CollectionExt;
+use futures::StreamExt;
 use mz_repr::{Diff, Row};
-use mz_storage_client::types::connections::ConnectionContext;
-use mz_storage_client::types::sources::{
-    Generator, GeneratorMessageType, LoadGenerator, LoadGeneratorSourceConnection, MzOffset,
-    SourceTimestamp,
+use mz_storage_types::sources::load_generator::{
+    Event, Generator, LoadGenerator, LoadGeneratorSourceConnection,
 };
-use mz_timely_util::builder_async::OperatorBuilder as AsyncOperatorBuilder;
+use mz_storage_types::sources::{MzOffset, SourceTimestamp};
+use mz_timely_util::builder_async::{OperatorBuilder as AsyncOperatorBuilder, PressOnDropButton};
 use timely::dataflow::operators::ToStream;
 use timely::dataflow::{Scope, Stream};
 use timely::progress::Antichain;
 
-use crate::source::types::{HealthStatus, HealthStatusUpdate, SourceRender};
+use crate::healthcheck::{HealthStatusMessage, HealthStatusUpdate, StatusNamespace};
+use crate::source::types::{ProgressStatisticsUpdate, SourceRender};
 use crate::source::{RawSourceCreationConfig, SourceMessage, SourceReaderError};
 
 mod auction;
@@ -70,92 +67,154 @@ pub fn as_generator(g: &LoadGenerator, tick_micros: Option<u64>) -> Box<dyn Gene
 }
 
 impl SourceRender for LoadGeneratorSourceConnection {
-    type Key = ();
-    type Value = Row;
     type Time = MzOffset;
+
+    const STATUS_NAMESPACE: StatusNamespace = StatusNamespace::Generator;
 
     fn render<G: Scope<Timestamp = MzOffset>>(
         self,
         scope: &mut G,
         config: RawSourceCreationConfig,
-        _connection_context: ConnectionContext,
-        _resume_uppers: impl futures::Stream<Item = Antichain<MzOffset>> + 'static,
+        resume_uppers: impl futures::Stream<Item = Antichain<MzOffset>> + 'static,
+        _start_signal: impl std::future::Future<Output = ()> + 'static,
     ) -> (
-        Collection<
-            G,
-            (
-                usize,
-                Result<SourceMessage<Self::Key, Self::Value>, SourceReaderError>,
-            ),
-            Diff,
-        >,
+        Collection<G, (usize, Result<SourceMessage, SourceReaderError>), Diff>,
         Option<Stream<G, Infallible>>,
-        Stream<G, (usize, HealthStatusUpdate)>,
-        Rc<dyn Any>,
+        Stream<G, HealthStatusMessage>,
+        Stream<G, ProgressStatisticsUpdate>,
+        Vec<PressOnDropButton>,
     ) {
         let mut builder = AsyncOperatorBuilder::new(config.name.clone(), scope.clone());
 
         let (mut data_output, stream) = builder.new_output();
+        let (mut stats_output, stats_stream) = builder.new_output();
 
         let button = builder.build(move |caps| async move {
-            let mut cap = caps.into_element();
+            let [mut cap, stats_cap]: [_; 2] = caps.try_into().unwrap();
 
             if !config.responsible_for(()) {
+                // Emit 0, to mark this worker as having started up correctly.
+                stats_output
+                    .give(
+                        &stats_cap,
+                        ProgressStatisticsUpdate::SteadyState {
+                            offset_known: 0,
+                            offset_committed: 0,
+                        },
+                    )
+                    .await;
                 return;
             }
 
             let resume_upper = Antichain::from_iter(
-                config.source_resume_upper[&config.id]
+                config.source_resume_uppers[&config.id]
                     .iter()
                     .map(MzOffset::decode_row),
             );
 
-            let Some(mut offset) = resume_upper.into_option() else {
-                return
+            let Some(resume_offset) = resume_upper.into_option() else {
+                return;
             };
-            cap.downgrade(&offset);
 
-            let mut rows = as_generator(&self.load_generator, self.tick_micros)
-                .by_seed(mz_ore::now::SYSTEM_TIME.clone(), None);
-
-            // Skip forward to the requested offset.
-            let tx_count = usize::cast_from(offset.offset);
-            let txns = rows
-                .by_ref()
-                .filter(|(_, typ, _, _)| matches!(typ, GeneratorMessageType::Finalized))
-                .take(tx_count)
-                .count();
-            assert_eq!(txns, tx_count, "produced wrong number of transactions");
+            let mut rows = as_generator(&self.load_generator, self.tick_micros).by_seed(
+                mz_ore::now::SYSTEM_TIME.clone(),
+                None,
+                resume_offset,
+            );
 
             let tick = Duration::from_micros(self.tick_micros.unwrap_or(1_000_000));
 
-            while let Some((output, typ, value, diff)) = rows.next() {
-                let message = (
-                    output,
-                    Ok(SourceMessage {
-                        upstream_time_millis: None,
-                        key: (),
-                        value,
-                        headers: None,
-                    }),
-                );
+            let mut resume_uppers = std::pin::pin!(resume_uppers);
 
-                data_output.give(&cap, (message, offset, diff)).await;
+            // If we are just starting up, report 0 as our `offset_committed`.
+            let mut offset_committed = if resume_offset.offset == 0 {
+                Some(0)
+            } else {
+                None
+            };
 
-                if matches!(typ, GeneratorMessageType::Finalized) {
-                    offset += 1;
-                    cap.downgrade(&offset);
-                    tokio::time::sleep(tick).await;
+            while let Some((output, event)) = rows.next() {
+                match event {
+                    Event::Message(offset, (value, diff)) => {
+                        let message = (
+                            output,
+                            Ok(SourceMessage {
+                                key: Row::default(),
+                                value,
+                                metadata: Row::default(),
+                            }),
+                        );
+
+                        // Some generators always reproduce their TVC from the beginning which can
+                        // generate a significant amount of data that will overwhelm the dataflow.
+                        // Since those are not required downstream we eagerly ignore them here.
+                        if resume_offset <= offset {
+                            data_output.give(&cap, (message, offset, diff)).await;
+                        }
+                    }
+                    Event::Progress(Some(offset)) => {
+                        cap.downgrade(&offset);
+
+                        // We only sleep if we have surpassed the resume offset so that we can
+                        // quickly go over any historical updates that a generator might choose to
+                        // emit.
+                        // TODO(petrosagg): Remove the sleep below and make generators return an
+                        // async stream so that they can drive the rate of production directly
+                        if resume_offset < offset {
+                            let mut sleep = std::pin::pin!(tokio::time::sleep(tick));
+
+                            loop {
+                                tokio::select! {
+                                    _ = &mut sleep => {
+                                        break;
+                                    }
+                                    Some(frontier) = resume_uppers.next() => {
+                                        if let Some(offset) = frontier.as_option() {
+                                            // Offset N means we have committed N offsets (offsets are
+                                            // 0-indexed)
+                                            offset_committed = Some(offset.offset);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // TODO(guswynn): generators have various definitions of "snapshot", so
+                            // we are not going to implement snapshot progress statistics for them
+                            // right now, but will come back to it.
+                            if let Some(offset_committed) = offset_committed {
+                                stats_output
+                                    .give(
+                                        &stats_cap,
+                                        ProgressStatisticsUpdate::SteadyState {
+                                            // technically we could have _known_ a larger offset
+                                            // than the one that has been committed, but we can
+                                            // never recover that known amount on restart, so we
+                                            // just advance these in lock step.
+                                            offset_known: offset_committed,
+                                            offset_committed,
+                                        },
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    Event::Progress(None) => return,
                 }
             }
         });
 
-        let status = [(0, HealthStatusUpdate::status(HealthStatus::Running))].to_stream(scope);
+        let status = [HealthStatusMessage {
+            index: 0,
+            namespace: Self::STATUS_NAMESPACE.clone(),
+            update: HealthStatusUpdate::running(),
+        }]
+        .to_stream(scope);
         (
             stream.as_collection(),
             None,
             status,
-            Rc::new(button.press_on_drop()),
+            stats_stream,
+            vec![button.press_on_drop()],
         )
     }
 }

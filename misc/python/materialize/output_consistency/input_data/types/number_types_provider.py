@@ -7,7 +7,6 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-from typing import List, Optional, Set
 
 from materialize.output_consistency.data_type.data_type import DataType
 from materialize.output_consistency.data_type.data_type_category import DataTypeCategory
@@ -23,17 +22,23 @@ from materialize.output_consistency.operation.return_type_spec import ReturnType
 class NumberDataType(DataType):
     def __init__(
         self,
-        identifier: str,
+        internal_identifier: str,
         type_name: str,
         is_signed: bool,
         is_decimal: bool,
         smallest_value: str,
         max_value: str,
-        max_negative_value: Optional[str],
-        further_tiny_dec_values: Optional[Set[str]] = None,
+        max_negative_value: str | None,
+        further_tiny_dec_values: set[str] | None = None,
         is_floating_point_type: bool = False,
+        is_pg_compatible: bool = True,
     ):
-        super().__init__(identifier, type_name, DataTypeCategory.NUMERIC)
+        super().__init__(
+            internal_identifier,
+            type_name,
+            DataTypeCategory.NUMERIC,
+            is_pg_compatible=is_pg_compatible,
+        )
         self.is_signed = is_signed
         self.is_decimal = is_decimal
         self.smallest_value = smallest_value
@@ -45,11 +50,13 @@ class NumberDataType(DataType):
         self.is_floating_point_type = is_floating_point_type
 
     def resolve_return_type_spec(
-        self, characteristics: Set[ExpressionCharacteristics]
+        self, characteristics: set[ExpressionCharacteristics]
     ) -> ReturnTypeSpec:
         return NumericReturnTypeSpec(
-            only_integer=not self.is_decimal
+            only_integer=(not self.is_decimal)
             or ExpressionCharacteristics.DECIMAL not in characteristics,
+            always_floating_type=self.is_decimal
+            or ExpressionCharacteristics.DECIMAL in characteristics,
         )
 
 
@@ -100,6 +107,7 @@ UINT2_TYPE = NumberDataType(
     smallest_value="1",
     max_value="65535",
     max_negative_value=None,
+    is_pg_compatible=False,
 )
 UINT4_TYPE = NumberDataType(
     UINT4_TYPE_IDENTIFIER,
@@ -109,6 +117,7 @@ UINT4_TYPE = NumberDataType(
     smallest_value="1",
     max_value="4294967295",
     max_negative_value=None,
+    is_pg_compatible=False,
 )
 UINT8_TYPE = NumberDataType(
     UINT8_TYPE_IDENTIFIER,
@@ -118,6 +127,7 @@ UINT8_TYPE = NumberDataType(
     smallest_value="1",
     max_value="18446744073709551615",
     max_negative_value=None,
+    is_pg_compatible=False,
 )
 
 # configurable decimal digits
@@ -174,26 +184,26 @@ DOUBLE_TYPE = NumberDataType(
     is_floating_point_type=True,
 )
 
-SIGNED_INT_TYPES: List[NumberDataType] = [
+SIGNED_INT_TYPES: list[NumberDataType] = [
     INT2_TYPE,
     INT4_TYPE,
     INT8_TYPE,
 ]
 
-UNSIGNED_INT_TYPES: List[NumberDataType] = [
+UNSIGNED_INT_TYPES: list[NumberDataType] = [
     UINT2_TYPE,
     UINT4_TYPE,
     UINT8_TYPE,
 ]
 
-FLOAT_OR_DECIMAL_DATA_TYPES: List[NumberDataType] = [
+FLOAT_OR_DECIMAL_DATA_TYPES: list[NumberDataType] = [
     DECIMAL39_0_TYPE,
     DECIMAL39_8_TYPE,
     REAL_TYPE,
     DOUBLE_TYPE,
 ]
 
-NUMERIC_DATA_TYPES: List[NumberDataType] = []
+NUMERIC_DATA_TYPES: list[NumberDataType] = []
 NUMERIC_DATA_TYPES.extend(SIGNED_INT_TYPES)
 NUMERIC_DATA_TYPES.extend(UNSIGNED_INT_TYPES)
 NUMERIC_DATA_TYPES.extend(FLOAT_OR_DECIMAL_DATA_TYPES)

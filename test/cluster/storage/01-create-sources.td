@@ -7,8 +7,11 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+# To ensure we get statistics in time
+$ set-sql-timeout duration=180s
+
 $ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
-ALTER SYSTEM SET enable_unmanaged_cluster_replicas = true
+ALTER SYSTEM SET enable_unorchestrated_cluster_replicas = true
 
 # Create sources and verify they can ingest data while `environmentd` is online.
 
@@ -31,7 +34,7 @@ one
   )
 
 > CREATE CONNECTION kafka_conn
-  TO KAFKA (BROKER '${testdrive.kafka-addr}');
+  TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT);
 
 > CREATE SOURCE remote1
   IN CLUSTER storage_cluster
@@ -46,3 +49,15 @@ one
 one
 > SELECT * from remote2
 one
+
+> SELECT s.name,
+  SUM(u.updates_committed) > 0,
+  SUM(u.messages_received),
+  SUM(u.offset_known),
+  SUM(u.offset_committed)
+  FROM mz_sources s
+  JOIN mz_internal.mz_source_statistics_raw u ON s.id = u.id
+  WHERE s.name IN ('remote1', 'remote2')
+  GROUP BY s.id, s.name
+remote1 true 1 1 1
+remote2 true 1 1 1

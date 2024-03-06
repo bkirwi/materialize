@@ -7,9 +7,6 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-$ postgres-execute connection=postgres://mz_system:materialize@${testdrive.materialize-internal-sql-addr}
-ALTER SYSTEM SET enable_kafka_config_denylist_options = true
-
 # Test that the source ingestion pipeline commits offsets back to Kafka with
 # the expected group ID.
 
@@ -21,12 +18,14 @@ one
 two
 three
 
-> CREATE CONNECTION conn TO KAFKA (BROKER '${testdrive.kafka-addr}')
+> CREATE CONNECTION conn TO KAFKA (BROKER '${testdrive.kafka-addr}', SECURITY PROTOCOL PLAINTEXT)
 
 # Test that the default consumer group ID is
 # `materialize-$ENVIRONMENTID-$CONNECTIONID-$SOURCEID`.
 
+> CREATE CLUSTER topic_cluster SIZE '${arg.default-storage-size}';
 > CREATE SOURCE topic
+  IN CLUSTER topic_cluster
   FROM KAFKA CONNECTION conn (
     TOPIC 'testdrive-topic-${testdrive.seed}'
   )
@@ -39,7 +38,7 @@ three
 
 $ set-from-sql var=consumer-group-id
 SELECT
-  ks.group_id_base
+  ks.group_id_prefix
 FROM mz_sources s
 JOIN mz_internal.mz_kafka_sources ks ON s.id = ks.id
 WHERE s.name = 'topic'
@@ -52,6 +51,7 @@ $ kafka-verify-commit consumer-group-id=${consumer-group-id} topic=topic partiti
 # Test than an arbitrary prefix can be prepended to the consumer group.
 
 > CREATE SOURCE topic
+  IN CLUSTER topic_cluster
   FROM KAFKA CONNECTION conn (
     TOPIC 'testdrive-topic-${testdrive.seed}',
     GROUP ID PREFIX 'OVERRIDE-'
@@ -65,7 +65,7 @@ three
 
 $ set-from-sql var=consumer-group-id
 SELECT
-  ks.group_id_base
+  ks.group_id_prefix
 FROM mz_sources s
 JOIN mz_internal.mz_kafka_sources ks ON s.id = ks.id
 WHERE s.name = 'topic'

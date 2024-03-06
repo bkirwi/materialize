@@ -23,20 +23,21 @@ use timely::progress::{Antichain, Timestamp};
 use tracing::debug;
 
 use crate::cache::{LockingTypedState, StateCache};
-use crate::error::CodecMismatch;
+use crate::error::{CodecMismatch, InvalidUsage};
 use crate::internal::gc::GcReq;
 use crate::internal::maintenance::RoutineMaintenance;
 use crate::internal::metrics::{CmdMetrics, Metrics, ShardMetrics};
 use crate::internal::paths::{PartialRollupKey, RollupId};
 use crate::internal::state::{
     ExpiryMetrics, HollowBatch, Since, SnapshotErr, StateCollections, TypedState, Upper,
+    ROLLUP_THRESHOLD,
 };
 use crate::internal::state_diff::StateDiff;
 use crate::internal::state_versions::{EncodedRollup, StateVersions};
 use crate::internal::trace::FueledMergeReq;
 use crate::internal::watch::StateWatch;
-use crate::rpc::PubSubSender;
-use crate::{PersistConfig, ShardId};
+use crate::rpc::{PubSubSender, PUBSUB_PUSH_DIFF_ENABLED};
+use crate::{Diagnostics, PersistConfig, ShardId};
 
 /// An applier of persist commands.
 ///
@@ -93,14 +94,19 @@ where
         state_versions: Arc<StateVersions>,
         shared_states: Arc<StateCache>,
         pubsub_sender: Arc<dyn PubSubSender>,
+        diagnostics: Diagnostics,
     ) -> Result<Self, Box<CodecMismatch>> {
-        let shard_metrics = metrics.shards.shard(&shard_id);
+        let shard_metrics = metrics.shards.shard(&shard_id, &diagnostics.shard_name);
         let state = shared_states
-            .get::<K, V, T, D, _, _>(shard_id, || {
-                metrics.cmds.init_state.run_cmd(&shard_metrics, || {
-                    state_versions.maybe_init_shard(&shard_metrics)
-                })
-            })
+            .get::<K, V, T, D, _, _>(
+                shard_id,
+                || {
+                    metrics.cmds.init_state.run_cmd(&shard_metrics, || {
+                        state_versions.maybe_init_shard(&shard_metrics)
+                    })
+                },
+                &diagnostics,
+            )
             .await?;
         let ret = Applier {
             cfg,
@@ -183,15 +189,16 @@ where
             })
     }
 
-    /// A point-in-time read of `is_tombstone` from the current state.
+    /// A point-in-time read from the current state. (We declare a shard 'finalized' if it's
+    /// both become an unreadable tombstone and the state itself is has been emptied out.)
     ///
     /// Due to sharing state with other handles, successive reads to this fn or any other may
     /// see a different version of state, even if this Applier has not explicitly fetched and
     /// updated to the latest state. Once this fn returns true, it will always return true.
-    pub fn is_tombstone(&self) -> bool {
+    pub fn is_finalized(&self) -> bool {
         self.state
             .read_lock(&self.metrics.locks.applier_read_cacheable, |state| {
-                state.collections.is_tombstone()
+                state.collections.is_tombstone() && state.collections.is_single_empty_batch()
             })
     }
 
@@ -200,10 +207,17 @@ where
     /// Due to sharing state with other handles, successive reads to this fn or any other may
     /// see a different version of state, even if this Applier has not explicitly fetched and
     /// updated to the latest state. Once this fn returns true, it will always return true.
-    pub fn since_upper_both_empty(&self) -> bool {
+    pub fn check_since_upper_both_empty(&self) -> Result<(), InvalidUsage<T>> {
         self.state
             .read_lock(&self.metrics.locks.applier_read_cacheable, |state| {
-                state.since().is_empty() && state.upper().is_empty()
+                if state.since().is_empty() && state.upper().is_empty() {
+                    Ok(())
+                } else {
+                    Err(InvalidUsage::FinalizationError {
+                        since: state.since().clone(),
+                        upper: state.upper().clone(),
+                    })
+                }
             })
     }
 
@@ -238,6 +252,20 @@ where
             })
     }
 
+    pub fn all_batches(&self) -> Vec<HollowBatch<T>> {
+        self.state
+            .read_lock(&self.metrics.locks.applier_read_noncacheable, |state| {
+                state
+                    .state
+                    .collections
+                    .trace
+                    .batches()
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+    }
+
     pub fn verify_listen(&self, as_of: &Antichain<T>) -> Result<Result<(), Upper<T>>, Since<T>> {
         self.state
             .read_lock(&self.metrics.locks.applier_read_noncacheable, |state| {
@@ -252,16 +280,16 @@ where
             })
     }
 
-    pub async fn write_rollup_blob(&self, rollup_id: &RollupId) -> EncodedRollup {
-        let rollup = self
+    pub async fn write_rollup_for_state(&self) -> Option<EncodedRollup> {
+        let state = self
             .state
             .read_lock(&self.metrics.locks.applier_read_noncacheable, |state| {
-                let key = PartialRollupKey::new(state.seqno, rollup_id);
-                self.state_versions
-                    .encode_rollup_blob(&self.shard_metrics, state, key)
+                state.clone_for_rollup()
             });
-        let () = self.state_versions.write_rollup_blob(&rollup).await;
-        rollup
+
+        self.state_versions
+            .write_rollup_for_state(self.shard_metrics.as_ref(), state, &RollupId::new())
+            .await
     }
 
     pub async fn apply_unbatched_cmd<
@@ -293,7 +321,7 @@ where
                     cmd.succeeded.inc();
                     self.shard_metrics.cmd_succeeded.inc();
                     self.update_state(new_state);
-                    if self.cfg.dynamic.pubsub_push_diff_enabled() {
+                    if PUBSUB_PUSH_DIFF_ENABLED.get(&self.cfg) {
                         self.pubsub_sender.push_diff(&self.shard_id, &diff);
                     }
                     return Ok((diff.seqno, Ok(res), maintenance));
@@ -315,6 +343,8 @@ where
         }
     }
 
+    // work_fn fails to compile without mut, false positive
+    #[allow(clippy::needless_pass_by_ref_mut)]
     async fn apply_unbatched_cmd_locked<
         R,
         E,
@@ -377,6 +407,11 @@ where
                     .timeout_read
                     .inc_by(u64::cast_from(expiry_metrics.readers_expired));
 
+                metrics
+                    .state
+                    .writer_removed
+                    .inc_by(u64::cast_from(expiry_metrics.writers_expired));
+
                 if let Some(gc) = garbage_collection.as_ref() {
                     debug!("Assigned gc request: {:?}", gc);
                 }
@@ -408,6 +443,7 @@ where
     ) -> Result<NextState<K, V, T, D, R>, (SeqNo, E)> {
         let is_write = cmd.name == metrics.cmds.compare_and_append.name;
         let is_rollup = cmd.name == metrics.cmds.add_rollup.name;
+        let is_become_tombstone = cmd.name == metrics.cmds.become_tombstone.name;
 
         let expected = state.seqno;
         let was_tombstone_before = state.collections.is_tombstone();
@@ -429,14 +465,14 @@ where
         // TODO: Even better would be to write the rollup in the
         // tombstone transition so it's a single terminal state
         // transition, but it'll be tricky to get right.
-        if was_tombstone_before && !is_rollup {
+        if was_tombstone_before && !(is_rollup || is_become_tombstone) {
             panic!(
                 "cmd {} unexpectedly tried to commit a new state on a tombstone: {:?}",
                 cmd.name, state
             );
         }
 
-        let write_rollup = new_state.need_rollup(cfg.dynamic.rollup_threshold());
+        let write_rollup = new_state.need_rollup(ROLLUP_THRESHOLD.get(cfg));
 
         // Find out if this command has been selected to perform gc, so
         // that it will fire off a background request to the

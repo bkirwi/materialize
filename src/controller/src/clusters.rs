@@ -18,18 +18,18 @@ use chrono::{DateTime, Utc};
 use differential_dataflow::lattice::Lattice;
 use futures::stream::{BoxStream, StreamExt};
 use mz_cluster_client::client::ClusterReplicaLocation;
-pub use mz_compute_client::controller::DEFAULT_COMPUTE_REPLICA_LOGGING_INTERVAL_MICROS as DEFAULT_REPLICA_LOGGING_INTERVAL_MICROS;
-use mz_compute_client::controller::{
-    ComputeInstanceId, ComputeReplicaConfig, ComputeReplicaLogging,
-};
+use mz_compute_client::controller::{ComputeReplicaConfig, ComputeReplicaLogging};
 use mz_compute_client::logging::LogVariant;
 use mz_compute_client::service::{ComputeClient, ComputeGrpcClient};
+use mz_compute_types::ComputeInstanceId;
+use mz_controller_types::{is_cluster_size_v2, ClusterId, ReplicaId};
 use mz_orchestrator::{
-    CpuLimit, LabelSelectionLogic, LabelSelector, MemoryLimit, Service, ServiceConfig,
+    CpuLimit, DiskLimit, LabelSelectionLogic, LabelSelector, MemoryLimit, Service, ServiceConfig,
     ServiceEvent, ServicePort,
 };
 use mz_ore::halt;
-use mz_ore::task::{AbortOnDropHandle, JoinHandleExt};
+use mz_ore::instrument;
+use mz_ore::task::AbortOnDropHandle;
 use mz_repr::adt::numeric::Numeric;
 use mz_repr::GlobalId;
 use once_cell::sync::Lazy;
@@ -39,9 +39,6 @@ use timely::progress::Timestamp;
 use tracing::{error, warn};
 
 use crate::Controller;
-
-/// Identifies a cluster.
-pub type ClusterId = ComputeInstanceId;
 
 /// Configures a cluster.
 pub struct ClusterConfig {
@@ -55,11 +52,8 @@ pub struct ClusterConfig {
 /// The status of a cluster.
 pub type ClusterStatus = mz_orchestrator::ServiceStatus;
 
-/// Identifies a cluster replica.
-pub type ReplicaId = mz_cluster_client::ReplicaId;
-
 /// Configures a cluster replica.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ReplicaConfig {
     /// The location of the replica.
     pub location: ReplicaLocation,
@@ -68,12 +62,14 @@ pub struct ReplicaConfig {
 }
 
 /// Configures the resource allocation for a cluster replica.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReplicaAllocation {
     /// The memory limit for each process in the replica.
     pub memory_limit: Option<MemoryLimit>,
     /// The CPU limit for each process in the replica.
     pub cpu_limit: Option<CpuLimit>,
+    /// The disk limit for each process in the replica.
+    pub disk_limit: Option<DiskLimit>,
     /// The number of processes in the replica.
     pub scale: u16,
     /// The number of worker threads in the replica.
@@ -81,27 +77,91 @@ pub struct ReplicaAllocation {
     /// The number of credits per hour that the replica consumes.
     #[serde(deserialize_with = "mz_repr::adt::numeric::str_serde::deserialize")]
     pub credits_per_hour: Numeric,
+    /// Whether each process has exclusive access to its CPU cores.
+    #[serde(default)]
+    pub cpu_exclusive: bool,
+    /// Whether instances of this type can be created.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Additional node selectors.
+    #[serde(default)]
+    pub selectors: BTreeMap<String, String>,
 }
 
 #[mz_ore::test]
-#[cfg_attr(miri, ignore)]
 // We test this particularly because we deserialize values from strings.
+#[cfg_attr(miri, ignore)] // unsupported operation: can't call foreign function `decContextDefault` on OS `linux`
 fn test_replica_allocation_deserialization() {
+    use bytesize::ByteSize;
+
     let data = r#"
         {
             "cpu_limit": 1.0,
             "memory_limit": "10GiB",
+            "disk_limit": "100MiB",
             "scale": 16,
             "workers": 1,
-            "credits_per_hour": "16"
+            "credits_per_hour": "16",
+            "selectors": {
+                "key1": "value1",
+                "key2": "value2"
+            }
         }"#;
 
-    let _: ReplicaAllocation = serde_json::from_str(data)
+    let replica_allocation: ReplicaAllocation = serde_json::from_str(data)
         .expect("deserialization from JSON succeeds for ReplicaAllocation");
+
+    assert_eq!(
+        replica_allocation,
+        ReplicaAllocation {
+            credits_per_hour: 16.into(),
+            disk_limit: Some(DiskLimit(ByteSize::mib(100))),
+            disabled: false,
+            memory_limit: Some(MemoryLimit(ByteSize::gib(10))),
+            cpu_limit: Some(CpuLimit::from_millicpus(1000)),
+            cpu_exclusive: false,
+            scale: 16,
+            workers: 1,
+            selectors: BTreeMap::from([
+                ("key1".to_string(), "value1".to_string()),
+                ("key2".to_string(), "value2".to_string())
+            ]),
+        }
+    );
+
+    let data = r#"
+        {
+            "cpu_limit": 0,
+            "memory_limit": "0GiB",
+            "disk_limit": "0MiB",
+            "scale": 0,
+            "workers": 0,
+            "credits_per_hour": "0",
+            "cpu_exclusive": true,
+            "disabled": true
+        }"#;
+
+    let replica_allocation: ReplicaAllocation = serde_json::from_str(data)
+        .expect("deserialization from JSON succeeds for ReplicaAllocation");
+
+    assert_eq!(
+        replica_allocation,
+        ReplicaAllocation {
+            credits_per_hour: 0.into(),
+            disk_limit: Some(DiskLimit(ByteSize::mib(0))),
+            disabled: true,
+            memory_limit: Some(MemoryLimit(ByteSize::gib(0))),
+            cpu_limit: Some(CpuLimit::from_millicpus(0)),
+            cpu_exclusive: true,
+            scale: 0,
+            workers: 0,
+            selectors: Default::default(),
+        }
+    );
 }
 
 /// Configures the location of a cluster replica.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub enum ReplicaLocation {
     /// An unmanaged replica.
     Unmanaged(UnmanagedReplicaLocation),
@@ -110,15 +170,6 @@ pub enum ReplicaLocation {
 }
 
 impl ReplicaLocation {
-    /// Returns the availability zone specified by this replica location, if
-    /// any.
-    pub fn availability_zone(&self) -> Option<&str> {
-        match self {
-            ReplicaLocation::Unmanaged(_) => None,
-            ReplicaLocation::Managed(m) => Some(&m.availability_zone),
-        }
-    }
-
     /// Returns the number of processes specified by this replica location.
     pub fn num_processes(&self) -> usize {
         match self {
@@ -128,6 +179,22 @@ impl ReplicaLocation {
             ReplicaLocation::Managed(ManagedReplicaLocation { allocation, .. }) => {
                 allocation.scale.into()
             }
+        }
+    }
+
+    pub fn billed_as(&self) -> Option<&str> {
+        match self {
+            ReplicaLocation::Managed(ManagedReplicaLocation { billed_as, .. }) => {
+                billed_as.as_deref()
+            }
+            _ => None,
+        }
+    }
+
+    pub fn internal(&self) -> bool {
+        match self {
+            ReplicaLocation::Managed(ManagedReplicaLocation { internal, .. }) => *internal,
+            ReplicaLocation::Unmanaged(_) => false,
         }
     }
 }
@@ -166,18 +233,53 @@ pub struct UnmanagedReplicaLocation {
     pub workers: usize,
 }
 
+/// Information about availability zone constraints for replicas.
+#[derive(Clone, Debug)]
+pub enum ManagedReplicaAvailabilityZones {
+    /// Specified if the `Replica` is from `MANAGED` cluster,
+    /// and specifies if there is an `AVAILABILITY ZONES`
+    /// constraint. Empty lists are represented as `None`.
+    FromCluster(Option<Vec<String>>),
+    /// Specified if the `Replica` is from a non-`MANAGED` cluster,
+    /// and specifies if there is a specific `AVAILABILITY ZONE`.
+    FromReplica(Option<String>),
+}
+
 /// The location of a managed replica.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ManagedReplicaLocation {
     /// The resource allocation for the replica.
     pub allocation: ReplicaAllocation,
     /// SQL size parameter used for allocation
     pub size: String,
-    /// The replica's availability zone
-    pub availability_zone: String,
-    /// `true` if the AZ was specified by the user and must be respected;
-    /// `false` if it was picked arbitrarily by Materialize.
-    pub az_user_specified: bool,
+    /// If `true`, Materialize support owns this replica.
+    pub internal: bool,
+    /// Optional SQL size parameter used for billing.
+    pub billed_as: Option<String>,
+    /// The replica's availability zones, if specified.
+    ///
+    /// This is either the replica's specific `AVAILABILITY ZONE`,
+    /// or the zones placed here during replica concretization
+    /// from the `MANAGED` cluster config.
+    ///
+    /// We skip serialization (which is used for some validation
+    /// in tests) as the latter case is a "virtual" piece of information,
+    /// that exists only at runtime.
+    ///
+    /// An empty list of availability zones is concretized as `None`,
+    /// as the on-disk serialization of `MANAGED CLUSTER AVAILABILITY ZONES`
+    /// is an empty list if none are specified
+    #[serde(skip)]
+    pub availability_zones: ManagedReplicaAvailabilityZones,
+    /// Whether the replica needs scratch disk space.
+    pub disk: bool,
+}
+
+impl ManagedReplicaLocation {
+    /// Return the size which should be used to determine billing-related information.
+    pub fn size_for_billing(&self) -> &str {
+        self.billed_as.as_deref().unwrap_or(&self.size)
+    }
 }
 
 /// Configures logging for a cluster replica.
@@ -244,6 +346,7 @@ where
     pub async fn create_replicas(
         &mut self,
         replicas: Vec<CreateReplicaConfig>,
+        enable_worker_core_affinity: bool,
     ) -> Result<(), anyhow::Error> {
         /// A intermediate struct to hold info about a replica, to avoid
         /// a large tuple.
@@ -303,7 +406,13 @@ where
                     ReplicaLocation::Managed(m) => {
                         let workers = m.allocation.workers;
                         let (service, metrics_task_join_handle) = this
-                            .provision_replica(cluster_id, replica_id, role, m)
+                            .provision_replica(
+                                cluster_id,
+                                replica_id,
+                                role,
+                                m,
+                                enable_worker_core_affinity,
+                            )
                             .await?;
                         let storage_location = ClusterReplicaLocation {
                             ctl_addrs: service.addresses("storagectl"),
@@ -347,11 +456,13 @@ where
         drop(replica_stream);
 
         for (cluster_id, replicas) in replicas {
+            let last_replica = replicas.last().unwrap();
             // We only connect to the last replica (chosen arbitrarily)
             // for storage, until we support multi-replica storage objects
             self.storage.connect_replica(
                 cluster_id,
-                replicas.last().unwrap().storage_location.clone(),
+                last_replica.replica_id,
+                last_replica.storage_location.clone(),
             );
 
             for ReplicaInfo {
@@ -396,10 +507,16 @@ where
     }
 
     /// Remove orphaned replicas.
+    #[instrument]
     pub async fn remove_orphaned_replicas(
         &mut self,
-        next_replica_id: ReplicaId,
+        next_user_replica_id: u64,
+        next_system_replica_id: u64,
     ) -> Result<(), anyhow::Error> {
+        // Remove replicas with the old service name format.
+        // TODO(teskje): Remove this after v0.67 has been rolled out.
+        self.deprovision_old_services().await?;
+
         let desired: BTreeSet<_> = self.metrics_tasks.keys().copied().collect();
 
         let actual: BTreeSet<_> = self
@@ -411,20 +528,43 @@ where
             .collect::<Result<_, _>>()?;
 
         for (cluster_id, replica_id) in actual {
-            if replica_id >= next_replica_id {
+            let smaller_next = match replica_id {
+                ReplicaId::User(id) if id >= next_user_replica_id => {
+                    Some(ReplicaId::User(next_user_replica_id))
+                }
+                ReplicaId::System(id) if id >= next_system_replica_id => {
+                    Some(ReplicaId::System(next_system_replica_id))
+                }
+                _ => None,
+            };
+            if let Some(next) = smaller_next {
                 // Found a replica in kubernetes with a higher replica ID than
                 // what we are aware of. This must have been created by an
                 // environmentd with higher epoch number.
-                halt!(
-                    "found replica id ({}) in orchestrator >= next id ({})",
-                    replica_id,
-                    next_replica_id
-                );
+                halt!("found replica ID ({replica_id}) in orchestrator >= next ID ({next})");
             }
 
             if !desired.contains(&replica_id) {
                 self.deprovision_replica(cluster_id, replica_id).await?;
             }
+        }
+
+        Ok(())
+    }
+
+    async fn deprovision_old_services(&self) -> Result<(), anyhow::Error> {
+        static OLD_SERVICE_NAME_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"(?-u)^[us]\d+-replica-\d+$").unwrap());
+
+        let old_services = self
+            .orchestrator
+            .list_services()
+            .await?
+            .into_iter()
+            .filter(|s| OLD_SERVICE_NAME_RE.is_match(s));
+
+        for service_name in old_services {
+            self.orchestrator.drop_service(&service_name).await?;
         }
 
         Ok(())
@@ -465,6 +605,7 @@ where
         replica_id: ReplicaId,
         role: ClusterRole,
         location: ManagedReplicaLocation,
+        enable_worker_core_affinity: bool,
     ) -> Result<(Box<dyn Service>, AbortOnDropHandle<()>), anyhow::Error> {
         let service_name = generate_replica_service_name(cluster_id, replica_id);
         let role_label = match role {
@@ -472,7 +613,12 @@ where
             ClusterRole::System => "system",
             ClusterRole::User => "user",
         };
+        let environment_id = self.connection_context().environment_id.clone();
+        let aws_external_id_prefix = self.connection_context().aws_external_id_prefix.clone();
+        let aws_connection_role_arn = self.connection_context().aws_connection_role_arn.clone();
         let persist_pubsub_url = self.persist_pubsub_url.clone();
+        let persist_txn_tables = self.persist_txn_tables;
+        let secrets_args = self.secrets_args.to_flags();
         let service = self
             .orchestrator
             .ensure_service(
@@ -481,7 +627,7 @@ where
                     image: self.clusterd_image.clone(),
                     init_container_image: self.init_container_image.clone(),
                     args: &|assigned| {
-                        vec![
+                        let mut args = vec![
                             format!(
                                 "--storage-controller-listen-addr={}",
                                 assigned["storagectl"]
@@ -494,7 +640,37 @@ where
                             format!("--opentelemetry-resource=cluster_id={}", cluster_id),
                             format!("--opentelemetry-resource=replica_id={}", replica_id),
                             format!("--persist-pubsub-url={}", persist_pubsub_url),
-                        ]
+                            format!("--persist-txn-tables={}", persist_txn_tables),
+                            format!("--environment-id={}", environment_id),
+                        ];
+                        if let Some(aws_external_id_prefix) = &aws_external_id_prefix {
+                            args.push(format!(
+                                "--aws-external-id-prefix={}",
+                                aws_external_id_prefix
+                            ));
+                        }
+                        if let Some(aws_connection_role_arn) = &aws_connection_role_arn {
+                            args.push(format!(
+                                "--aws-connection-role-arn={}",
+                                aws_connection_role_arn
+                            ));
+                        }
+                        if let Some(memory_limit) = location.allocation.memory_limit {
+                            args.push(format!(
+                                "--announce-memory-limit={}",
+                                memory_limit.0.as_u64()
+                            ));
+                        }
+                        if location.allocation.cpu_exclusive && enable_worker_core_affinity {
+                            args.push("--worker-core-affinity".into());
+                        }
+                        if is_cluster_size_v2(&location.size) {
+                            args.push("--is-cluster-size-v2".into());
+                        }
+
+                        args.extend(secrets_args.clone());
+
+                        args
                     },
                     ports: vec![
                         ServicePort {
@@ -529,33 +705,41 @@ where
                         ("cluster-id".into(), cluster_id.to_string()),
                         ("type".into(), "cluster".into()),
                         ("replica-role".into(), role_label.into()),
-                        ("scale".into(), location.allocation.scale.to_string()),
                         ("workers".into(), location.allocation.workers.to_string()),
                         ("size".into(), location.size.to_string()),
                     ]),
-                    availability_zone: Some(location.availability_zone),
-                    // This constrains the orchestrator (for those orchestrators that support
-                    // anti-affinity, today just k8s) to never schedule pods for different replicas
-                    // of the same cluster on the same node. Pods from the _same_ replica are fine;
-                    // pods from different clusters are also fine.
-                    //
-                    // The point is that if pods of two replicas are on the same node, that node
-                    // going down would kill both replicas, and so the replication factor of the
-                    // cluster in question is illusory.
-                    anti_affinity: Some(vec![
+                    availability_zones: match location.availability_zones {
+                        ManagedReplicaAvailabilityZones::FromCluster(azs) => azs,
+                        ManagedReplicaAvailabilityZones::FromReplica(az) => az.map(|z| vec![z]),
+                    },
+                    // This provides the orchestrator with some label selectors that
+                    // are used to constraint the scheduling of replicas, based on
+                    // its internal configuration.
+                    other_replicas_selector: vec![
                         LabelSelector {
                             label_name: "cluster-id".to_string(),
                             logic: LabelSelectionLogic::Eq {
                                 value: cluster_id.to_string(),
                             },
                         },
+                        // Select other replicas (but not oneself)
                         LabelSelector {
                             label_name: "replica-id".into(),
                             logic: LabelSelectionLogic::NotEq {
                                 value: replica_id.to_string(),
                             },
                         },
-                    ]),
+                    ],
+                    replicas_selector: vec![LabelSelector {
+                        label_name: "cluster-id".to_string(),
+                        // Select ALL replicas.
+                        logic: LabelSelectionLogic::Eq {
+                            value: cluster_id.to_string(),
+                        },
+                    }],
+                    disk_limit: location.allocation.disk_limit,
+                    disk: location.disk,
+                    node_selector: location.allocation.selectors,
                 },
             )
             .await?;
@@ -614,7 +798,7 @@ fn parse_replica_service_name(
     service_name: &str,
 ) -> Result<(ComputeInstanceId, ReplicaId), anyhow::Error> {
     static SERVICE_NAME_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?-u)^([us]\d+)-replica-(\d+)$").unwrap());
+        Lazy::new(|| Regex::new(r"(?-u)^([us]\d+)-replica-([us]\d+)$").unwrap());
 
     let caps = SERVICE_NAME_RE
         .captures(service_name)

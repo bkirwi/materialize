@@ -28,8 +28,12 @@ set -euo pipefail
 # or change how we want bugs to be filed.
 declare -A shortlinks=(
     [bug]="https://github.com/MaterializeInc/materialize/issues/new?labels=C-bug&template=01-bug.yml"
-    [non-materialized-error]="https://materialize.com/docs/sql/create-view/#querying-non-materialized-views"
-    [chat]="https://join.slack.com/t/materializecommunity/shared_invite/zt-ljdufufo-PTwVPmgzlZtI7RIQLDrAiA"
+    [docs]="https://materialize.com/docs"
+    [non-materialized-error]="https://materialize.com/docs/lts/sql/create-view/#querying-non-materialized-views"
+    [sink-key-selection]="https://materialize.com/docs/sql/create-sink/kafka/#upsert-key-selection"
+    [aws-connection-role-trust-policy]="https://materialize.com/docs/sql/create-connection/#permissions"
+    [chat]="https://join.slack.com/t/materializecommunity/shared_invite/zt-2bad5ce4i-ZsiPWI5jd7Q9pRDGYj3dkw"
+    [pricing]="https://materialize.com/pdfs/pricing.pdf"
 )
 
 cd doc/user

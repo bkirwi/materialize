@@ -6,10 +6,13 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
-from typing import List, Optional, Set
+from collections.abc import Callable
 
 from materialize.output_consistency.data_type.data_type import DataType
 from materialize.output_consistency.data_type.data_type_category import DataTypeCategory
+from materialize.output_consistency.execution.sql_dialect_adjuster import (
+    SqlDialectAdjuster,
+)
 from materialize.output_consistency.execution.value_storage_layout import (
     ValueStorageLayout,
 )
@@ -34,7 +37,7 @@ class ExpressionWithArgs(Expression):
     def __init__(
         self,
         operation: DbOperationOrFunction,
-        args: List[Expression],
+        args: list[Expression],
         is_aggregate: bool,
         is_expect_error: bool,
     ):
@@ -52,11 +55,13 @@ class ExpressionWithArgs(Expression):
     def has_args(self) -> bool:
         return len(self.args) > 0
 
-    def to_sql(self, is_root_level: bool) -> str:
+    def to_sql(self, sql_adjuster: SqlDialectAdjuster, is_root_level: bool) -> str:
         sql: str = self.pattern
 
         for arg in self.args:
-            sql = sql.replace(EXPRESSION_PLACEHOLDER, arg.to_sql(False), 1)
+            sql = sql.replace(
+                EXPRESSION_PLACEHOLDER, arg.to_sql(sql_adjuster, False), 1
+            )
 
         if len(self.args) != self.pattern.count(EXPRESSION_PLACEHOLDER):
             raise RuntimeError(
@@ -90,7 +95,7 @@ class ExpressionWithArgs(Expression):
 
         return self.return_type_spec.resolve_type_category(input_type_hints)
 
-    def try_resolve_exact_data_type(self) -> Optional[DataType]:
+    def try_resolve_exact_data_type(self) -> DataType | None:
         return self.operation.try_resolve_exact_data_type(self.args)
 
     def __str__(self) -> str:
@@ -99,8 +104,8 @@ class ExpressionWithArgs(Expression):
 
     def recursively_collect_involved_characteristics(
         self, row_selection: DataRowSelection
-    ) -> Set[ExpressionCharacteristics]:
-        involved_characteristics: Set[ExpressionCharacteristics] = set()
+    ) -> set[ExpressionCharacteristics]:
+        involved_characteristics: set[ExpressionCharacteristics] = set()
         involved_characteristics = involved_characteristics.union(
             self.own_characteristics
         )
@@ -112,7 +117,7 @@ class ExpressionWithArgs(Expression):
 
         return involved_characteristics
 
-    def collect_leaves(self) -> List[LeafExpression]:
+    def collect_leaves(self) -> list[LeafExpression]:
         leaves = []
 
         for arg in self.args:
@@ -121,6 +126,19 @@ class ExpressionWithArgs(Expression):
         return leaves
 
     def is_leaf(self) -> bool:
+        return False
+
+    def matches(
+        self, predicate: Callable[[Expression], bool], apply_recursively: bool
+    ) -> bool:
+        if super().matches(predicate, apply_recursively):
+            return True
+
+        if apply_recursively:
+            for arg in self.args:
+                if arg.matches(predicate, apply_recursively):
+                    return True
+
         return False
 
     def contains_leaf_not_directly_consumed_by_aggregation(self) -> bool:
@@ -136,22 +154,24 @@ class ExpressionWithArgs(Expression):
         return False
 
 
-def _determine_storage_layout(args: List[Expression]) -> ValueStorageLayout:
-    storage_layout: Optional[ValueStorageLayout] = None
+def _determine_storage_layout(args: list[Expression]) -> ValueStorageLayout:
+    mutual_storage_layout: ValueStorageLayout | None = None
 
     for arg in args:
-        if arg.storage_layout == ValueStorageLayout.ANY:
+        if (
+            mutual_storage_layout is None
+            or mutual_storage_layout == ValueStorageLayout.ANY
+        ):
+            mutual_storage_layout = arg.storage_layout
+        elif arg.storage_layout == ValueStorageLayout.ANY:
             continue
-
-        if storage_layout is None:
-            storage_layout = arg.storage_layout
-        elif storage_layout != arg.storage_layout:
+        elif mutual_storage_layout != arg.storage_layout:
             raise RuntimeError(
-                f"It is not allowed to mix storage layouts in an expression (current={storage_layout}, got={arg.storage_layout})"
+                f"It is not allowed to mix storage layouts in an expression (current={mutual_storage_layout}, got={arg.storage_layout})"
             )
 
-    if storage_layout is None:
+    if mutual_storage_layout is None:
         # use this as default (but it should not matter as expressions are expected to always have at least one arg)
         return ValueStorageLayout.HORIZONTAL
 
-    return storage_layout
+    return mutual_storage_layout

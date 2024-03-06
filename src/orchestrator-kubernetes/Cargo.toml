@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1.0.66"
 async-trait = "0.1.68"
@@ -18,8 +21,8 @@ mz-cloud-resources = { path = "../cloud-resources" }
 mz-orchestrator = { path = "../orchestrator" }
 mz-secrets = { path = "../secrets" }
 mz-repr = { path = "../repr" }
-k8s-openapi = { version = "0.16.0", features = ["v1_24"] }
-kube = { version = "0.77.0", features = ["runtime", "ws"] }
+k8s-openapi = { version = "0.20.0", features = ["v1_26"] }
+kube = { version = "0.87.1", default-features = false, features = ["client", "runtime", "ws"] }
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = "1.0.89"
 sha2 = "0.10.6"

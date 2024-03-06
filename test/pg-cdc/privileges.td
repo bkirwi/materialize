@@ -29,22 +29,18 @@ CREATE PUBLICATION mz_source FOR ALL TABLES;
 
 REVOKE CONNECT ON DATABASE postgres FROM public;
 
+#
+# CONNECT error
+#
+
 > CREATE SECRET pgpass AS 'priv'
-> CREATE CONNECTION pg TO POSTGRES (
+! CREATE CONNECTION pg TO POSTGRES (
     HOST postgres,
     DATABASE postgres,
     USER priv,
     PASSWORD SECRET pgpass
   )
-
-#
-# CONNECT error
-#
-
-! CREATE SOURCE mz_source
-  FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
-  FOR SCHEMAS(public, other);
-contains:failed to connect to PostgreSQL database
+contains:permission denied for database "postgres"
 
 #
 # USAGE error
@@ -54,10 +50,17 @@ $ postgres-execute connection=postgres://postgres:postgres@postgres
 GRANT CONNECT ON DATABASE postgres TO public;
 REVOKE USAGE ON SCHEMA other FROM priv;
 
+> CREATE CONNECTION pg TO POSTGRES (
+    HOST postgres,
+    DATABASE postgres,
+    USER priv,
+    PASSWORD SECRET pgpass
+  )
+
 ! CREATE SOURCE mz_source
   FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
   FOR SCHEMAS(public, other);
-contains:failed to connect to PostgreSQL database
+contains:insufficient privileges
 detail:user priv lacks USAGE privileges for schemas other
 
 #
@@ -71,7 +74,7 @@ REVOKE SELECT ON TABLE other.s FROM priv;
 ! CREATE SOURCE mz_source
   FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
   FOR SCHEMAS(public, other);
-contains:failed to connect to PostgreSQL database
+contains:insufficient privileges
 detail:user priv lacks SELECT privileges for tables other.s
 
 $ postgres-execute connection=postgres://postgres:postgres@postgres
@@ -83,5 +86,8 @@ REVOKE SELECT ON public."""select""" FROM priv;
 ! CREATE SOURCE mz_source
   FROM POSTGRES CONNECTION pg (PUBLICATION 'mz_source')
   FOR SCHEMAS(public);
-contains:failed to connect to PostgreSQL database
-detail:user priv lacks SELECT privileges for tables public."select", public."""select"""
+contains:insufficient privileges
+detail:user priv lacks SELECT privileges for tables public."""select""", public."select"
+
+$ postgres-execute connection=postgres://postgres:postgres@postgres
+DROP SCHEMA IF EXISTS other CASCADE;

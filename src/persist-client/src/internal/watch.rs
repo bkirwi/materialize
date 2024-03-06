@@ -147,10 +147,14 @@ mod tests {
     use timely::progress::Antichain;
 
     use crate::cache::StateCache;
-    use crate::cfg::{PersistConfig, PersistParameters, RetryParameters};
+    use crate::cfg::PersistConfig;
+    use crate::internal::machine::{
+        NEXT_LISTEN_BATCH_RETRYER_CLAMP, NEXT_LISTEN_BATCH_RETRYER_INITIAL_BACKOFF,
+        NEXT_LISTEN_BATCH_RETRYER_MULTIPLIER,
+    };
     use crate::internal::state::TypedState;
     use crate::tests::new_test_client;
-    use crate::ShardId;
+    use crate::{Diagnostics, ShardId};
 
     use super::*;
 
@@ -164,14 +168,18 @@ mod tests {
         let cache = StateCache::new_no_metrics();
         let shard_id = ShardId::new();
         let state = cache
-            .get::<(), (), u64, i64, _, _>(shard_id, || async {
-                Ok(TypedState::new(
-                    DUMMY_BUILD_INFO.semver_version(),
-                    shard_id,
-                    "host".to_owned(),
-                    0u64,
-                ))
-            })
+            .get::<(), (), u64, i64, _, _>(
+                shard_id,
+                || async {
+                    Ok(TypedState::new(
+                        DUMMY_BUILD_INFO.semver_version(),
+                        shard_id,
+                        "host".to_owned(),
+                        0u64,
+                    ))
+                },
+                &Diagnostics::for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(state.read_lock(&metrics.locks.watch, |x| x.seqno), SeqNo(0));
@@ -201,6 +209,7 @@ mod tests {
     }
 
     #[mz_ore::test(tokio::test(flavor = "multi_thread"))]
+    #[cfg_attr(miri, ignore)] // error: unsupported operation: integer-to-pointer casts and `ptr::from_exposed_addr` are not supported with `-Zmiri-strict-provenance`
     async fn state_watch_concurrency() {
         mz_ore::test::init_logging();
         let metrics = Arc::new(Metrics::new(
@@ -210,14 +219,18 @@ mod tests {
         let cache = StateCache::new_no_metrics();
         let shard_id = ShardId::new();
         let state = cache
-            .get::<(), (), u64, i64, _, _>(shard_id, || async {
-                Ok(TypedState::new(
-                    DUMMY_BUILD_INFO.semver_version(),
-                    shard_id,
-                    "host".to_owned(),
-                    0u64,
-                ))
-            })
+            .get::<(), (), u64, i64, _, _>(
+                shard_id,
+                || async {
+                    Ok(TypedState::new(
+                        DUMMY_BUILD_INFO.semver_version(),
+                        shard_id,
+                        "host".to_owned(),
+                        0u64,
+                    ))
+                },
+                &Diagnostics::for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(state.read_lock(&metrics.locks.watch, |x| x.seqno), SeqNo(0));
@@ -236,7 +249,6 @@ mod tests {
                     let _ = watch.wait_for_seqno_ge(wait_seqno).await;
                     let observed_seqno =
                         state.read_lock(&metrics.locks.applier_read_noncacheable, |x| x.seqno);
-                    tracing::info!("{} vs {}", wait_seqno, observed_seqno);
                     assert!(
                         wait_seqno <= observed_seqno,
                         "{} vs {}",
@@ -253,7 +265,6 @@ mod tests {
                 mz_ore::task::spawn(|| "write", async move {
                     state.write_lock(&metrics.locks.applier_write, |x| {
                         x.seqno = x.seqno.next();
-                        eprintln!("wrote {}", x.seqno);
                     });
                 })
             })
@@ -267,6 +278,7 @@ mod tests {
     }
 
     #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // unsupported operation: returning ready events from epoll_wait is not yet implemented
     async fn state_watch_listen_snapshot() {
         mz_ore::test::init_logging();
         let waker = noop_waker();
@@ -274,15 +286,17 @@ mod tests {
 
         let client = new_test_client().await;
         // Override the listen poll so that it's useless.
-        PersistParameters {
-            next_listen_batch_retryer: Some(RetryParameters {
-                initial_backoff: Duration::from_secs(1_000_000),
-                multiplier: 1,
-                clamp: Duration::from_secs(1_000_000),
-            }),
-            ..PersistParameters::default()
-        }
-        .apply(&client.cfg);
+        client.cfg.set_config(
+            &NEXT_LISTEN_BATCH_RETRYER_INITIAL_BACKOFF,
+            Duration::from_secs(1_000_000),
+        );
+        client
+            .cfg
+            .set_config(&NEXT_LISTEN_BATCH_RETRYER_MULTIPLIER, 1);
+        client.cfg.set_config(
+            &NEXT_LISTEN_BATCH_RETRYER_CLAMP,
+            Duration::from_secs(1_000_000),
+        );
 
         let (mut write, mut read) = client.expect_open::<(), (), u64, i64>(ShardId::new()).await;
 
@@ -296,7 +310,7 @@ mod tests {
             .unwrap();
         let mut snapshot = Box::pin(read.snapshot(Antichain::from_elem(0)));
         assert!(Pin::new(&mut snapshot).poll(&mut cx).is_pending());
-        let mut listen_next_batch = Box::pin(listen.next());
+        let mut listen_next_batch = Box::pin(listen.next(None));
         assert!(Pin::new(&mut listen_next_batch).poll(&mut cx).is_pending());
 
         // Now update the frontier, which should allow the snapshot to resolve

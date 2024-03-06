@@ -41,11 +41,67 @@ statement ok
 CREATE MATERIALIZED VIEW mv AS
 SELECT * FROM t WHERE a IS NOT NULL
 
+statement ok
+CREATE VIEW hierarchical_group_by AS
+SELECT
+  a,
+  MIN(b),
+  MAX(DISTINCT b)
+FROM t
+GROUP BY a
+
+statement ok
+CREATE MATERIALIZED VIEW hierarchical_group_by_mv AS
+SELECT * FROM hierarchical_group_by
+
+statement ok
+CREATE VIEW hierarchical_global AS
+SELECT
+  MIN(b),
+  MAX(DISTINCT b)
+FROM t
+
+statement ok
+CREATE MATERIALIZED VIEW hierarchical_global_mv AS
+SELECT * FROM hierarchical_global
+
+statement ok
+CREATE VIEW collated_group_by AS
+SELECT
+  a,
+  COUNT(DISTINCT b),
+  STRING_AGG(b::text || '1',  ',') AS b1,
+  MIN(b),
+  MAX(DISTINCT b),
+  SUM(b),
+  STRING_AGG(b::text || '2',  ',') AS b2
+FROM t
+GROUP BY a
+
+statement ok
+CREATE MATERIALIZED VIEW collated_group_by_mv AS
+SELECT * FROM collated_group_by
+
+statement ok
+CREATE VIEW collated_global AS
+SELECT
+  COUNT(DISTINCT b),
+  STRING_AGG(b::text || '1',  ',') AS b1,
+  MIN(b),
+  MAX(DISTINCT b),
+  SUM(b),
+  STRING_AGG(b::text || '2',  ',') AS b2
+FROM t
+
+statement ok
+CREATE MATERIALIZED VIEW collated_global_mv AS
+SELECT * FROM collated_global
+
 mode cockroach
 
 # Test constant error.
 query T multiline
-EXPLAIN PHYSICAL PLAN WITH(no_fast_path) AS JSON FOR
+EXPLAIN PHYSICAL PLAN WITH(no fast path) AS JSON FOR
 SELECT 1 / 0
 ----
 {
@@ -56,7 +112,8 @@ SELECT 1 / 0
         "Constant": {
           "rows": {
             "Err": "DivisionByZero"
-          }
+          },
+          "node_id": 0
         }
       }
     }
@@ -67,7 +124,7 @@ EOF
 
 # Test constant with two elements.
 query T multiline
-EXPLAIN PHYSICAL PLAN WITH(no_fast_path) AS JSON FOR
+EXPLAIN PHYSICAL PLAN WITH(no fast path) AS JSON FOR
 (SELECT 1, 2) UNION ALL (SELECT 1, 2) UNION ALL (SELECT 3, 4)
 ----
 {
@@ -81,16 +138,10 @@ EXPLAIN PHYSICAL PLAN WITH(no_fast_path) AS JSON FOR
               [
                 {
                   "data": [
-                    4,
+                    42,
                     1,
-                    0,
-                    0,
-                    0,
-                    4,
-                    2,
-                    0,
-                    0,
-                    0
+                    42,
+                    2
                   ]
                 },
                 0,
@@ -99,23 +150,18 @@ EXPLAIN PHYSICAL PLAN WITH(no_fast_path) AS JSON FOR
               [
                 {
                   "data": [
-                    4,
+                    42,
                     3,
-                    0,
-                    0,
-                    0,
-                    4,
-                    4,
-                    0,
-                    0,
-                    0
+                    42,
+                    4
                   ]
                 },
                 0,
                 1
               ]
             ]
-          }
+          },
+          "node_id": 0
         }
       }
     }
@@ -129,7 +175,7 @@ EOF
 
 # PassArrangements plan (identity transform on an arranged input).
 query T multiline
-EXPLAIN PHYSICAL PLAN WITH(no_fast_path) AS JSON FOR
+EXPLAIN PHYSICAL PLAN WITH(no fast path) AS JSON FOR
 SELECT * FROM t
 ----
 {
@@ -160,9 +206,20 @@ SELECT * FROM t
                   1
                 ]
               ]
+            ],
+            "types": [
+              {
+                "scalar_type": "Int32",
+                "nullable": true
+              },
+              {
+                "scalar_type": "Int32",
+                "nullable": true
+              }
             ]
           },
-          "plan": "PassArrangements"
+          "plan": "PassArrangements",
+          "node_id": 0
         }
       }
     }
@@ -173,7 +230,7 @@ EOF
 
 # PassArrangements plan (identity transform on a raw input).
 query T multiline
-EXPLAIN PHYSICAL PLAN WITH(no_fast_path) AS JSON FOR
+EXPLAIN PHYSICAL PLAN WITH(no fast path) AS JSON FOR
 SELECT * FROM u
 ----
 {
@@ -189,9 +246,11 @@ SELECT * FROM u
           },
           "keys": {
             "raw": true,
-            "arranged": []
+            "arranged": [],
+            "types": null
           },
-          "plan": "PassArrangements"
+          "plan": "PassArrangements",
+          "node_id": 0
         }
       }
     }
@@ -202,7 +261,7 @@ EOF
 
 # GetArrangement plan (linear transform of an arranged input).
 query T multiline
-EXPLAIN PHYSICAL PLAN WITH(no_fast_path) AS JSON FOR
+EXPLAIN PHYSICAL PLAN WITH(no fast path) AS JSON FOR
 SELECT a + b, 1 FROM t
 ----
 {
@@ -233,6 +292,16 @@ SELECT a + b, 1 FROM t
                   1
                 ]
               ]
+            ],
+            "types": [
+              {
+                "scalar_type": "Int32",
+                "nullable": true
+              },
+              {
+                "scalar_type": "Int32",
+                "nullable": true
+              }
             ]
           },
           "plan": {
@@ -261,11 +330,8 @@ SELECT a + b, 1 FROM t
                       {
                         "Ok": {
                           "data": [
-                            4,
-                            1,
-                            0,
-                            0,
-                            0
+                            42,
+                            1
                           ]
                         }
                       },
@@ -284,7 +350,8 @@ SELECT a + b, 1 FROM t
                 "input_arity": 2
               }
             ]
-          }
+          },
+          "node_id": 0
         }
       }
     }
@@ -295,7 +362,7 @@ EOF
 
 # GetCollection plan (linear transform of a raw input).
 query T multiline
-EXPLAIN PHYSICAL PLAN WITH(no_fast_path) AS JSON FOR
+EXPLAIN PHYSICAL PLAN WITH(no fast path) AS JSON FOR
 SELECT c + d, 1 FROM u
 ----
 {
@@ -311,7 +378,8 @@ SELECT c + d, 1 FROM u
           },
           "keys": {
             "raw": true,
-            "arranged": []
+            "arranged": [],
+            "types": null
           },
           "plan": {
             "Collection": {
@@ -323,14 +391,17 @@ SELECT c + d, 1 FROM u
               ],
               "input_arity": 2
             }
-          }
+          },
+          "node_id": 0
         }
       }
     }
   ],
   "sources": [
     {
-      "id": "materialize.public.u",
+      "id": {
+        "User": 2
+      },
       "op": {
         "expressions": [
           {
@@ -349,11 +420,8 @@ SELECT c + d, 1 FROM u
               {
                 "Ok": {
                   "data": [
-                    4,
-                    1,
-                    0,
-                    0,
-                    0
+                    42,
+                    1
                   ]
                 }
               },
@@ -376,9 +444,9 @@ SELECT c + d, 1 FROM u
 }
 EOF
 
-# TopKBasic plan.
+# MonotonicTopK plan (one-shot).
 query T multiline
-EXPLAIN PHYSICAL PLAN WITH(no_fast_path) AS JSON FOR
+EXPLAIN PHYSICAL PLAN WITH(no fast path) AS JSON FOR
 SELECT * FROM ov
 ----
 {
@@ -413,14 +481,26 @@ SELECT * FROM ov
                           1
                         ]
                       ]
+                    ],
+                    "types": [
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      },
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      }
                     ]
                   },
-                  "plan": "PassArrangements"
+                  "plan": "PassArrangements",
+                  "node_id": 0
                 }
               },
               "forms": {
                 "raw": true,
-                "arranged": []
+                "arranged": [],
+                "types": null
               },
               "input_key": [
                 {
@@ -435,11 +515,12 @@ SELECT * FROM ov
                   1
                 ],
                 "input_arity": 2
-              }
+              },
+              "node_id": 1
             }
           },
           "top_k_plan": {
-            "Basic": {
+            "MonotonicTopK": {
               "group_key": [],
               "order_key": [
                 {
@@ -453,20 +534,27 @@ SELECT * FROM ov
                   "nulls_last": false
                 }
               ],
-              "limit": 5,
-              "offset": 0,
+              "limit": {
+                "Literal": [
+                  {
+                    "Ok": {
+                      "data": [
+                        47,
+                        5
+                      ]
+                    }
+                  },
+                  {
+                    "scalar_type": "Int64",
+                    "nullable": false
+                  }
+                ]
+              },
               "arity": 2,
-              "buckets": [
-                268435456,
-                16777216,
-                1048576,
-                65536,
-                4096,
-                256,
-                16
-              ]
+              "must_consolidate": true
             }
-          }
+          },
+          "node_id": 2
         }
       }
     }
@@ -515,6 +603,16 @@ SELECT a FROM t EXCEPT ALL SELECT b FROM mv
                                 1
                               ]
                             ]
+                          ],
+                          "types": [
+                            {
+                              "scalar_type": "Int32",
+                              "nullable": true
+                            },
+                            {
+                              "scalar_type": "Int32",
+                              "nullable": true
+                            }
                           ]
                         },
                         "plan": {
@@ -534,7 +632,8 @@ SELECT a FROM t EXCEPT ALL SELECT b FROM mv
                               "input_arity": 2
                             }
                           ]
-                        }
+                        },
+                        "node_id": 0
                       }
                     },
                     {
@@ -548,7 +647,8 @@ SELECT a FROM t EXCEPT ALL SELECT b FROM mv
                             },
                             "keys": {
                               "raw": true,
-                              "arranged": []
+                              "arranged": [],
+                              "types": null
                             },
                             "plan": {
                               "Collection": {
@@ -559,12 +659,16 @@ SELECT a FROM t EXCEPT ALL SELECT b FROM mv
                                 ],
                                 "input_arity": 1
                               }
-                            }
+                            },
+                            "node_id": 1
                           }
-                        }
+                        },
+                        "node_id": 2
                       }
                     }
-                  ]
+                  ],
+                  "consolidate_output": true,
+                  "node_id": 3
                 }
               },
               "forms": {
@@ -581,6 +685,12 @@ SELECT a FROM t EXCEPT ALL SELECT b FROM mv
                     },
                     []
                   ]
+                ],
+                "types": [
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  }
                 ]
               },
               "input_key": null,
@@ -591,7 +701,8 @@ SELECT a FROM t EXCEPT ALL SELECT b FROM mv
                   0
                 ],
                 "input_arity": 1
-              }
+              },
+              "node_id": 4
             }
           },
           "threshold_plan": {
@@ -608,14 +719,17 @@ SELECT a FROM t EXCEPT ALL SELECT b FROM mv
                 []
               ]
             }
-          }
+          },
+          "node_id": 5
         }
       }
     }
   ],
   "sources": [
     {
-      "id": "materialize.public.mv",
+      "id": {
+        "User": 7
+      },
       "op": {
         "expressions": [],
         "predicates": [],
@@ -631,12 +745,12 @@ EOF
 
 query T multiline
 EXPLAIN PHYSICAL PLAN WITH (TYPES) AS JSON FOR
-VIEW ov
+SELECT * FROM ov
 ----
 {
   "plans": [
     {
-      "id": "materialize.public.ov",
+      "id": "Explained Query",
       "plan": {
         "TopK": {
           "input": {
@@ -665,14 +779,26 @@ VIEW ov
                           1
                         ]
                       ]
+                    ],
+                    "types": [
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      },
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      }
                     ]
                   },
-                  "plan": "PassArrangements"
+                  "plan": "PassArrangements",
+                  "node_id": 0
                 }
               },
               "forms": {
                 "raw": true,
-                "arranged": []
+                "arranged": [],
+                "types": null
               },
               "input_key": [
                 {
@@ -687,11 +813,12 @@ VIEW ov
                   1
                 ],
                 "input_arity": 2
-              }
+              },
+              "node_id": 1
             }
           },
           "top_k_plan": {
-            "Basic": {
+            "MonotonicTopK": {
               "group_key": [],
               "order_key": [
                 {
@@ -705,20 +832,27 @@ VIEW ov
                   "nulls_last": false
                 }
               ],
-              "limit": 5,
-              "offset": 0,
+              "limit": {
+                "Literal": [
+                  {
+                    "Ok": {
+                      "data": [
+                        47,
+                        5
+                      ]
+                    }
+                  },
+                  {
+                    "scalar_type": "Int64",
+                    "nullable": false
+                  }
+                ]
+              },
               "arity": 2,
-              "buckets": [
-                268435456,
-                16777216,
-                1048576,
-                65536,
-                4096,
-                256,
-                16
-              ]
+              "must_consolidate": true
             }
-          }
+          },
+          "node_id": 2
         }
       }
     }
@@ -771,6 +905,16 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                                     1
                                   ]
                                 ]
+                              ],
+                              "types": [
+                                {
+                                  "scalar_type": "Int32",
+                                  "nullable": true
+                                },
+                                {
+                                  "scalar_type": "Int32",
+                                  "nullable": true
+                                }
                               ]
                             },
                             "plan": {
@@ -790,7 +934,8 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                                   "input_arity": 2
                                 }
                               ]
-                            }
+                            },
+                            "node_id": 0
                           }
                         },
                         {
@@ -804,7 +949,8 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                                 },
                                 "keys": {
                                   "raw": true,
-                                  "arranged": []
+                                  "arranged": [],
+                                  "types": null
                                 },
                                 "plan": {
                                   "Collection": {
@@ -815,12 +961,16 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                                     ],
                                     "input_arity": 1
                                   }
-                                }
+                                },
+                                "node_id": 1
                               }
-                            }
+                            },
+                            "node_id": 2
                           }
                         }
-                      ]
+                      ],
+                      "consolidate_output": true,
+                      "node_id": 3
                     }
                   },
                   "forms": {
@@ -837,6 +987,12 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                         },
                         []
                       ]
+                    ],
+                    "types": [
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      }
                     ]
                   },
                   "input_key": null,
@@ -847,7 +1003,8 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                       0
                     ],
                     "input_arity": 1
-                  }
+                  },
+                  "node_id": 4
                 }
               },
               "threshold_plan": {
@@ -864,7 +1021,8 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                     []
                   ]
                 }
-              }
+              },
+              "node_id": 5
             }
           },
           "body": {
@@ -889,6 +1047,12 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                           },
                           []
                         ]
+                      ],
+                      "types": [
+                        {
+                          "scalar_type": "Int32",
+                          "nullable": true
+                        }
                       ]
                     },
                     "plan": {
@@ -912,11 +1076,8 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                                     {
                                       "Ok": {
                                         "data": [
-                                          4,
-                                          1,
-                                          0,
-                                          0,
-                                          0
+                                          42,
+                                          1
                                         ]
                                       }
                                     },
@@ -936,7 +1097,8 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                           "input_arity": 1
                         }
                       ]
-                    }
+                    },
+                    "node_id": 6
                   }
                 },
                 {
@@ -958,6 +1120,12 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                           },
                           []
                         ]
+                      ],
+                      "types": [
+                        {
+                          "scalar_type": "Int32",
+                          "nullable": true
+                        }
                       ]
                     },
                     "plan": {
@@ -981,11 +1149,8 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                                     {
                                       "Ok": {
                                         "data": [
-                                          4,
-                                          1,
-                                          0,
-                                          0,
-                                          0
+                                          42,
+                                          1
                                         ]
                                       }
                                     },
@@ -1005,19 +1170,25 @@ WITH cte(x) as (SELECT a FROM t EXCEPT ALL SELECT b FROM mv)
                           "input_arity": 1
                         }
                       ]
-                    }
+                    },
+                    "node_id": 7
                   }
                 }
-              ]
+              ],
+              "consolidate_output": false,
+              "node_id": 8
             }
-          }
+          },
+          "node_id": 9
         }
       }
     }
   ],
   "sources": [
     {
-      "id": "materialize.public.mv",
+      "id": {
+        "User": 7
+      },
       "op": {
         "expressions": [],
         "predicates": [],
@@ -1077,9 +1248,20 @@ SELECT x * 5 FROM cte WHERE x = 5
                                           1
                                         ]
                                       ]
+                                    ],
+                                    "types": [
+                                      {
+                                        "scalar_type": "Int32",
+                                        "nullable": true
+                                      },
+                                      {
+                                        "scalar_type": "Int32",
+                                        "nullable": true
+                                      }
                                     ]
                                   },
-                                  "plan": "PassArrangements"
+                                  "plan": "PassArrangements",
+                                  "node_id": 0
                                 }
                               },
                               {
@@ -1091,22 +1273,20 @@ SELECT x * 5 FROM cte WHERE x = 5
                                           [
                                             {
                                               "data": [
-                                                4,
-                                                5,
-                                                0,
-                                                0,
-                                                0
+                                                42,
+                                                5
                                               ]
                                             },
                                             0,
                                             1
                                           ]
                                         ]
-                                      }
+                                      },
+                                      "node_id": 1
                                     }
                                   },
                                   "forms": {
-                                    "raw": false,
+                                    "raw": true,
                                     "arranged": [
                                       [
                                         [
@@ -1119,6 +1299,12 @@ SELECT x * 5 FROM cte WHERE x = 5
                                         },
                                         []
                                       ]
+                                    ],
+                                    "types": [
+                                      {
+                                        "scalar_type": "Int32",
+                                        "nullable": false
+                                      }
                                     ]
                                   },
                                   "input_key": null,
@@ -1129,7 +1315,8 @@ SELECT x * 5 FROM cte WHERE x = 5
                                       0
                                     ],
                                     "input_arity": 1
-                                  }
+                                  },
+                                  "node_id": 2
                                 }
                               }
                             ],
@@ -1173,7 +1360,8 @@ SELECT x * 5 FROM cte WHERE x = 5
                                 ],
                                 "final_closure": null
                               }
-                            }
+                            },
+                            "node_id": 3
                           }
                         },
                         {
@@ -1187,7 +1375,8 @@ SELECT x * 5 FROM cte WHERE x = 5
                                 },
                                 "keys": {
                                   "raw": true,
-                                  "arranged": []
+                                  "arranged": [],
+                                  "types": null
                                 },
                                 "plan": {
                                   "Collection": {
@@ -1198,12 +1387,16 @@ SELECT x * 5 FROM cte WHERE x = 5
                                     ],
                                     "input_arity": 1
                                   }
-                                }
+                                },
+                                "node_id": 4
                               }
-                            }
+                            },
+                            "node_id": 5
                           }
                         }
-                      ]
+                      ],
+                      "consolidate_output": true,
+                      "node_id": 6
                     }
                   },
                   "forms": {
@@ -1220,6 +1413,12 @@ SELECT x * 5 FROM cte WHERE x = 5
                         },
                         []
                       ]
+                    ],
+                    "types": [
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": false
+                      }
                     ]
                   },
                   "input_key": null,
@@ -1230,7 +1429,8 @@ SELECT x * 5 FROM cte WHERE x = 5
                       0
                     ],
                     "input_arity": 1
-                  }
+                  },
+                  "node_id": 7
                 }
               },
               "threshold_plan": {
@@ -1247,7 +1447,8 @@ SELECT x * 5 FROM cte WHERE x = 5
                     []
                   ]
                 }
-              }
+              },
+              "node_id": 8
             }
           },
           "mfp": {
@@ -1257,11 +1458,8 @@ SELECT x * 5 FROM cte WHERE x = 5
                   {
                     "Ok": {
                       "data": [
-                        4,
-                        25,
-                        0,
-                        0,
-                        0
+                        42,
+                        25
                       ]
                     }
                   },
@@ -1285,14 +1483,17 @@ SELECT x * 5 FROM cte WHERE x = 5
               }
             ],
             null
-          ]
+          ],
+          "node_id": 9
         }
       }
     }
   ],
   "sources": [
     {
-      "id": "materialize.public.mv",
+      "id": {
+        "User": 7
+      },
       "op": {
         "expressions": [],
         "predicates": [
@@ -1309,11 +1510,8 @@ SELECT x * 5 FROM cte WHERE x = 5
                     {
                       "Ok": {
                         "data": [
-                          4,
-                          5,
-                          0,
-                          0,
-                          0
+                          42,
+                          5
                         ]
                       }
                     },
@@ -1372,9 +1570,20 @@ SELECT generate_series(a, b) from t
                       1
                     ]
                   ]
+                ],
+                "types": [
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  },
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  }
                 ]
               },
-              "plan": "PassArrangements"
+              "plan": "PassArrangements",
+              "node_id": 0
             }
           },
           "func": "GenerateSeriesInt32",
@@ -1390,11 +1599,8 @@ SELECT generate_series(a, b) from t
                 {
                   "Ok": {
                     "data": [
-                      4,
-                      1,
-                      0,
-                      0,
-                      0
+                      42,
+                      1
                     ]
                   }
                 },
@@ -1405,7 +1611,7 @@ SELECT generate_series(a, b) from t
               ]
             }
           ],
-          "mfp": {
+          "mfp_after": {
             "expressions": [],
             "predicates": [],
             "projection": [
@@ -1417,7 +1623,8 @@ SELECT generate_series(a, b) from t
             {
               "Column": 0
             }
-          ]
+          ],
+          "node_id": 1
         }
       }
     }
@@ -1461,9 +1668,20 @@ SELECT DISTINCT a, b FROM t
                       1
                     ]
                   ]
+                ],
+                "types": [
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  },
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  }
                 ]
               },
-              "plan": "PassArrangements"
+              "plan": "PassArrangements",
+              "node_id": 0
             }
           },
           "key_val_plan": {
@@ -1492,7 +1710,17 @@ SELECT DISTINCT a, b FROM t
             {
               "Column": 0
             }
-          ]
+          ],
+          "mfp_after": {
+            "expressions": [],
+            "predicates": [],
+            "projection": [
+              0,
+              1
+            ],
+            "input_arity": 2
+          },
+          "node_id": 1
         }
       }
     }
@@ -1541,9 +1769,20 @@ GROUP BY a
                       1
                     ]
                   ]
+                ],
+                "types": [
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  },
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  }
                 ]
               },
-              "plan": "PassArrangements"
+              "plan": "PassArrangements",
+              "node_id": 0
             }
           },
           "key_val_plan": {
@@ -1619,7 +1858,18 @@ GROUP BY a
             {
               "Column": 0
             }
-          ]
+          ],
+          "mfp_after": {
+            "expressions": [],
+            "predicates": [],
+            "projection": [
+              0,
+              1,
+              2
+            ],
+            "input_arity": 3
+          },
+          "node_id": 1
         }
       }
     }
@@ -1669,6 +1919,16 @@ FROM t
                           1
                         ]
                       ]
+                    ],
+                    "types": [
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      },
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      }
                     ]
                   },
                   "plan": {
@@ -1688,7 +1948,8 @@ FROM t
                         "input_arity": 2
                       }
                     ]
-                  }
+                  },
+                  "node_id": 0
                 }
               },
               "key_val_plan": {
@@ -1758,7 +2019,17 @@ FROM t
                   ]
                 }
               },
-              "input_key": null
+              "input_key": null,
+              "mfp_after": {
+                "expressions": [],
+                "predicates": [],
+                "projection": [
+                  0,
+                  1
+                ],
+                "input_arity": 2
+              },
+              "node_id": 1
             }
           },
           "body": {
@@ -1785,14 +2056,17 @@ FROM t
                                 1
                               ]
                             ]
-                          ]
+                          ],
+                          "types": null
                         },
-                        "plan": "PassArrangements"
+                        "plan": "PassArrangements",
+                        "node_id": 2
                       }
                     },
                     "forms": {
                       "raw": true,
-                      "arranged": []
+                      "arranged": [],
+                      "types": null
                     },
                     "input_key": [],
                     "input_mfp": {
@@ -1803,7 +2077,8 @@ FROM t
                         1
                       ],
                       "input_arity": 2
-                    }
+                    },
+                    "node_id": 8
                   }
                 },
                 {
@@ -1832,7 +2107,8 @@ FROM t
                                           1
                                         ]
                                       ]
-                                    ]
+                                    ],
+                                    "types": null
                                   },
                                   "plan": {
                                     "Arrangement": [
@@ -1845,9 +2121,11 @@ FROM t
                                         "input_arity": 2
                                       }
                                     ]
-                                  }
+                                  },
+                                  "node_id": 3
                                 }
-                              }
+                              },
+                              "node_id": 4
                             }
                           },
                           {
@@ -1862,10 +2140,13 @@ FROM t
                                     1
                                   ]
                                 ]
-                              }
+                              },
+                              "node_id": 5
                             }
                           }
-                        ]
+                        ],
+                        "consolidate_output": true,
+                        "node_id": 6
                       }
                     },
                     "mfp": {
@@ -1890,15 +2171,7 @@ FROM t
                             {
                               "Ok": {
                                 "data": [
-                                  5,
-                                  0,
-                                  0,
-                                  0,
-                                  0,
-                                  0,
-                                  0,
-                                  0,
-                                  0
+                                  46
                                 ]
                               }
                             },
@@ -1916,12 +2189,16 @@ FROM t
                       ],
                       "input_arity": 0
                     },
-                    "input_key_val": null
+                    "input_key_val": null,
+                    "node_id": 7
                   }
                 }
-              ]
+              ],
+              "consolidate_output": false,
+              "node_id": 9
             }
-          }
+          },
+          "node_id": 10
         }
       }
     }
@@ -1930,15 +2207,10 @@ FROM t
 }
 EOF
 
-# Test Reduce::Hierarchical (with GROUP BY).
+# Test Reduce::Hierarchical (with GROUP BY, one-shot).
 query T multiline
 EXPLAIN PHYSICAL PLAN AS JSON FOR
-SELECT
-  a,
-  MIN(b),
-  MAX(DISTINCT b)
-FROM t
-GROUP BY a
+SELECT * FROM hierarchical_group_by
 ----
 {
   "plans": [
@@ -1970,9 +2242,20 @@ GROUP BY a
                       1
                     ]
                   ]
+                ],
+                "types": [
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  },
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  }
                 ]
               },
-              "plan": "PassArrangements"
+              "plan": "PassArrangements",
+              "node_id": 0
             }
           },
           "key_val_plan": {
@@ -2000,7 +2283,7 @@ GROUP BY a
           },
           "plan": {
             "Hierarchical": {
-              "Bucketed": {
+              "Monotonic": {
                 "aggr_funcs": [
                   "MinInt32",
                   "MaxInt32"
@@ -2009,15 +2292,7 @@ GROUP BY a
                   0,
                   0
                 ],
-                "buckets": [
-                  268435456,
-                  16777216,
-                  1048576,
-                  65536,
-                  4096,
-                  256,
-                  16
-                ]
+                "must_consolidate": true
               }
             }
           },
@@ -2025,7 +2300,18 @@ GROUP BY a
             {
               "Column": 0
             }
-          ]
+          ],
+          "mfp_after": {
+            "expressions": [],
+            "predicates": [],
+            "projection": [
+              0,
+              1,
+              2
+            ],
+            "input_arity": 3
+          },
+          "node_id": 1
         }
       }
     }
@@ -2037,15 +2323,12 @@ EOF
 # Test Reduce::Hierarchical (global aggregate).
 query T multiline
 EXPLAIN PHYSICAL PLAN AS JSON FOR
-SELECT
-  MIN(b),
-  MAX(DISTINCT b)
-FROM t
+MATERIALIZED VIEW hierarchical_global_mv
 ----
 {
   "plans": [
     {
-      "id": "Explained Query",
+      "id": "materialize.public.hierarchical_global_mv",
       "plan": {
         "Let": {
           "id": 0,
@@ -2075,6 +2358,16 @@ FROM t
                           1
                         ]
                       ]
+                    ],
+                    "types": [
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      },
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      }
                     ]
                   },
                   "plan": {
@@ -2094,7 +2387,8 @@ FROM t
                         "input_arity": 2
                       }
                     ]
-                  }
+                  },
+                  "node_id": 0
                 }
               },
               "key_val_plan": {
@@ -2141,7 +2435,17 @@ FROM t
                   }
                 }
               },
-              "input_key": null
+              "input_key": null,
+              "mfp_after": {
+                "expressions": [],
+                "predicates": [],
+                "projection": [
+                  0,
+                  1
+                ],
+                "input_arity": 2
+              },
+              "node_id": 1
             }
           },
           "body": {
@@ -2168,14 +2472,17 @@ FROM t
                                 1
                               ]
                             ]
-                          ]
+                          ],
+                          "types": null
                         },
-                        "plan": "PassArrangements"
+                        "plan": "PassArrangements",
+                        "node_id": 2
                       }
                     },
                     "forms": {
                       "raw": true,
-                      "arranged": []
+                      "arranged": [],
+                      "types": null
                     },
                     "input_key": [],
                     "input_mfp": {
@@ -2186,7 +2493,8 @@ FROM t
                         1
                       ],
                       "input_arity": 2
-                    }
+                    },
+                    "node_id": 8
                   }
                 },
                 {
@@ -2215,7 +2523,8 @@ FROM t
                                           1
                                         ]
                                       ]
-                                    ]
+                                    ],
+                                    "types": null
                                   },
                                   "plan": {
                                     "Arrangement": [
@@ -2228,9 +2537,11 @@ FROM t
                                         "input_arity": 2
                                       }
                                     ]
-                                  }
+                                  },
+                                  "node_id": 3
                                 }
-                              }
+                              },
+                              "node_id": 4
                             }
                           },
                           {
@@ -2245,10 +2556,13 @@ FROM t
                                     1
                                   ]
                                 ]
-                              }
+                              },
+                              "node_id": 5
                             }
                           }
-                        ]
+                        ],
+                        "consolidate_output": true,
+                        "node_id": 6
                       }
                     },
                     "mfp": {
@@ -2291,12 +2605,311 @@ FROM t
                       ],
                       "input_arity": 0
                     },
-                    "input_key_val": null
+                    "input_key_val": null,
+                    "node_id": 7
                   }
                 }
-              ]
+              ],
+              "consolidate_output": false,
+              "node_id": 9
             }
-          }
+          },
+          "node_id": 10
+        }
+      }
+    }
+  ],
+  "sources": []
+}
+EOF
+
+# Test Reduce::Hierarchical (global aggregate, one-shot).
+query T multiline
+EXPLAIN PHYSICAL PLAN AS JSON FOR
+SELECT * FROM hierarchical_global
+----
+{
+  "plans": [
+    {
+      "id": "Explained Query",
+      "plan": {
+        "Let": {
+          "id": 0,
+          "value": {
+            "Reduce": {
+              "input": {
+                "Get": {
+                  "id": {
+                    "Global": {
+                      "User": 1
+                    }
+                  },
+                  "keys": {
+                    "raw": false,
+                    "arranged": [
+                      [
+                        [
+                          {
+                            "Column": 0
+                          }
+                        ],
+                        {
+                          "0": 0,
+                          "1": 1
+                        },
+                        [
+                          1
+                        ]
+                      ]
+                    ],
+                    "types": [
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      },
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      }
+                    ]
+                  },
+                  "plan": {
+                    "Arrangement": [
+                      [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      null,
+                      {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          1
+                        ],
+                        "input_arity": 2
+                      }
+                    ]
+                  },
+                  "node_id": 0
+                }
+              },
+              "key_val_plan": {
+                "key_plan": {
+                  "mfp": {
+                    "expressions": [],
+                    "predicates": [],
+                    "projection": [],
+                    "input_arity": 1
+                  }
+                },
+                "val_plan": {
+                  "mfp": {
+                    "expressions": [],
+                    "predicates": [],
+                    "projection": [
+                      0,
+                      0
+                    ],
+                    "input_arity": 1
+                  }
+                }
+              },
+              "plan": {
+                "Hierarchical": {
+                  "Monotonic": {
+                    "aggr_funcs": [
+                      "MinInt32",
+                      "MaxInt32"
+                    ],
+                    "skips": [
+                      0,
+                      0
+                    ],
+                    "must_consolidate": true
+                  }
+                }
+              },
+              "input_key": null,
+              "mfp_after": {
+                "expressions": [],
+                "predicates": [],
+                "projection": [
+                  0,
+                  1
+                ],
+                "input_arity": 2
+              },
+              "node_id": 1
+            }
+          },
+          "body": {
+            "Union": {
+              "inputs": [
+                {
+                  "ArrangeBy": {
+                    "input": {
+                      "Get": {
+                        "id": {
+                          "Local": 0
+                        },
+                        "keys": {
+                          "raw": false,
+                          "arranged": [
+                            [
+                              [],
+                              {
+                                "0": 0,
+                                "1": 1
+                              },
+                              [
+                                0,
+                                1
+                              ]
+                            ]
+                          ],
+                          "types": null
+                        },
+                        "plan": "PassArrangements",
+                        "node_id": 2
+                      }
+                    },
+                    "forms": {
+                      "raw": true,
+                      "arranged": [],
+                      "types": null
+                    },
+                    "input_key": [],
+                    "input_mfp": {
+                      "expressions": [],
+                      "predicates": [],
+                      "projection": [
+                        0,
+                        1
+                      ],
+                      "input_arity": 2
+                    },
+                    "node_id": 8
+                  }
+                },
+                {
+                  "Mfp": {
+                    "input": {
+                      "Union": {
+                        "inputs": [
+                          {
+                            "Negate": {
+                              "input": {
+                                "Get": {
+                                  "id": {
+                                    "Local": 0
+                                  },
+                                  "keys": {
+                                    "raw": false,
+                                    "arranged": [
+                                      [
+                                        [],
+                                        {
+                                          "0": 0,
+                                          "1": 1
+                                        },
+                                        [
+                                          0,
+                                          1
+                                        ]
+                                      ]
+                                    ],
+                                    "types": null
+                                  },
+                                  "plan": {
+                                    "Arrangement": [
+                                      [],
+                                      null,
+                                      {
+                                        "expressions": [],
+                                        "predicates": [],
+                                        "projection": [],
+                                        "input_arity": 2
+                                      }
+                                    ]
+                                  },
+                                  "node_id": 3
+                                }
+                              },
+                              "node_id": 4
+                            }
+                          },
+                          {
+                            "Constant": {
+                              "rows": {
+                                "Ok": [
+                                  [
+                                    {
+                                      "data": []
+                                    },
+                                    0,
+                                    1
+                                  ]
+                                ]
+                              },
+                              "node_id": 5
+                            }
+                          }
+                        ],
+                        "consolidate_output": true,
+                        "node_id": 6
+                      }
+                    },
+                    "mfp": {
+                      "expressions": [
+                        {
+                          "Literal": [
+                            {
+                              "Ok": {
+                                "data": [
+                                  0
+                                ]
+                              }
+                            },
+                            {
+                              "scalar_type": "Int32",
+                              "nullable": true
+                            }
+                          ]
+                        },
+                        {
+                          "Literal": [
+                            {
+                              "Ok": {
+                                "data": [
+                                  0
+                                ]
+                              }
+                            },
+                            {
+                              "scalar_type": "Int32",
+                              "nullable": true
+                            }
+                          ]
+                        }
+                      ],
+                      "predicates": [],
+                      "projection": [
+                        0,
+                        1
+                      ],
+                      "input_arity": 0
+                    },
+                    "input_key_val": null,
+                    "node_id": 7
+                  }
+                }
+              ],
+              "consolidate_output": false,
+              "node_id": 9
+            }
+          },
+          "node_id": 10
         }
       }
     }
@@ -2345,9 +2958,20 @@ GROUP BY a
                       1
                     ]
                   ]
+                ],
+                "types": [
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  },
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  }
                 ]
               },
-              "plan": "PassArrangements"
+              "plan": "PassArrangements",
+              "node_id": 0
             }
           },
           "key_val_plan": {
@@ -2706,7 +3330,18 @@ GROUP BY a
             {
               "Column": 0
             }
-          ]
+          ],
+          "mfp_after": {
+            "expressions": [],
+            "predicates": [],
+            "projection": [
+              0,
+              1,
+              2
+            ],
+            "input_arity": 3
+          },
+          "node_id": 1
         }
       }
     }
@@ -2756,6 +3391,16 @@ FROM t
                           1
                         ]
                       ]
+                    ],
+                    "types": [
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      },
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      }
                     ]
                   },
                   "plan": {
@@ -2775,7 +3420,8 @@ FROM t
                         "input_arity": 2
                       }
                     ]
-                  }
+                  },
+                  "node_id": 0
                 }
               },
               "key_val_plan": {
@@ -3128,7 +3774,17 @@ FROM t
                   ]
                 }
               },
-              "input_key": null
+              "input_key": null,
+              "mfp_after": {
+                "expressions": [],
+                "predicates": [],
+                "projection": [
+                  0,
+                  1
+                ],
+                "input_arity": 2
+              },
+              "node_id": 1
             }
           },
           "body": {
@@ -3155,14 +3811,17 @@ FROM t
                                 1
                               ]
                             ]
-                          ]
+                          ],
+                          "types": null
                         },
-                        "plan": "PassArrangements"
+                        "plan": "PassArrangements",
+                        "node_id": 2
                       }
                     },
                     "forms": {
                       "raw": true,
-                      "arranged": []
+                      "arranged": [],
+                      "types": null
                     },
                     "input_key": [],
                     "input_mfp": {
@@ -3173,7 +3832,8 @@ FROM t
                         1
                       ],
                       "input_arity": 2
-                    }
+                    },
+                    "node_id": 8
                   }
                 },
                 {
@@ -3202,7 +3862,8 @@ FROM t
                                           1
                                         ]
                                       ]
-                                    ]
+                                    ],
+                                    "types": null
                                   },
                                   "plan": {
                                     "Arrangement": [
@@ -3215,9 +3876,11 @@ FROM t
                                         "input_arity": 2
                                       }
                                     ]
-                                  }
+                                  },
+                                  "node_id": 3
                                 }
-                              }
+                              },
+                              "node_id": 4
                             }
                           },
                           {
@@ -3232,10 +3895,13 @@ FROM t
                                     1
                                   ]
                                 ]
-                              }
+                              },
+                              "node_id": 5
                             }
                           }
-                        ]
+                        ],
+                        "consolidate_output": true,
+                        "node_id": 6
                       }
                     },
                     "mfp": {
@@ -3278,12 +3944,16 @@ FROM t
                       ],
                       "input_arity": 0
                     },
-                    "input_key_val": null
+                    "input_key_val": null,
+                    "node_id": 7
                   }
                 }
-              ]
+              ],
+              "consolidate_output": false,
+              "node_id": 9
             }
-          }
+          },
+          "node_id": 10
         }
       }
     }
@@ -3295,21 +3965,12 @@ EOF
 # Test Reduce::Collated (with GROUP BY).
 query T multiline
 EXPLAIN PHYSICAL PLAN AS JSON FOR
-SELECT
-  a,
-  COUNT(DISTINCT b),
-  STRING_AGG(b::text || '1',  ','),
-  MIN(b),
-  MAX(DISTINCT b),
-  SUM(b),
-  STRING_AGG(b::text || '2',  ',')
-FROM t
-GROUP BY a
+MATERIALIZED VIEW collated_group_by_mv
 ----
 {
   "plans": [
     {
-      "id": "Explained Query",
+      "id": "materialize.public.collated_group_by_mv",
       "plan": {
         "Reduce": {
           "input": {
@@ -3336,9 +3997,20 @@ GROUP BY a
                       1
                     ]
                   ]
+                ],
+                "types": [
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  },
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  }
                 ]
               },
-              "plan": "PassArrangements"
+              "plan": "PassArrangements",
+              "node_id": 0
             }
           },
           "key_val_plan": {
@@ -3776,7 +4448,524 @@ GROUP BY a
             {
               "Column": 0
             }
-          ]
+          ],
+          "mfp_after": {
+            "expressions": [],
+            "predicates": [],
+            "projection": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "input_arity": 7
+          },
+          "node_id": 1
+        }
+      }
+    }
+  ],
+  "sources": []
+}
+EOF
+
+# Test Reduce::Collated (with GROUP BY, one-shot).
+query T multiline
+EXPLAIN PHYSICAL PLAN AS JSON FOR
+SELECT * FROM collated_group_by
+----
+{
+  "plans": [
+    {
+      "id": "Explained Query",
+      "plan": {
+        "Reduce": {
+          "input": {
+            "Get": {
+              "id": {
+                "Global": {
+                  "User": 1
+                }
+              },
+              "keys": {
+                "raw": false,
+                "arranged": [
+                  [
+                    [
+                      {
+                        "Column": 0
+                      }
+                    ],
+                    {
+                      "0": 0,
+                      "1": 1
+                    },
+                    [
+                      1
+                    ]
+                  ]
+                ],
+                "types": [
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  },
+                  {
+                    "scalar_type": "Int32",
+                    "nullable": true
+                  }
+                ]
+              },
+              "plan": "PassArrangements",
+              "node_id": 0
+            }
+          },
+          "key_val_plan": {
+            "key_plan": {
+              "mfp": {
+                "expressions": [],
+                "predicates": [],
+                "projection": [
+                  0
+                ],
+                "input_arity": 2
+              }
+            },
+            "val_plan": {
+              "mfp": {
+                "expressions": [
+                  {
+                    "CallUnary": {
+                      "func": {
+                        "CastInt32ToString": null
+                      },
+                      "expr": {
+                        "Column": 1
+                      }
+                    }
+                  },
+                  {
+                    "CallVariadic": {
+                      "func": {
+                        "RecordCreate": {
+                          "field_names": [
+                            ""
+                          ]
+                        }
+                      },
+                      "exprs": [
+                        {
+                          "CallVariadic": {
+                            "func": {
+                              "RecordCreate": {
+                                "field_names": [
+                                  "value",
+                                  "sep"
+                                ]
+                              }
+                            },
+                            "exprs": [
+                              {
+                                "CallBinary": {
+                                  "func": "TextConcat",
+                                  "expr1": {
+                                    "Column": 2
+                                  },
+                                  "expr2": {
+                                    "Literal": [
+                                      {
+                                        "Ok": {
+                                          "data": [
+                                            19,
+                                            1,
+                                            49
+                                          ]
+                                        }
+                                      },
+                                      {
+                                        "scalar_type": "String",
+                                        "nullable": false
+                                      }
+                                    ]
+                                  }
+                                }
+                              },
+                              {
+                                "Literal": [
+                                  {
+                                    "Ok": {
+                                      "data": [
+                                        19,
+                                        1,
+                                        44
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "scalar_type": "String",
+                                    "nullable": false
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "CallVariadic": {
+                      "func": {
+                        "RecordCreate": {
+                          "field_names": [
+                            ""
+                          ]
+                        }
+                      },
+                      "exprs": [
+                        {
+                          "CallVariadic": {
+                            "func": {
+                              "RecordCreate": {
+                                "field_names": [
+                                  "value",
+                                  "sep"
+                                ]
+                              }
+                            },
+                            "exprs": [
+                              {
+                                "CallBinary": {
+                                  "func": "TextConcat",
+                                  "expr1": {
+                                    "Column": 2
+                                  },
+                                  "expr2": {
+                                    "Literal": [
+                                      {
+                                        "Ok": {
+                                          "data": [
+                                            19,
+                                            1,
+                                            50
+                                          ]
+                                        }
+                                      },
+                                      {
+                                        "scalar_type": "String",
+                                        "nullable": false
+                                      }
+                                    ]
+                                  }
+                                }
+                              },
+                              {
+                                "Literal": [
+                                  {
+                                    "Ok": {
+                                      "data": [
+                                        19,
+                                        1,
+                                        44
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "scalar_type": "String",
+                                    "nullable": false
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ],
+                "predicates": [],
+                "projection": [
+                  1,
+                  3,
+                  1,
+                  1,
+                  1,
+                  4
+                ],
+                "input_arity": 2
+              }
+            }
+          },
+          "plan": {
+            "Collation": {
+              "accumulable": {
+                "full_aggrs": [
+                  {
+                    "func": "Count",
+                    "expr": {
+                      "Column": 1
+                    },
+                    "distinct": true
+                  },
+                  {
+                    "func": "SumInt32",
+                    "expr": {
+                      "Column": 1
+                    },
+                    "distinct": false
+                  }
+                ],
+                "simple_aggrs": [
+                  [
+                    1,
+                    4,
+                    {
+                      "func": "SumInt32",
+                      "expr": {
+                        "Column": 1
+                      },
+                      "distinct": false
+                    }
+                  ]
+                ],
+                "distinct_aggrs": [
+                  [
+                    0,
+                    0,
+                    {
+                      "func": "Count",
+                      "expr": {
+                        "Column": 1
+                      },
+                      "distinct": true
+                    }
+                  ]
+                ]
+              },
+              "hierarchical": {
+                "Monotonic": {
+                  "aggr_funcs": [
+                    "MinInt32",
+                    "MaxInt32"
+                  ],
+                  "skips": [
+                    2,
+                    0
+                  ],
+                  "must_consolidate": true
+                }
+              },
+              "basic": {
+                "Multiple": [
+                  [
+                    1,
+                    {
+                      "func": {
+                        "StringAgg": {
+                          "order_by": []
+                        }
+                      },
+                      "expr": {
+                        "CallVariadic": {
+                          "func": {
+                            "RecordCreate": {
+                              "field_names": [
+                                ""
+                              ]
+                            }
+                          },
+                          "exprs": [
+                            {
+                              "CallVariadic": {
+                                "func": {
+                                  "RecordCreate": {
+                                    "field_names": [
+                                      "value",
+                                      "sep"
+                                    ]
+                                  }
+                                },
+                                "exprs": [
+                                  {
+                                    "CallBinary": {
+                                      "func": "TextConcat",
+                                      "expr1": {
+                                        "CallUnary": {
+                                          "func": {
+                                            "CastInt32ToString": null
+                                          },
+                                          "expr": {
+                                            "Column": 1
+                                          }
+                                        }
+                                      },
+                                      "expr2": {
+                                        "Literal": [
+                                          {
+                                            "Ok": {
+                                              "data": [
+                                                19,
+                                                1,
+                                                49
+                                              ]
+                                            }
+                                          },
+                                          {
+                                            "scalar_type": "String",
+                                            "nullable": false
+                                          }
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  {
+                                    "Literal": [
+                                      {
+                                        "Ok": {
+                                          "data": [
+                                            19,
+                                            1,
+                                            44
+                                          ]
+                                        }
+                                      },
+                                      {
+                                        "scalar_type": "String",
+                                        "nullable": false
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      "distinct": false
+                    }
+                  ],
+                  [
+                    5,
+                    {
+                      "func": {
+                        "StringAgg": {
+                          "order_by": []
+                        }
+                      },
+                      "expr": {
+                        "CallVariadic": {
+                          "func": {
+                            "RecordCreate": {
+                              "field_names": [
+                                ""
+                              ]
+                            }
+                          },
+                          "exprs": [
+                            {
+                              "CallVariadic": {
+                                "func": {
+                                  "RecordCreate": {
+                                    "field_names": [
+                                      "value",
+                                      "sep"
+                                    ]
+                                  }
+                                },
+                                "exprs": [
+                                  {
+                                    "CallBinary": {
+                                      "func": "TextConcat",
+                                      "expr1": {
+                                        "CallUnary": {
+                                          "func": {
+                                            "CastInt32ToString": null
+                                          },
+                                          "expr": {
+                                            "Column": 1
+                                          }
+                                        }
+                                      },
+                                      "expr2": {
+                                        "Literal": [
+                                          {
+                                            "Ok": {
+                                              "data": [
+                                                19,
+                                                1,
+                                                50
+                                              ]
+                                            }
+                                          },
+                                          {
+                                            "scalar_type": "String",
+                                            "nullable": false
+                                          }
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  {
+                                    "Literal": [
+                                      {
+                                        "Ok": {
+                                          "data": [
+                                            19,
+                                            1,
+                                            44
+                                          ]
+                                        }
+                                      },
+                                      {
+                                        "scalar_type": "String",
+                                        "nullable": false
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      "distinct": false
+                    }
+                  ]
+                ]
+              },
+              "aggregate_types": [
+                "Accumulable",
+                "Basic",
+                "Hierarchical",
+                "Hierarchical",
+                "Accumulable",
+                "Basic"
+              ]
+            }
+          },
+          "input_key": [
+            {
+              "Column": 0
+            }
+          ],
+          "mfp_after": {
+            "expressions": [],
+            "predicates": [],
+            "projection": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "input_arity": 7
+          },
+          "node_id": 1
         }
       }
     }
@@ -3788,19 +4977,12 @@ EOF
 # Test Reduce::Collated (global aggregate).
 query T multiline
 EXPLAIN PHYSICAL PLAN AS JSON FOR
-SELECT
-  COUNT(DISTINCT b),
-  STRING_AGG(b::text || '1',  ','),
-  MIN(b),
-  MAX(DISTINCT b),
-  SUM(b),
-  STRING_AGG(b::text || '2',  ',')
-FROM t
+MATERIALIZED VIEW collated_global_mv
 ----
 {
   "plans": [
     {
-      "id": "Explained Query",
+      "id": "materialize.public.collated_global_mv",
       "plan": {
         "Let": {
           "id": 0,
@@ -3830,6 +5012,16 @@ FROM t
                           1
                         ]
                       ]
+                    ],
+                    "types": [
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      },
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      }
                     ]
                   },
                   "plan": {
@@ -3849,7 +5041,8 @@ FROM t
                         "input_arity": 2
                       }
                     ]
-                  }
+                  },
+                  "node_id": 0
                 }
               },
               "key_val_plan": {
@@ -4281,7 +5474,21 @@ FROM t
                   ]
                 }
               },
-              "input_key": null
+              "input_key": null,
+              "mfp_after": {
+                "expressions": [],
+                "predicates": [],
+                "projection": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5
+                ],
+                "input_arity": 6
+              },
+              "node_id": 1
             }
           },
           "body": {
@@ -4316,14 +5523,17 @@ FROM t
                                 5
                               ]
                             ]
-                          ]
+                          ],
+                          "types": null
                         },
-                        "plan": "PassArrangements"
+                        "plan": "PassArrangements",
+                        "node_id": 2
                       }
                     },
                     "forms": {
                       "raw": true,
-                      "arranged": []
+                      "arranged": [],
+                      "types": null
                     },
                     "input_key": [],
                     "input_mfp": {
@@ -4338,7 +5548,8 @@ FROM t
                         5
                       ],
                       "input_arity": 6
-                    }
+                    },
+                    "node_id": 8
                   }
                 },
                 {
@@ -4375,7 +5586,8 @@ FROM t
                                           5
                                         ]
                                       ]
-                                    ]
+                                    ],
+                                    "types": null
                                   },
                                   "plan": {
                                     "Arrangement": [
@@ -4388,9 +5600,11 @@ FROM t
                                         "input_arity": 6
                                       }
                                     ]
-                                  }
+                                  },
+                                  "node_id": 3
                                 }
-                              }
+                              },
+                              "node_id": 4
                             }
                           },
                           {
@@ -4405,10 +5619,13 @@ FROM t
                                     1
                                   ]
                                 ]
-                              }
+                              },
+                              "node_id": 5
                             }
                           }
-                        ]
+                        ],
+                        "consolidate_output": true,
+                        "node_id": 6
                       }
                     },
                     "mfp": {
@@ -4418,15 +5635,7 @@ FROM t
                             {
                               "Ok": {
                                 "data": [
-                                  5,
-                                  0,
-                                  0,
-                                  0,
-                                  0,
-                                  0,
-                                  0,
-                                  0,
-                                  0
+                                  46
                                 ]
                               }
                             },
@@ -4523,12 +5732,784 @@ FROM t
                       ],
                       "input_arity": 0
                     },
-                    "input_key_val": null
+                    "input_key_val": null,
+                    "node_id": 7
                   }
                 }
-              ]
+              ],
+              "consolidate_output": false,
+              "node_id": 9
             }
-          }
+          },
+          "node_id": 10
+        }
+      }
+    }
+  ],
+  "sources": []
+}
+EOF
+
+# Test Reduce::Collated (global aggregate, one-shot).
+query T multiline
+EXPLAIN PHYSICAL PLAN AS JSON FOR
+SELECT * FROM collated_global
+----
+{
+  "plans": [
+    {
+      "id": "Explained Query",
+      "plan": {
+        "Let": {
+          "id": 0,
+          "value": {
+            "Reduce": {
+              "input": {
+                "Get": {
+                  "id": {
+                    "Global": {
+                      "User": 1
+                    }
+                  },
+                  "keys": {
+                    "raw": false,
+                    "arranged": [
+                      [
+                        [
+                          {
+                            "Column": 0
+                          }
+                        ],
+                        {
+                          "0": 0,
+                          "1": 1
+                        },
+                        [
+                          1
+                        ]
+                      ]
+                    ],
+                    "types": [
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      },
+                      {
+                        "scalar_type": "Int32",
+                        "nullable": true
+                      }
+                    ]
+                  },
+                  "plan": {
+                    "Arrangement": [
+                      [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      null,
+                      {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          1
+                        ],
+                        "input_arity": 2
+                      }
+                    ]
+                  },
+                  "node_id": 0
+                }
+              },
+              "key_val_plan": {
+                "key_plan": {
+                  "mfp": {
+                    "expressions": [],
+                    "predicates": [],
+                    "projection": [],
+                    "input_arity": 1
+                  }
+                },
+                "val_plan": {
+                  "mfp": {
+                    "expressions": [
+                      {
+                        "CallUnary": {
+                          "func": {
+                            "CastInt32ToString": null
+                          },
+                          "expr": {
+                            "Column": 0
+                          }
+                        }
+                      },
+                      {
+                        "CallVariadic": {
+                          "func": {
+                            "RecordCreate": {
+                              "field_names": [
+                                ""
+                              ]
+                            }
+                          },
+                          "exprs": [
+                            {
+                              "CallVariadic": {
+                                "func": {
+                                  "RecordCreate": {
+                                    "field_names": [
+                                      "value",
+                                      "sep"
+                                    ]
+                                  }
+                                },
+                                "exprs": [
+                                  {
+                                    "CallBinary": {
+                                      "func": "TextConcat",
+                                      "expr1": {
+                                        "Column": 1
+                                      },
+                                      "expr2": {
+                                        "Literal": [
+                                          {
+                                            "Ok": {
+                                              "data": [
+                                                19,
+                                                1,
+                                                49
+                                              ]
+                                            }
+                                          },
+                                          {
+                                            "scalar_type": "String",
+                                            "nullable": false
+                                          }
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  {
+                                    "Literal": [
+                                      {
+                                        "Ok": {
+                                          "data": [
+                                            19,
+                                            1,
+                                            44
+                                          ]
+                                        }
+                                      },
+                                      {
+                                        "scalar_type": "String",
+                                        "nullable": false
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "CallVariadic": {
+                          "func": {
+                            "RecordCreate": {
+                              "field_names": [
+                                ""
+                              ]
+                            }
+                          },
+                          "exprs": [
+                            {
+                              "CallVariadic": {
+                                "func": {
+                                  "RecordCreate": {
+                                    "field_names": [
+                                      "value",
+                                      "sep"
+                                    ]
+                                  }
+                                },
+                                "exprs": [
+                                  {
+                                    "CallBinary": {
+                                      "func": "TextConcat",
+                                      "expr1": {
+                                        "Column": 1
+                                      },
+                                      "expr2": {
+                                        "Literal": [
+                                          {
+                                            "Ok": {
+                                              "data": [
+                                                19,
+                                                1,
+                                                50
+                                              ]
+                                            }
+                                          },
+                                          {
+                                            "scalar_type": "String",
+                                            "nullable": false
+                                          }
+                                        ]
+                                      }
+                                    }
+                                  },
+                                  {
+                                    "Literal": [
+                                      {
+                                        "Ok": {
+                                          "data": [
+                                            19,
+                                            1,
+                                            44
+                                          ]
+                                        }
+                                      },
+                                      {
+                                        "scalar_type": "String",
+                                        "nullable": false
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ],
+                    "predicates": [],
+                    "projection": [
+                      0,
+                      2,
+                      0,
+                      0,
+                      0,
+                      3
+                    ],
+                    "input_arity": 1
+                  }
+                }
+              },
+              "plan": {
+                "Collation": {
+                  "accumulable": {
+                    "full_aggrs": [
+                      {
+                        "func": "Count",
+                        "expr": {
+                          "Column": 0
+                        },
+                        "distinct": true
+                      },
+                      {
+                        "func": "SumInt32",
+                        "expr": {
+                          "Column": 0
+                        },
+                        "distinct": false
+                      }
+                    ],
+                    "simple_aggrs": [
+                      [
+                        1,
+                        4,
+                        {
+                          "func": "SumInt32",
+                          "expr": {
+                            "Column": 0
+                          },
+                          "distinct": false
+                        }
+                      ]
+                    ],
+                    "distinct_aggrs": [
+                      [
+                        0,
+                        0,
+                        {
+                          "func": "Count",
+                          "expr": {
+                            "Column": 0
+                          },
+                          "distinct": true
+                        }
+                      ]
+                    ]
+                  },
+                  "hierarchical": {
+                    "Monotonic": {
+                      "aggr_funcs": [
+                        "MinInt32",
+                        "MaxInt32"
+                      ],
+                      "skips": [
+                        2,
+                        0
+                      ],
+                      "must_consolidate": true
+                    }
+                  },
+                  "basic": {
+                    "Multiple": [
+                      [
+                        1,
+                        {
+                          "func": {
+                            "StringAgg": {
+                              "order_by": []
+                            }
+                          },
+                          "expr": {
+                            "CallVariadic": {
+                              "func": {
+                                "RecordCreate": {
+                                  "field_names": [
+                                    ""
+                                  ]
+                                }
+                              },
+                              "exprs": [
+                                {
+                                  "CallVariadic": {
+                                    "func": {
+                                      "RecordCreate": {
+                                        "field_names": [
+                                          "value",
+                                          "sep"
+                                        ]
+                                      }
+                                    },
+                                    "exprs": [
+                                      {
+                                        "CallBinary": {
+                                          "func": "TextConcat",
+                                          "expr1": {
+                                            "CallUnary": {
+                                              "func": {
+                                                "CastInt32ToString": null
+                                              },
+                                              "expr": {
+                                                "Column": 0
+                                              }
+                                            }
+                                          },
+                                          "expr2": {
+                                            "Literal": [
+                                              {
+                                                "Ok": {
+                                                  "data": [
+                                                    19,
+                                                    1,
+                                                    49
+                                                  ]
+                                                }
+                                              },
+                                              {
+                                                "scalar_type": "String",
+                                                "nullable": false
+                                              }
+                                            ]
+                                          }
+                                        }
+                                      },
+                                      {
+                                        "Literal": [
+                                          {
+                                            "Ok": {
+                                              "data": [
+                                                19,
+                                                1,
+                                                44
+                                              ]
+                                            }
+                                          },
+                                          {
+                                            "scalar_type": "String",
+                                            "nullable": false
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "distinct": false
+                        }
+                      ],
+                      [
+                        5,
+                        {
+                          "func": {
+                            "StringAgg": {
+                              "order_by": []
+                            }
+                          },
+                          "expr": {
+                            "CallVariadic": {
+                              "func": {
+                                "RecordCreate": {
+                                  "field_names": [
+                                    ""
+                                  ]
+                                }
+                              },
+                              "exprs": [
+                                {
+                                  "CallVariadic": {
+                                    "func": {
+                                      "RecordCreate": {
+                                        "field_names": [
+                                          "value",
+                                          "sep"
+                                        ]
+                                      }
+                                    },
+                                    "exprs": [
+                                      {
+                                        "CallBinary": {
+                                          "func": "TextConcat",
+                                          "expr1": {
+                                            "CallUnary": {
+                                              "func": {
+                                                "CastInt32ToString": null
+                                              },
+                                              "expr": {
+                                                "Column": 0
+                                              }
+                                            }
+                                          },
+                                          "expr2": {
+                                            "Literal": [
+                                              {
+                                                "Ok": {
+                                                  "data": [
+                                                    19,
+                                                    1,
+                                                    50
+                                                  ]
+                                                }
+                                              },
+                                              {
+                                                "scalar_type": "String",
+                                                "nullable": false
+                                              }
+                                            ]
+                                          }
+                                        }
+                                      },
+                                      {
+                                        "Literal": [
+                                          {
+                                            "Ok": {
+                                              "data": [
+                                                19,
+                                                1,
+                                                44
+                                              ]
+                                            }
+                                          },
+                                          {
+                                            "scalar_type": "String",
+                                            "nullable": false
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "distinct": false
+                        }
+                      ]
+                    ]
+                  },
+                  "aggregate_types": [
+                    "Accumulable",
+                    "Basic",
+                    "Hierarchical",
+                    "Hierarchical",
+                    "Accumulable",
+                    "Basic"
+                  ]
+                }
+              },
+              "input_key": null,
+              "mfp_after": {
+                "expressions": [],
+                "predicates": [],
+                "projection": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4,
+                  5
+                ],
+                "input_arity": 6
+              },
+              "node_id": 1
+            }
+          },
+          "body": {
+            "Union": {
+              "inputs": [
+                {
+                  "ArrangeBy": {
+                    "input": {
+                      "Get": {
+                        "id": {
+                          "Local": 0
+                        },
+                        "keys": {
+                          "raw": false,
+                          "arranged": [
+                            [
+                              [],
+                              {
+                                "0": 0,
+                                "1": 1,
+                                "2": 2,
+                                "3": 3,
+                                "4": 4,
+                                "5": 5
+                              },
+                              [
+                                0,
+                                1,
+                                2,
+                                3,
+                                4,
+                                5
+                              ]
+                            ]
+                          ],
+                          "types": null
+                        },
+                        "plan": "PassArrangements",
+                        "node_id": 2
+                      }
+                    },
+                    "forms": {
+                      "raw": true,
+                      "arranged": [],
+                      "types": null
+                    },
+                    "input_key": [],
+                    "input_mfp": {
+                      "expressions": [],
+                      "predicates": [],
+                      "projection": [
+                        0,
+                        1,
+                        2,
+                        3,
+                        4,
+                        5
+                      ],
+                      "input_arity": 6
+                    },
+                    "node_id": 8
+                  }
+                },
+                {
+                  "Mfp": {
+                    "input": {
+                      "Union": {
+                        "inputs": [
+                          {
+                            "Negate": {
+                              "input": {
+                                "Get": {
+                                  "id": {
+                                    "Local": 0
+                                  },
+                                  "keys": {
+                                    "raw": false,
+                                    "arranged": [
+                                      [
+                                        [],
+                                        {
+                                          "0": 0,
+                                          "1": 1,
+                                          "2": 2,
+                                          "3": 3,
+                                          "4": 4,
+                                          "5": 5
+                                        },
+                                        [
+                                          0,
+                                          1,
+                                          2,
+                                          3,
+                                          4,
+                                          5
+                                        ]
+                                      ]
+                                    ],
+                                    "types": null
+                                  },
+                                  "plan": {
+                                    "Arrangement": [
+                                      [],
+                                      null,
+                                      {
+                                        "expressions": [],
+                                        "predicates": [],
+                                        "projection": [],
+                                        "input_arity": 6
+                                      }
+                                    ]
+                                  },
+                                  "node_id": 3
+                                }
+                              },
+                              "node_id": 4
+                            }
+                          },
+                          {
+                            "Constant": {
+                              "rows": {
+                                "Ok": [
+                                  [
+                                    {
+                                      "data": []
+                                    },
+                                    0,
+                                    1
+                                  ]
+                                ]
+                              },
+                              "node_id": 5
+                            }
+                          }
+                        ],
+                        "consolidate_output": true,
+                        "node_id": 6
+                      }
+                    },
+                    "mfp": {
+                      "expressions": [
+                        {
+                          "Literal": [
+                            {
+                              "Ok": {
+                                "data": [
+                                  46
+                                ]
+                              }
+                            },
+                            {
+                              "scalar_type": "Int64",
+                              "nullable": false
+                            }
+                          ]
+                        },
+                        {
+                          "Literal": [
+                            {
+                              "Ok": {
+                                "data": [
+                                  0
+                                ]
+                              }
+                            },
+                            {
+                              "scalar_type": "String",
+                              "nullable": true
+                            }
+                          ]
+                        },
+                        {
+                          "Literal": [
+                            {
+                              "Ok": {
+                                "data": [
+                                  0
+                                ]
+                              }
+                            },
+                            {
+                              "scalar_type": "Int32",
+                              "nullable": true
+                            }
+                          ]
+                        },
+                        {
+                          "Literal": [
+                            {
+                              "Ok": {
+                                "data": [
+                                  0
+                                ]
+                              }
+                            },
+                            {
+                              "scalar_type": "Int32",
+                              "nullable": true
+                            }
+                          ]
+                        },
+                        {
+                          "Literal": [
+                            {
+                              "Ok": {
+                                "data": [
+                                  0
+                                ]
+                              }
+                            },
+                            {
+                              "scalar_type": "Int64",
+                              "nullable": true
+                            }
+                          ]
+                        },
+                        {
+                          "Literal": [
+                            {
+                              "Ok": {
+                                "data": [
+                                  0
+                                ]
+                              }
+                            },
+                            {
+                              "scalar_type": "String",
+                              "nullable": true
+                            }
+                          ]
+                        }
+                      ],
+                      "predicates": [],
+                      "projection": [
+                        0,
+                        1,
+                        2,
+                        3,
+                        4,
+                        5
+                      ],
+                      "input_arity": 0
+                    },
+                    "input_key_val": null,
+                    "node_id": 7
+                  }
+                }
+              ],
+              "consolidate_output": false,
+              "node_id": 9
+            }
+          },
+          "node_id": 10
         }
       }
     }
@@ -4539,7 +6520,7 @@ EOF
 
 # Test Join::Differential (acyclic).
 query T multiline
-EXPLAIN PHYSICAL PLAN WITH(non_negative) AS JSON FOR
+EXPLAIN PHYSICAL PLAN WITH(non negative) AS JSON FOR
 SELECT b + d, c + e, a + e
 FROM t, u, v
 WHERE a = c AND d = e AND b + d > 42
@@ -4575,9 +6556,20 @@ WHERE a = c AND d = e AND b + d > 42
                         1
                       ]
                     ]
+                  ],
+                  "types": [
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": true
+                    },
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": true
+                    }
                   ]
                 },
-                "plan": "PassArrangements"
+                "plan": "PassArrangements",
+                "node_id": 0
               }
             },
             {
@@ -4591,7 +6583,8 @@ WHERE a = c AND d = e AND b + d > 42
                     },
                     "keys": {
                       "raw": true,
-                      "arranged": []
+                      "arranged": [],
+                      "types": null
                     },
                     "plan": {
                       "Collection": {
@@ -4603,7 +6596,8 @@ WHERE a = c AND d = e AND b + d > 42
                         ],
                         "input_arity": 2
                       }
-                    }
+                    },
+                    "node_id": 1
                   }
                 },
                 "forms": {
@@ -4622,7 +6616,31 @@ WHERE a = c AND d = e AND b + d > 42
                       [
                         1
                       ]
+                    ],
+                    [
+                      [
+                        {
+                          "Column": 1
+                        }
+                      ],
+                      {
+                        "0": 1,
+                        "1": 0
+                      },
+                      [
+                        0
+                      ]
                     ]
+                  ],
+                  "types": [
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": false
+                    },
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": false
+                    }
                   ]
                 },
                 "input_key": null,
@@ -4634,7 +6652,8 @@ WHERE a = c AND d = e AND b + d > 42
                     1
                   ],
                   "input_arity": 2
-                }
+                },
+                "node_id": 2
               }
             },
             {
@@ -4648,7 +6667,8 @@ WHERE a = c AND d = e AND b + d > 42
                     },
                     "keys": {
                       "raw": true,
-                      "arranged": []
+                      "arranged": [],
+                      "types": null
                     },
                     "plan": {
                       "Collection": {
@@ -4659,7 +6679,8 @@ WHERE a = c AND d = e AND b + d > 42
                         ],
                         "input_arity": 1
                       }
-                    }
+                    },
+                    "node_id": 3
                   }
                 },
                 "forms": {
@@ -4676,6 +6697,12 @@ WHERE a = c AND d = e AND b + d > 42
                       },
                       []
                     ]
+                  ],
+                  "types": [
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": false
+                    }
                   ]
                 },
                 "input_key": null,
@@ -4686,63 +6713,26 @@ WHERE a = c AND d = e AND b + d > 42
                     0
                   ],
                   "input_arity": 1
-                }
+                },
+                "node_id": 4
               }
             }
           ],
           "plan": {
-            "Linear": {
-              "source_relation": 0,
-              "source_key": [
+            "Delta": {
+              "path_plans": [
                 {
-                  "Column": 0
-                }
-              ],
-              "initial_closure": null,
-              "stage_plans": [
-                {
-                  "lookup_relation": 1,
-                  "stream_key": [
+                  "source_relation": 0,
+                  "source_key": [
                     {
                       "Column": 0
                     }
                   ],
-                  "stream_thinning": [
-                    1
-                  ],
-                  "lookup_key": [
-                    {
-                      "Column": 0
-                    }
-                  ],
-                  "closure": {
+                  "initial_closure": {
                     "ready_equivalences": [],
                     "before": {
                       "mfp": {
-                        "expressions": [
-                          {
-                            "CallBinary": {
-                              "func": "AddInt32",
-                              "expr1": {
-                                "Column": 1
-                              },
-                              "expr2": {
-                                "Column": 2
-                              }
-                            }
-                          },
-                          {
-                            "CallBinary": {
-                              "func": "AddInt32",
-                              "expr1": {
-                                "Column": 0
-                              },
-                              "expr2": {
-                                "Column": 2
-                              }
-                            }
-                          }
-                        ],
+                        "expressions": [],
                         "predicates": [
                           [
                             1,
@@ -4763,104 +6753,499 @@ WHERE a = c AND d = e AND b + d > 42
                                 }
                               }
                             }
-                          ],
-                          [
-                            4,
-                            {
-                              "CallBinary": {
-                                "func": "Gt",
-                                "expr1": {
-                                  "Column": 3
-                                },
-                                "expr2": {
-                                  "Literal": [
-                                    {
-                                      "Ok": {
-                                        "data": [
-                                          4,
-                                          42,
-                                          0,
-                                          0,
-                                          0
-                                        ]
-                                      }
-                                    },
-                                    {
-                                      "scalar_type": "Int32",
-                                      "nullable": false
-                                    }
-                                  ]
-                                }
-                              }
-                            }
                           ]
                         ],
                         "projection": [
-                          2,
-                          3,
-                          4
+                          0,
+                          1
                         ],
-                        "input_arity": 3
+                        "input_arity": 2
                       }
                     }
-                  }
-                },
-                {
-                  "lookup_relation": 2,
-                  "stream_key": [
+                  },
+                  "stage_plans": [
                     {
-                      "Column": 0
+                      "lookup_relation": 1,
+                      "stream_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [
+                        1
+                      ],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [
+                              {
+                                "CallBinary": {
+                                  "func": "AddInt32",
+                                  "expr1": {
+                                    "Column": 1
+                                  },
+                                  "expr2": {
+                                    "Column": 2
+                                  }
+                                }
+                              },
+                              {
+                                "CallBinary": {
+                                  "func": "AddInt32",
+                                  "expr1": {
+                                    "Column": 0
+                                  },
+                                  "expr2": {
+                                    "Column": 2
+                                  }
+                                }
+                              }
+                            ],
+                            "predicates": [
+                              [
+                                4,
+                                {
+                                  "CallBinary": {
+                                    "func": "Gt",
+                                    "expr1": {
+                                      "Column": 3
+                                    },
+                                    "expr2": {
+                                      "Literal": [
+                                        {
+                                          "Ok": {
+                                            "data": [
+                                              42,
+                                              42
+                                            ]
+                                          }
+                                        },
+                                        {
+                                          "scalar_type": "Int32",
+                                          "nullable": false
+                                        }
+                                      ]
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "projection": [
+                              2,
+                              3,
+                              4
+                            ],
+                            "input_arity": 3
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "lookup_relation": 2,
+                      "stream_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [
+                        1,
+                        2
+                      ],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [],
+                            "predicates": [],
+                            "projection": [
+                              1,
+                              2
+                            ],
+                            "input_arity": 3
+                          }
+                        }
+                      }
                     }
                   ],
-                  "stream_thinning": [
-                    1,
-                    2
-                  ],
-                  "lookup_key": [
-                    {
-                      "Column": 0
-                    }
-                  ],
-                  "closure": {
+                  "final_closure": {
                     "ready_equivalences": [],
                     "before": {
                       "mfp": {
                         "expressions": [],
                         "predicates": [],
                         "projection": [
+                          0,
                           1,
-                          2
+                          1
                         ],
-                        "input_arity": 3
+                        "input_arity": 2
+                      }
+                    }
+                  }
+                },
+                {
+                  "source_relation": 1,
+                  "source_key": [
+                    {
+                      "Column": 0
+                    }
+                  ],
+                  "initial_closure": {
+                    "ready_equivalences": [],
+                    "before": {
+                      "mfp": {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          0,
+                          1
+                        ],
+                        "input_arity": 2
+                      }
+                    }
+                  },
+                  "stage_plans": [
+                    {
+                      "lookup_relation": 0,
+                      "stream_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [
+                        1
+                      ],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [
+                              {
+                                "CallBinary": {
+                                  "func": "AddInt32",
+                                  "expr1": {
+                                    "Column": 2
+                                  },
+                                  "expr2": {
+                                    "Column": 1
+                                  }
+                                }
+                              },
+                              {
+                                "CallBinary": {
+                                  "func": "AddInt32",
+                                  "expr1": {
+                                    "Column": 0
+                                  },
+                                  "expr2": {
+                                    "Column": 1
+                                  }
+                                }
+                              }
+                            ],
+                            "predicates": [
+                              [
+                                1,
+                                {
+                                  "CallUnary": {
+                                    "func": {
+                                      "Not": null
+                                    },
+                                    "expr": {
+                                      "CallUnary": {
+                                        "func": {
+                                          "IsNull": null
+                                        },
+                                        "expr": {
+                                          "Column": 0
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              ],
+                              [
+                                4,
+                                {
+                                  "CallBinary": {
+                                    "func": "Gt",
+                                    "expr1": {
+                                      "Column": 3
+                                    },
+                                    "expr2": {
+                                      "Literal": [
+                                        {
+                                          "Ok": {
+                                            "data": [
+                                              42,
+                                              42
+                                            ]
+                                          }
+                                        },
+                                        {
+                                          "scalar_type": "Int32",
+                                          "nullable": false
+                                        }
+                                      ]
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "projection": [
+                              1,
+                              3,
+                              4
+                            ],
+                            "input_arity": 3
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "lookup_relation": 2,
+                      "stream_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [
+                        1,
+                        2
+                      ],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [],
+                            "predicates": [],
+                            "projection": [
+                              1,
+                              2
+                            ],
+                            "input_arity": 3
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "final_closure": {
+                    "ready_equivalences": [],
+                    "before": {
+                      "mfp": {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          0,
+                          1,
+                          1
+                        ],
+                        "input_arity": 2
+                      }
+                    }
+                  }
+                },
+                {
+                  "source_relation": 2,
+                  "source_key": [
+                    {
+                      "Column": 0
+                    }
+                  ],
+                  "initial_closure": {
+                    "ready_equivalences": [],
+                    "before": {
+                      "mfp": {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          0
+                        ],
+                        "input_arity": 1
+                      }
+                    }
+                  },
+                  "stage_plans": [
+                    {
+                      "lookup_relation": 1,
+                      "stream_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [],
+                      "lookup_key": [
+                        {
+                          "Column": 1
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [],
+                            "predicates": [],
+                            "projection": [
+                              1,
+                              0
+                            ],
+                            "input_arity": 2
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "lookup_relation": 0,
+                      "stream_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [
+                        1
+                      ],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [
+                              {
+                                "CallBinary": {
+                                  "func": "AddInt32",
+                                  "expr1": {
+                                    "Column": 2
+                                  },
+                                  "expr2": {
+                                    "Column": 1
+                                  }
+                                }
+                              },
+                              {
+                                "CallBinary": {
+                                  "func": "AddInt32",
+                                  "expr1": {
+                                    "Column": 0
+                                  },
+                                  "expr2": {
+                                    "Column": 1
+                                  }
+                                }
+                              }
+                            ],
+                            "predicates": [
+                              [
+                                1,
+                                {
+                                  "CallUnary": {
+                                    "func": {
+                                      "Not": null
+                                    },
+                                    "expr": {
+                                      "CallUnary": {
+                                        "func": {
+                                          "IsNull": null
+                                        },
+                                        "expr": {
+                                          "Column": 0
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              ],
+                              [
+                                4,
+                                {
+                                  "CallBinary": {
+                                    "func": "Gt",
+                                    "expr1": {
+                                      "Column": 3
+                                    },
+                                    "expr2": {
+                                      "Literal": [
+                                        {
+                                          "Ok": {
+                                            "data": [
+                                              42,
+                                              42
+                                            ]
+                                          }
+                                        },
+                                        {
+                                          "scalar_type": "Int32",
+                                          "nullable": false
+                                        }
+                                      ]
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "projection": [
+                              3,
+                              4
+                            ],
+                            "input_arity": 3
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "final_closure": {
+                    "ready_equivalences": [],
+                    "before": {
+                      "mfp": {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          0,
+                          1,
+                          1
+                        ],
+                        "input_arity": 2
                       }
                     }
                   }
                 }
-              ],
-              "final_closure": {
-                "ready_equivalences": [],
-                "before": {
-                  "mfp": {
-                    "expressions": [],
-                    "predicates": [],
-                    "projection": [
-                      0,
-                      1,
-                      1
-                    ],
-                    "input_arity": 2
-                  }
-                }
-              }
+              ]
             }
-          }
+          },
+          "node_id": 5
         }
       }
     }
   ],
   "sources": [
     {
-      "id": "materialize.public.u",
+      "id": {
+        "User": 2
+      },
       "op": {
         "expressions": [],
         "predicates": [
@@ -4913,7 +7298,9 @@ WHERE a = c AND d = e AND b + d > 42
       }
     },
     {
-      "id": "materialize.public.v",
+      "id": {
+        "User": 3
+      },
       "op": {
         "expressions": [],
         "predicates": [
@@ -4961,7 +7348,7 @@ CREATE INDEX v_e_idx ON V(e);
 
 # Test Join::Differential (cyclic).
 query T multiline
-EXPLAIN PHYSICAL PLAN WITH(non_negative) AS JSON FOR
+EXPLAIN PHYSICAL PLAN WITH(non negative) AS JSON FOR
 SELECT a, b, c, d, e, f
 FROM t, u, v
 WHERE a = c AND d = e AND f = a
@@ -4997,9 +7384,20 @@ WHERE a = c AND d = e AND f = a
                         1
                       ]
                     ]
+                  ],
+                  "types": [
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": true
+                    },
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": true
+                    }
                   ]
                 },
-                "plan": "PassArrangements"
+                "plan": "PassArrangements",
+                "node_id": 0
               }
             },
             {
@@ -5028,6 +7426,16 @@ WHERE a = c AND d = e AND f = a
                             1
                           ]
                         ]
+                      ],
+                      "types": [
+                        {
+                          "scalar_type": "Int32",
+                          "nullable": true
+                        },
+                        {
+                          "scalar_type": "Int32",
+                          "nullable": true
+                        }
                       ]
                     },
                     "plan": {
@@ -5089,7 +7497,8 @@ WHERE a = c AND d = e AND f = a
                           "input_arity": 2
                         }
                       ]
-                    }
+                    },
+                    "node_id": 1
                   }
                 },
                 "forms": {
@@ -5098,18 +7507,42 @@ WHERE a = c AND d = e AND f = a
                     [
                       [
                         {
-                          "Column": 1
-                        },
-                        {
                           "Column": 0
                         }
                       ],
                       {
-                        "0": 1,
-                        "1": 0
+                        "0": 0,
+                        "1": 1
+                      },
+                      [
+                        1
+                      ]
+                    ],
+                    [
+                      [
+                        {
+                          "Column": 0
+                        },
+                        {
+                          "Column": 1
+                        }
+                      ],
+                      {
+                        "0": 0,
+                        "1": 1
                       },
                       []
                     ]
+                  ],
+                  "types": [
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": false
+                    },
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": false
+                    }
                   ]
                 },
                 "input_key": null,
@@ -5121,7 +7554,8 @@ WHERE a = c AND d = e AND f = a
                     1
                   ],
                   "input_arity": 2
-                }
+                },
+                "node_id": 2
               }
             },
             {
@@ -5150,6 +7584,16 @@ WHERE a = c AND d = e AND f = a
                             1
                           ]
                         ]
+                      ],
+                      "types": [
+                        {
+                          "scalar_type": "Int32",
+                          "nullable": true
+                        },
+                        {
+                          "scalar_type": "Int32",
+                          "nullable": true
+                        }
                       ]
                     },
                     "plan": {
@@ -5211,7 +7655,8 @@ WHERE a = c AND d = e AND f = a
                           "input_arity": 2
                         }
                       ]
-                    }
+                    },
+                    "node_id": 3
                   }
                 },
                 "forms": {
@@ -5232,6 +7677,16 @@ WHERE a = c AND d = e AND f = a
                       },
                       []
                     ]
+                  ],
+                  "types": [
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": false
+                    },
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": false
+                    }
                   ]
                 },
                 "input_key": null,
@@ -5243,73 +7698,22 @@ WHERE a = c AND d = e AND f = a
                     1
                   ],
                   "input_arity": 2
-                }
+                },
+                "node_id": 4
               }
             }
           ],
           "plan": {
-            "Linear": {
-              "source_relation": 1,
-              "source_key": [
+            "Delta": {
+              "path_plans": [
                 {
-                  "Column": 1
-                },
-                {
-                  "Column": 0
-                }
-              ],
-              "initial_closure": null,
-              "stage_plans": [
-                {
-                  "lookup_relation": 2,
-                  "stream_key": [
-                    {
-                      "Column": 1
-                    },
+                  "source_relation": 0,
+                  "source_key": [
                     {
                       "Column": 0
                     }
                   ],
-                  "stream_thinning": [],
-                  "lookup_key": [
-                    {
-                      "Column": 0
-                    },
-                    {
-                      "Column": 1
-                    }
-                  ],
-                  "closure": {
-                    "ready_equivalences": [],
-                    "before": {
-                      "mfp": {
-                        "expressions": [],
-                        "predicates": [],
-                        "projection": [
-                          1,
-                          0
-                        ],
-                        "input_arity": 2
-                      }
-                    }
-                  }
-                },
-                {
-                  "lookup_relation": 0,
-                  "stream_key": [
-                    {
-                      "Column": 0
-                    }
-                  ],
-                  "stream_thinning": [
-                    1
-                  ],
-                  "lookup_key": [
-                    {
-                      "Column": 0
-                    }
-                  ],
-                  "closure": {
+                  "initial_closure": {
                     "ready_equivalences": [],
                     "before": {
                       "mfp": {
@@ -5338,35 +7742,364 @@ WHERE a = c AND d = e AND f = a
                         ],
                         "projection": [
                           0,
-                          2,
                           1
+                        ],
+                        "input_arity": 2
+                      }
+                    }
+                  },
+                  "stage_plans": [
+                    {
+                      "lookup_relation": 1,
+                      "stream_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [
+                        1
+                      ],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [],
+                            "predicates": [],
+                            "projection": [
+                              0,
+                              1,
+                              2
+                            ],
+                            "input_arity": 3
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "lookup_relation": 2,
+                      "stream_key": [
+                        {
+                          "Column": 2
+                        },
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [
+                        1
+                      ],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        },
+                        {
+                          "Column": 1
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [],
+                            "predicates": [],
+                            "projection": [
+                              1,
+                              2,
+                              0
+                            ],
+                            "input_arity": 3
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "final_closure": {
+                    "ready_equivalences": [],
+                    "before": {
+                      "mfp": {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          0,
+                          1,
+                          0,
+                          2,
+                          2,
+                          0
+                        ],
+                        "input_arity": 3
+                      }
+                    }
+                  }
+                },
+                {
+                  "source_relation": 1,
+                  "source_key": [
+                    {
+                      "Column": 0
+                    }
+                  ],
+                  "initial_closure": {
+                    "ready_equivalences": [],
+                    "before": {
+                      "mfp": {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          0,
+                          1
+                        ],
+                        "input_arity": 2
+                      }
+                    }
+                  },
+                  "stage_plans": [
+                    {
+                      "lookup_relation": 2,
+                      "stream_key": [
+                        {
+                          "Column": 1
+                        },
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        },
+                        {
+                          "Column": 1
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [],
+                            "predicates": [],
+                            "projection": [
+                              1,
+                              0
+                            ],
+                            "input_arity": 2
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "lookup_relation": 0,
+                      "stream_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [
+                        1
+                      ],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [],
+                            "predicates": [
+                              [
+                                1,
+                                {
+                                  "CallUnary": {
+                                    "func": {
+                                      "Not": null
+                                    },
+                                    "expr": {
+                                      "CallUnary": {
+                                        "func": {
+                                          "IsNull": null
+                                        },
+                                        "expr": {
+                                          "Column": 0
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "projection": [
+                              0,
+                              2,
+                              1
+                            ],
+                            "input_arity": 3
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "final_closure": {
+                    "ready_equivalences": [],
+                    "before": {
+                      "mfp": {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          0,
+                          1,
+                          0,
+                          2,
+                          2,
+                          0
+                        ],
+                        "input_arity": 3
+                      }
+                    }
+                  }
+                },
+                {
+                  "source_relation": 2,
+                  "source_key": [
+                    {
+                      "Column": 0
+                    },
+                    {
+                      "Column": 1
+                    }
+                  ],
+                  "initial_closure": {
+                    "ready_equivalences": [],
+                    "before": {
+                      "mfp": {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          0,
+                          1
+                        ],
+                        "input_arity": 2
+                      }
+                    }
+                  },
+                  "stage_plans": [
+                    {
+                      "lookup_relation": 1,
+                      "stream_key": [
+                        {
+                          "Column": 1
+                        },
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "stream_thinning": [],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        },
+                        {
+                          "Column": 1
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [],
+                            "predicates": [],
+                            "projection": [
+                              1,
+                              0
+                            ],
+                            "input_arity": 2
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "lookup_relation": 0,
+                      "stream_key": [
+                        {
+                          "Column": 1
+                        }
+                      ],
+                      "stream_thinning": [
+                        0
+                      ],
+                      "lookup_key": [
+                        {
+                          "Column": 0
+                        }
+                      ],
+                      "closure": {
+                        "ready_equivalences": [],
+                        "before": {
+                          "mfp": {
+                            "expressions": [],
+                            "predicates": [
+                              [
+                                1,
+                                {
+                                  "CallUnary": {
+                                    "func": {
+                                      "Not": null
+                                    },
+                                    "expr": {
+                                      "CallUnary": {
+                                        "func": {
+                                          "IsNull": null
+                                        },
+                                        "expr": {
+                                          "Column": 0
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            ],
+                            "projection": [
+                              0,
+                              2,
+                              1
+                            ],
+                            "input_arity": 3
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "final_closure": {
+                    "ready_equivalences": [],
+                    "before": {
+                      "mfp": {
+                        "expressions": [],
+                        "predicates": [],
+                        "projection": [
+                          0,
+                          1,
+                          0,
+                          2,
+                          2,
+                          0
                         ],
                         "input_arity": 3
                       }
                     }
                   }
                 }
-              ],
-              "final_closure": {
-                "ready_equivalences": [],
-                "before": {
-                  "mfp": {
-                    "expressions": [],
-                    "predicates": [],
-                    "projection": [
-                      0,
-                      1,
-                      0,
-                      2,
-                      2,
-                      0
-                    ],
-                    "input_arity": 3
-                  }
-                }
-              }
+              ]
             }
-          }
+          },
+          "node_id": 5
         }
       }
     }
@@ -5377,7 +8110,7 @@ EOF
 
 # Test Join::Delta (star).
 query T multiline
-EXPLAIN PHYSICAL PLAN WITH(non_negative) AS JSON FOR
+EXPLAIN PHYSICAL PLAN WITH(non negative) AS JSON FOR
 SELECT a, b, c, d, e, f
 FROM t, u, v
 WHERE a = c and a = e
@@ -5413,9 +8146,20 @@ WHERE a = c and a = e
                         1
                       ]
                     ]
+                  ],
+                  "types": [
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": true
+                    },
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": true
+                    }
                   ]
                 },
-                "plan": "PassArrangements"
+                "plan": "PassArrangements",
+                "node_id": 0
               }
             },
             {
@@ -5442,9 +8186,20 @@ WHERE a = c and a = e
                         1
                       ]
                     ]
+                  ],
+                  "types": [
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": true
+                    },
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": true
+                    }
                   ]
                 },
-                "plan": "PassArrangements"
+                "plan": "PassArrangements",
+                "node_id": 1
               }
             },
             {
@@ -5471,9 +8226,20 @@ WHERE a = c and a = e
                         1
                       ]
                     ]
+                  ],
+                  "types": [
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": true
+                    },
+                    {
+                      "scalar_type": "Int32",
+                      "nullable": true
+                    }
                   ]
                 },
-                "plan": "PassArrangements"
+                "plan": "PassArrangements",
+                "node_id": 2
               }
             }
           ],
@@ -5867,7 +8633,8 @@ WHERE a = c and a = e
                 }
               ]
             }
-          }
+          },
+          "node_id": 3
         }
       }
     }

@@ -42,7 +42,7 @@ Testdrive is the preferred system test framework when testing:
 
 `testdrive` is currently sub-optimal for the situations listed below and `sqllogictest` is the better driver in those cases:
 - test cases containing many `EXPLAIN` statements and a lot of recorded query plans;
-- test cases where substantial changes of the ouput over time are expected, which is often the case if many query plans have been recorded in the test.
+- test cases where substantial changes of the output over time are expected, which is often the case if many query plans have been recorded in the test.
 
 Unlike the `sqllogictest` driver, `testdrive` will fail the test at the first difference, and there is no ability to automatically produce a new version of the test file that includes all the required updates to make the test pass.
 
@@ -229,9 +229,21 @@ Shuffle the list of tests before running them (using the value from --seed, if a
 
 ## Other options
 
-#### `--validate-postgres-stash=postgres://root@materialized:26257?options=--search_path=adapter`
+#### `--consistency-checks=<file, statement, disable>`
 
-After executing a DDL statement, validate that representation of the catalog in the stash is identical to the in-memory one.
+There are internal invariants that we want to make sure are upheld within Materialize. By default
+we check these invariants after an entire test run. You can also optionally disable them, or when
+debugging, run them after every statement.
+
+#### `--validate-catalog-store=<store-kind>`
+
+After executing a DDL statement, validate that representation of the catalog is identical to the in-memory one. `<store-kind>` can be one of:
+  - `stash`: Connects to a catalog stored in the stash.
+    - must also set the `--postgres-stash=postgres://root@materialized:26257?options=--search_path=adapter` option.
+  - `persist`: Connects to a catalog stored in persist.
+    - must also set the `--persist-consensus-url` and `--persist-blob-url` options.
+  - `shadow`: Connects to a catalog stored in the stash and persist and sets the results.
+    - must also set the `--postgres-stash=postgres://root@materialized:26257?options=--search_path=adapter`, `--persist-consensus-url`, and `--persist-blob-url` options.
 
 # Executing statements
 
@@ -394,6 +406,10 @@ $ set schema={
         ]
     }
 ```
+
+#### `$ set-from-file var=PATH`
+
+Sets the variable to the contents of the file at `PATH`.
 
 #### `$ set-from-sql var=NAME`
 
@@ -606,12 +622,12 @@ Sleeps for `N` seconds
 
 Sleeps a random interval between 0 and N seconds
 
-#### `> select mz_internal.mz_sleep(N)`
+#### `> select mz_unsafe.mz_sleep(N)`
 
 Instructs Mz to sleep for the specified number of seconds. `mz_sleep()` returns `<null>`, so the test needs to be coded accordingly:
 
 ```
-> SELECT mz_internal.mz_sleep(1)
+> SELECT mz_unsafe.mz_sleep(1)
 <null>
 ```
 
@@ -632,39 +648,6 @@ Adjust the number of tries testdrive will perform while waiting for a SQL statem
 
 Set `max-tries` to `1` in order to ensure that statements are executed only once. If the desired result is not achieved on the first try, the test will fail. This is
 useful when testing operations that should return the right result immediately rather than eventually.
-
-## `TEST SCRIPT` sources
-`TEST SCRIPT` sources can be a useful to have a source that emits data in specific pattern,
-without setting up data in a local source. They are created as follows:
-
-```
-> CREATE SOURCE unit
-  FROM TEST SCRIPT
-  '[
-    {"command": "emit", "key": "fish", "value": "value", "offset": 0},
-    {"command": "emit", "key": "fish2", "value": "hmm", "offset": 1},
-    {"command": "emit" ,"key": "fish", "value": "value2", "offset": 2}
-  ]'
-  KEY FORMAT BYTES
-  VALUE FORMAT BYTES
-  ENVELOPE UPSERT
-```
-
-Each "command" can be:
-- `"emit"`: emit data at a specific offset. The `"key"` is optional, but required
-for some envelopes, like `UPSERT`
-- `"terminate"`: terminate the source, ignoring all later commands. This closes the
-source's `upper`
-  - The default behavior if there is no `"terminate"` command is for the source
-  to pend forever, after it processes all other commands.
-
-Note that this soure has some limitations:
-- It does not work with formats like `avro`
-- It requires the key and value format to specified individually, as
-it does not support CSR formats.
-
-These limitations may be lifted in the future; additionally, more features may
-be added to this source.
 
 ## Actions on local files
 
@@ -688,6 +671,19 @@ Add partitions to an existing topic
 #### `$ kafka-create-topic`
 
 Create a Kafka topic
+
+#### `$ kafka-delete-topic-flaky`
+
+Delete a Kafka topic
+
+Even though `kafka-delete-topic-flaky` ensures that the topic no longer exists
+in the broker metadata there is still work to be done asychnronously before
+it's truly gone that must complete before we attempt to recreate it. There is
+no way to observe this work completing so the only option left is sleeping for
+a while after executing this command.
+
+For this reason this command must be used with great care or not at all,
+otherwise there is a risk of introducing flakiness in CI.
 
 #### `$ kafka-ingest topic=... schema=... ...`
 
@@ -774,6 +770,13 @@ once one record matches, the following must all match.  There are permitted to b
 topic after the matching is complete.  Note that if the topic is not required to have `partial-search`
 elements in it but there will be an attempt to read up to this number with a blocking read.
 
+#### `kafka-verify-topic [sink=... | topic=...] [await-value-schema=false] [await-key-schema=false]`
+
+Verifies that the broker contains the appropriate topic.
+
+`await-value-schema` and `await-key-schema` optionally check that the Confluent
+Schema Registry also contains the appropriate subjects before continuing.
+
 #### `kafka-verify-commit consumer-group-id=... topic=... partition=...
 
 Verifies that the provided offset (the input data) matches the committed offset
@@ -782,7 +785,7 @@ for the specified consumer group, topic, and partition.
 #### `headers=<list or object>`
 
 `headers` is a parameter that takes a json map (or list of maps) with string key-value pairs
-sent as headers for every message for the given action.
+sent as headers for every message for the given action. To represent a value of bytes (instead of string) an int array with each value representing a byte can be passed.
 
 ## Actions on Confluent Schema Registry
 
@@ -822,19 +825,21 @@ The required `schema-type` argument indicates the type of the schema. At
 present, only Avro schemas are supported. Feel free to adjust the action to
 support additional schema types.
 
-#### `$ schema-registry-wait subject=...`
+#### `$ schema-registry-wait topic=...`
 
-Block the test until schema with the specified subject has been defined at the
-schema registry.
+Block the test until schema with the specified subject (both value and key) has been
+defined at the schema registry. Also waits for the kafka topic to exist.
 
 This action is useful to fortify tests that expect an external party, e.g.
 Debezium, to upload a particular schema.
 
 ## Actions on REST services
 
-#### `$ http-request method=(GET|POST|PUT) url=... content-type=...`
+#### `$ http-request method=(GET|POST|PUT) url=... content-type=... [accept-additional-status-codes=404,409]`
 
-Issue a HTTP request against a third-party server. The body of the command is used as a body of the request. This is generally used when communicating with REST services such as Debezium and Toxiproxy. See `test/debezium-avro/debezium-postgres.td.initialize` and `test/pg-cdc-resumption/configure-toxiproxy.td`
+Issue an HTTP request against a third-party server. The body of the command is used as a body of the request. This is
+generally used when communicating with REST services such as Debezium and Toxiproxy. See
+`test/debezium-avro/debezium-postgres.td.initialize` and `test/pg-cdc-resumption/configure-toxiproxy.td`
 
 ```
 $ http-request method=POST url=http://example/com content-type=application/json
@@ -843,7 +848,26 @@ $ http-request method=POST url=http://example/com content-type=application/json
 }
 ```
 
-The test will fail unless the HTTP status code of the response is in the 200 range.
+The test will fail unless the HTTP status code of the response is in the 200 range. If further status codes shall be
+accepted, use the parameter `accept-additional-status-codes`, which takes a comma-separated list.
+
+## Actions on Webhook Sources
+
+#### `$ webhook-append name=... [database=...] [schema=...] [status=404] [header_name=header_value, ...]`
+
+Issues an HTTP POST request to a webhook source at `<database>.<schema>.<name>`, by default
+`database` is `materialize` and `schema` is `public`. The body of the command is used as the body
+of the request. You can optionally specify an expected response status code, by default we expect a
+status of 200. Any remaining arguments are appended to the request as headers.
+
+See `webhook.td` for more examples.
+
+```
+$ webhook-append database=materialize schema=public name=webhook_json app_name=test_drive
+{
+  "hello": "world"
+}
+```
 
 ## Actions with `psql`
 
@@ -859,7 +883,8 @@ $ skip-if
 SELECT true
 ```
 
-`skip-if` followed by a SQL statement will skip the rest of the `.td` file if
+`skip-if` followed by a SQL statement will skip the following statements until
+the next `skip-end` statement (or until the end of the `.td` file) if
 the statement returns one row containing one column with the value `true`. If
 the statement returns `false`, then execution of the script proceeds normally.
 If the query returns anything but a single row with a single column containing a

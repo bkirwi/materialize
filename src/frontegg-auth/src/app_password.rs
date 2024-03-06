@@ -34,7 +34,7 @@ pub const PREFIX: &str = "mzp_";
 ///     This format allows for the UUIDs to be formatted with hyphens, or
 ///     not.
 ///
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AppPassword {
     /// The client ID embedded in the app password.
     pub client_id: Uuid,
@@ -90,7 +90,7 @@ impl FromStr for AppPassword {
 }
 
 /// An error while parsing an [`AppPassword`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AppPasswordParseError;
 
 impl Error for AppPasswordParseError {}

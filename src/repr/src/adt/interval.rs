@@ -16,6 +16,7 @@ use anyhow::{anyhow, bail};
 use mz_proto::{RustType, TryFromProtoError};
 use num_traits::CheckedMul;
 use once_cell::sync::Lazy;
+use proptest::prelude::{any, Arbitrary, BoxedStrategy, Strategy};
 use serde::{Deserialize, Serialize};
 
 use crate::adt::datetime::DateTimeField;
@@ -105,9 +106,15 @@ static DAY_OVERFLOW_ERROR: Lazy<String> = Lazy::new(|| {
         i32::MIN,
     )
 });
-static USECS_PER_DAY: Lazy<i64> = Lazy::new(|| {
+pub static USECS_PER_DAY: Lazy<i64> = Lazy::new(|| {
     Interval::convert_date_time_unit(DateTimeField::Day, DateTimeField::Microseconds, 1i64).unwrap()
 });
+
+#[derive(Debug, Clone)]
+pub enum RoundBehavior {
+    Truncate,
+    Nearest,
+}
 
 impl Interval {
     pub const CENTURY_PER_MILLENNIUM: u16 = 10;
@@ -376,6 +383,11 @@ impl Interval {
         i128::from(self.micros)
     }
 
+    /// Computes the total number of milliseconds in the interval. Discards fractional milliseconds!
+    pub fn as_milliseconds(&self) -> i128 {
+        self.as_microseconds() / 1000
+    }
+
     /// Converts this `Interval`'s duration into `chrono::Duration`.
     pub fn duration_as_chrono(&self) -> chrono::Duration {
         use chrono::Duration;
@@ -426,6 +438,7 @@ impl Interval {
         &mut self,
         f: DateTimeField,
         fsec_max_precision: Option<u64>,
+        round_behavior: RoundBehavior,
     ) -> Result<(), anyhow::Error> {
         use DateTimeField::*;
         match f {
@@ -468,7 +481,6 @@ impl Interval {
                     )
                 }
 
-                // Check if value should round up to nearest fractional place.
                 let precision = match u32::try_from(precision) {
                     Ok(p) => p,
                     Err(_) => bail!(
@@ -476,13 +488,26 @@ impl Interval {
                         precision
                     ),
                 };
+                // Truncate sub-second part.
                 let remainder = self.micros % 10_i64.pow(6 - precision);
-                if u64::from(precision) != default_precision
-                    && remainder / 10_i64.pow(5 - precision) > 4
-                {
-                    self.micros += 10_i64.pow(6 - precision);
-                }
                 self.micros -= remainder;
+                // Check if value should round up/down to nearest fractional place.
+                if matches!(round_behavior, RoundBehavior::Nearest)
+                    && u64::from(precision) != default_precision
+                {
+                    let rounding_digit = remainder / 10_i64.pow(5 - precision);
+                    let micros = if rounding_digit > 4 {
+                        self.micros.checked_add(10_i64.pow(6 - precision))
+                    } else if rounding_digit < -4 {
+                        self.micros.checked_sub(10_i64.pow(6 - precision))
+                    } else {
+                        Some(self.micros)
+                    };
+                    let Some(micros) = micros else {
+                        bail!("interval field value out of range: \"{self}\"");
+                    };
+                    self.micros = micros;
+                }
             }
             Day => {
                 self.micros = 0;
@@ -767,6 +792,21 @@ impl fmt::Display for Interval {
         }
 
         Ok(())
+    }
+}
+
+impl Arbitrary for Interval {
+    type Strategy = BoxedStrategy<Self>;
+    type Parameters = ();
+
+    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+        (any::<i32>(), any::<i32>(), any::<i64>())
+            .prop_map(|(months, days, micros)| Interval {
+                months,
+                days,
+                micros,
+            })
+            .boxed()
     }
 }
 
@@ -1122,7 +1162,8 @@ mod test {
             let mut i = Interval::new((test.2).0, (test.2).1, (test.2).2);
             let j = Interval::new((test.3).0, (test.3).1, (test.3).2);
 
-            i.truncate_low_fields(test.0, test.1).unwrap();
+            i.truncate_low_fields(test.0, test.1, RoundBehavior::Nearest)
+                .unwrap();
 
             if i != j {
                 panic!(

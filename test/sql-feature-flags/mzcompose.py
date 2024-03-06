@@ -12,8 +12,11 @@ import os
 import tempfile
 from textwrap import dedent, indent
 
-from materialize.mzcompose import Composition, WorkflowArgumentParser
-from materialize.mzcompose.services import Materialized, Redpanda, Testdrive
+from materialize.mzcompose.composition import Composition, WorkflowArgumentParser
+from materialize.mzcompose.services.materialized import Materialized
+from materialize.mzcompose.services.redpanda import Redpanda
+from materialize.mzcompose.services.testdrive import Testdrive
+from materialize.util import all_subclasses
 
 SERVICES = [
     Redpanda(),
@@ -127,6 +130,8 @@ class FeatureTestScenario:
                 # Include the header.
                 header(f"{cls.__name__} (phase 1)", drop_schema=True),
                 cls.initialize(),
+                # Ensure the feature is off, regardless of CI config.
+                alter_system_set(cls.feature_name(), "off"),
                 # We cannot create item #1 when the feature is turned off (default).
                 statement_error(cls.create_item(ordinal=1), cls.feature_error()),
                 # Turn the feature on.
@@ -222,70 +227,6 @@ class FeatureTestScenario:
         assert False, "query_item() must be overriden"
 
 
-class WithMutuallyRecursive(FeatureTestScenario):
-    @classmethod
-    def feature_name(cls) -> str:
-        return "enable_with_mutually_recursive"
-
-    @classmethod
-    def feature_error(cls) -> str:
-        return "WITH MUTUALLY RECURSIVE is not supported"
-
-    @classmethod
-    def create_item(cls, ordinal: int) -> str:
-        return dedent(
-            f"""
-            CREATE VIEW wmr_{ordinal:02d} AS WITH MUTUALLY RECURSIVE
-                foo (a int, b int) AS (SELECT 1, 2 UNION SELECT a, 7 FROM bar),
-                bar (a int) as (SELECT a FROM foo)
-            SELECT * FROM bar;
-            """
-        )
-
-    @classmethod
-    def drop_item(cls, ordinal: int) -> str:
-        return f"DROP VIEW wmr_{ordinal:02d}"
-
-    @classmethod
-    def query_item(cls, ordinal: int) -> str:
-        return f"SELECT * FROM wmr_{ordinal:02d}"
-
-
-class FormatJson(FeatureTestScenario):
-    @classmethod
-    def feature_name(cls) -> str:
-        return "enable_format_json"
-
-    @classmethod
-    def feature_error(cls) -> str:
-        return "FORMAT JSON is not supported"
-
-    @classmethod
-    def initialize(cls) -> str:
-        return "> CREATE CONNECTION IF NOT EXISTS kafka_conn_for_format_json TO KAFKA (BROKER '${testdrive.kafka-addr}')"
-
-    @classmethod
-    def create_item(cls, ordinal: int) -> str:
-        return dedent(
-            f"""
-            CREATE SOURCE kafka_source_{ordinal:02d}
-                FROM KAFKA CONNECTION kafka_conn_for_format_json (TOPIC 'bar')
-                FORMAT JSON
-                WITH (SIZE '1');
-            """
-        )
-
-    @classmethod
-    def drop_item(cls, ordinal: int) -> str:
-        return f"DROP SOURCE kafka_source_{ordinal:02d};"
-
-    @classmethod
-    def query_item(cls, ordinal: int) -> str:
-        # Test cannot spin up infra for this feature to be tested, but we just want to verify it
-        # plans successfully.
-        return "SELECT true;"
-
-
 def run_test(c: Composition, args: argparse.Namespace) -> None:
     c.up("redpanda", "materialized")
     c.up("testdrive", persistent=True)
@@ -293,7 +234,7 @@ def run_test(c: Composition, args: argparse.Namespace) -> None:
     scenarios = (
         [globals()[args.scenario]]
         if args.scenario
-        else FeatureTestScenario.__subclasses__()
+        else all_subclasses(FeatureTestScenario)
     )
 
     # To add a new scenario create a new FeatureTestScenario subclass

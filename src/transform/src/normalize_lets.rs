@@ -27,7 +27,7 @@
 use mz_expr::{visit::Visit, MirRelationExpr};
 use mz_ore::{id_gen::IdGen, stack::RecursionLimitError};
 
-use crate::TransformArgs;
+use crate::TransformCtx;
 
 pub use renumbering::renumber_bindings;
 
@@ -59,16 +59,15 @@ impl NormalizeLets {
 }
 
 impl crate::Transform for NormalizeLets {
-    #[tracing::instrument(
-        target = "optimizer"
-        level = "trace",
-        skip_all,
+    #[mz_ore::instrument(
+        target = "optimizer",
+        level = "debug",
         fields(path.segment = "normalize_lets")
     )]
     fn transform(
         &self,
         relation: &mut MirRelationExpr,
-        _args: TransformArgs,
+        _ctx: &mut TransformCtx,
     ) -> Result<(), crate::TransformError> {
         let result = self.transform_without_trace(relation);
         mz_repr::explain::trace_plan(&*relation);
@@ -114,10 +113,13 @@ impl NormalizeLets {
         // placing all `LetRec` nodes around the root, if not always in a single AST node.
         let_motion::promote_let_rec(relation);
         let_motion::assert_no_lets(relation);
+        let_motion::assert_letrec_major(relation);
 
-        inlining::inline_lets(relation, self.inline_mfp)?;
-
+        // Refresh types while we are in letrec-major form.
         support::refresh_types(relation)?;
+
+        // Inlining may violate letrec-major form.
+        inlining::inline_lets(relation, self.inline_mfp)?;
 
         // Renumber bindings for good measure.
         // Ideally we could skip when `action` is a no-op, but hard to thread that through at the moment.
@@ -280,7 +282,7 @@ mod support {
 
     /// Applies `types` to all `Get` nodes in `expr`.
     ///
-    /// This no longer considers new bindings, and will error if applied to `Let` and `LetRec`-free expressions.
+    /// This no longer considers new bindings, and will error if applied to expressions containing `Let` and `LetRec` stages.
     fn refresh_types_effector(
         expr: &mut MirRelationExpr,
         types: &BTreeMap<LocalId, mz_repr::RelationType>,
@@ -301,6 +303,7 @@ mod support {
                 MirRelationExpr::Get {
                     id: Id::Local(id),
                     typ,
+                    access_strategy: _,
                 } => {
                     if let Some(new_type) = types.get(id) {
                         // Assert that the column length has not changed.
@@ -542,7 +545,7 @@ mod let_motion {
             // Bindings to lower.
             let mut lowered = BTreeMap::<LocalId, MirRelationExpr>::new();
 
-            let rec_ids = MirRelationExpr::recursive_ids(ids, values)?;
+            let rec_ids = MirRelationExpr::recursive_ids(ids, values);
 
             while ids.last().map(|id| !rec_ids.contains(id)).unwrap_or(false) {
                 let id = ids.pop().expect("non-empty ids");
@@ -566,6 +569,31 @@ mod let_motion {
         expr.visit_pre(|expr| {
             assert!(!matches!(expr, MirRelationExpr::Let { .. }));
         });
+    }
+
+    /// Asserts that `expr` in "LetRec-major" form.
+    ///
+    /// This means `expr` is either `LetRec`-free, or a `LetRec` whose values and body are `LetRec`-major.
+    pub(crate) fn assert_letrec_major(expr: &MirRelationExpr) {
+        let mut todo = vec![expr];
+        while let Some(expr) = todo.pop() {
+            match expr {
+                MirRelationExpr::LetRec {
+                    ids: _,
+                    values,
+                    limits: _,
+                    body,
+                } => {
+                    todo.extend(values.iter());
+                    todo.push(body);
+                }
+                _ => {
+                    expr.visit_pre(|expr| {
+                        assert!(!matches!(expr, MirRelationExpr::LetRec { .. }));
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -709,6 +737,9 @@ mod inlining {
                             &expr
                         };
                         match stripped_value {
+                            // TODO: One could imagine CSEing multiple occurrences of a global Get
+                            // to make us read from Persist only once.
+                            // See <https://github.com/MaterializeInc/materialize/issues/21145>
                             MirRelationExpr::Get { .. } | MirRelationExpr::Constant { .. } => true,
                             _ => false,
                         }
