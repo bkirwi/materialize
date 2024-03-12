@@ -73,9 +73,6 @@ where
     /// A handle to the data represented by this batch.
     pub(crate) batch: HollowBatch<T>,
 
-    /// WIP
-    pub(crate) single_ts: SingleTs<T>,
-
     /// Handle to the [Blob] that the blobs of this batch were uploaded to.
     pub(crate) blob: Arc<dyn Blob + Send + Sync>,
 
@@ -117,7 +114,6 @@ where
         shard_id: ShardId,
         version: Version,
         batch: HollowBatch<T>,
-        single_ts: SingleTs<T>,
     ) -> Self {
         Self {
             batch_delete_enabled,
@@ -125,7 +121,6 @@ where
             shard_id,
             version,
             batch,
-            single_ts,
             blob,
             _phantom: PhantomData,
         }
@@ -147,24 +142,10 @@ where
     }
 
     /// WIP
-    pub fn rewrite_ts(&mut self, to: &T) -> Result<(), InvalidUsage<T>> {
-        // WIP these errors aren't right
-        match &self.single_ts {
-            SingleTs::Empty => Err(InvalidUsage::AddAfterRewrite),
-            SingleTs::Single(from) => {
-                let ts_rewrite = TsRewrite {
-                    from: T::encode(from),
-                    to: T::encode(&to),
-                };
-                for part in self.batch.parts.iter_mut() {
-                    assert_eq!(part.ts_rewrite, None);
-                    part.ts_rewrite = Some(ts_rewrite.clone());
-                }
-                self.single_ts = SingleTs::Rewrite(ts_rewrite);
-                Ok(())
-            }
-            SingleTs::Multi => Err(InvalidUsage::AddAfterRewrite),
-            SingleTs::Rewrite(_) => Err(InvalidUsage::AddAfterRewrite),
+    pub fn rewrite_ts(&mut self, to: &Antichain<T>) {
+        for part in &mut self.batch.parts {
+            // TODO: should this be a join?
+            part.rewrite_frontier = to.iter().map(|t| t.encode()).collect();
         }
     }
 
@@ -222,7 +203,7 @@ where
             shard_id: self.shard_id.into_proto(),
             version: self.version.to_string(),
             batch: Some(self.batch.into_proto()),
-            single_ts: self.single_ts.into_proto(),
+            rewrite_frontier: self.rewrite_frontier.into_proto(),
         };
         self.mark_consumed();
         ret
@@ -390,32 +371,6 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) enum SingleTs<T> {
-    Empty,
-    Single(T),
-    Multi,
-    Rewrite(TsRewrite),
-}
-
-impl<T: PartialEq + Clone> SingleTs<T> {
-    fn observe(&mut self, ts: &T) -> Result<(), InvalidUsage<T>> {
-        match self {
-            SingleTs::Empty => {
-                *self = SingleTs::Single(ts.clone());
-                Ok(())
-            }
-            SingleTs::Single(t) if t == ts => Ok(()),
-            SingleTs::Single(_) => {
-                *self = SingleTs::Multi;
-                Ok(())
-            }
-            SingleTs::Multi => Ok(()),
-            SingleTs::Rewrite(_) => Err(InvalidUsage::AddAfterRewrite),
-        }
-    }
-}
-
-#[derive(Debug)]
 pub(crate) struct BatchBuilderInternal<K, V, T, D>
 where
     K: Codec,
@@ -424,7 +379,6 @@ where
 {
     lower: Antichain<T>,
     inclusive_upper: Antichain<Reverse<T>>,
-    single_ts: SingleTs<T>,
 
     shard_id: ShardId,
     version: Version,
@@ -485,7 +439,6 @@ where
         Self {
             lower,
             inclusive_upper: Antichain::new(),
-            single_ts: SingleTs::Empty,
             blob,
             buffer: BatchBuffer::new(
                 Arc::clone(&metrics),
@@ -565,7 +518,6 @@ where
                 len: self.num_updates,
                 runs: self.runs,
             },
-            self.single_ts,
         );
 
         Ok(batch)
@@ -589,7 +541,6 @@ where
                 lower: self.lower.clone(),
             });
         }
-        let () = self.single_ts.observe(ts)?;
         self.inclusive_upper.insert(Reverse(ts.clone()));
 
         match self.buffer.push(key, val, ts.clone(), diff.clone()) {
@@ -654,11 +605,6 @@ where
             }
         }
 
-        let ts_rewrite = match self.single_ts {
-            SingleTs::Empty | SingleTs::Single(_) | SingleTs::Multi => None,
-            SingleTs::Rewrite(_) => unreachable!("WIP not supposed to happen"),
-        };
-
         let start = Instant::now();
         self.parts
             .write(
@@ -667,7 +613,7 @@ where
                 columnar,
                 self.inline_upper.clone(),
                 self.since.clone(),
-                ts_rewrite,
+                self.
             )
             .await;
         self.metrics
@@ -865,7 +811,7 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
         updates: ColumnarRecords,
         upper: Antichain<T>,
         since: Antichain<T>,
-        ts_rewrite: Option<TsRewrite>,
+        rewrite_frontier: Antichain<T>,
     ) {
         let desc = Description::new(self.lower.clone(), upper, since);
         let metrics = Arc::clone(&self.metrics);

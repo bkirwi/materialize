@@ -277,7 +277,7 @@ pub(crate) fn decode_batch_part_blob<T>(
     key: &str,
     registered_desc: Description<T>,
     value: &SegmentedBytes,
-    ts_rewrite: Option<&TsRewrite>,
+    ts_rewrite: Antichain<T>,
 ) -> EncodedPart<T>
 where
     T: Timestamp + Lattice + Codec64,
@@ -308,7 +308,7 @@ pub(crate) async fn fetch_batch_part<T>(
     read_metrics: &ReadMetrics,
     key: &PartialBatchKey,
     registered_desc: &Description<T>,
-    ts_rewrite: Option<&TsRewrite>,
+    ts_rewrite: Antichain<T>,
 ) -> Result<EncodedPart<T>, BlobKey>
 where
     T: Timestamp + Lattice + Codec64,
@@ -387,7 +387,7 @@ pub struct LeasedBatchPart<T> {
     /// A lower bound on the key. If a tight lower bound is not available, the
     /// empty vec (as the minimum vec) is a conservative choice.
     pub(crate) key_lower: Vec<u8>,
-    pub(crate) ts_rewrite: Option<TsRewrite>,
+    pub(crate) ts_rewrite: Antichain<T>,
 }
 
 impl<T> LeasedBatchPart<T>
@@ -600,7 +600,7 @@ pub(crate) struct EncodedPart<T> {
     registered_desc: Description<T>,
     part: Arc<BlobTraceBatchPart<T>>,
     needs_truncation: bool,
-    ts_rewrite: Option<(T, T)>,
+    ts_rewrite: Antichain<T>,
 }
 
 impl<K, V, T, D> Iterator for FetchedPart<K, V, T, D>
@@ -667,7 +667,7 @@ where
         key: &str,
         registered_desc: Description<T>,
         part: BlobTraceBatchPart<T>,
-        ts_rewrite: Option<&TsRewrite>,
+        ts_rewrite: Antichain<T>,
     ) -> Self {
         // There are two types of batches in persist:
         // - Batches written by a persist user (either directly or indirectly
@@ -717,7 +717,6 @@ where
                 key, inline_desc, registered_desc
             );
         }
-        let ts_rewrite = ts_rewrite.map(|x| (T::decode(x.from), T::decode(x.to)));
 
         EncodedPart {
             registered_desc,
@@ -750,7 +749,7 @@ impl Cursor {
     /// A cursor points to a particular update in the backing part data.
     /// If the update it points to is not valid, advance it to the next valid update
     /// if there is one, and return the pointed-to data.
-    pub fn peek<'a, T: Timestamp + Codec64>(
+    pub fn peek<'a, T: Timestamp + Lattice + Codec64>(
         &mut self,
         encoded: &'a EncodedPart<T>,
     ) -> Option<(&'a [u8], &'a [u8], T, [u8; 8])> {
@@ -765,11 +764,7 @@ impl Cursor {
             };
 
             let mut t = T::decode(t);
-            if let Some((from, to)) = &encoded.ts_rewrite {
-                assert_eq!(&t, from);
-                tracing::info!("WIP rewriting ts {:?} -> {:?}", from, to);
-                t.clone_from(to);
-            }
+            t.advance_by(encoded.ts_rewrite.borrow());
 
             // This filtering is really subtle, see the comment above for
             // what's going on here.
@@ -787,7 +782,7 @@ impl Cursor {
     }
 
     /// Similar to peek, but advance the cursor just past the end of the most recent update.
-    pub fn pop<'a, T: Timestamp + Codec64>(
+    pub fn pop<'a, T: Timestamp + Lattice + Codec64>(
         &mut self,
         part: &'a EncodedPart<T>,
     ) -> Option<(&'a [u8], &'a [u8], T, [u8; 8])> {
@@ -799,7 +794,7 @@ impl Cursor {
     }
 
     /// Advance the cursor just past the end of the most recent update, if there is one.
-    pub fn advance<'a, T: Timestamp + Codec64>(&mut self, part: &'a EncodedPart<T>) {
+    pub fn advance<'a, T: Timestamp + Lattice + Codec64>(&mut self, part: &'a EncodedPart<T>) {
         if self.part_idx < part.part.updates.len() {
             self.idx += 1;
         }

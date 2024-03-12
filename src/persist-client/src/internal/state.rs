@@ -169,13 +169,6 @@ pub struct HandleDebugState {
     pub purpose: String,
 }
 
-/// WIP
-#[derive(Arbitrary, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct TsRewrite {
-    pub from: [u8; 8],
-    pub to: [u8; 8],
-}
-
 /// A subset of a [HollowBatch] corresponding 1:1 to a blob.
 #[derive(Arbitrary, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct HollowBatchPart {
@@ -184,7 +177,7 @@ pub struct HollowBatchPart {
     /// The encoded size of this part.
     pub encoded_size_bytes: usize,
     /// WIP T instead of encoded?
-    pub ts_rewrite: Option<TsRewrite>,
+    pub rewrite_frontier: Vec<[u8; 8]>,
     /// A lower bound on the keys in the part. (By default, this the minimum
     /// possible key: `vec![]`.)
     #[serde(serialize_with = "serialize_part_bytes")]
@@ -1693,7 +1686,7 @@ pub(crate) mod tests {
                 .map(|x| HollowBatchPart {
                     key: PartialBatchKey((*x).to_owned()),
                     encoded_size_bytes: 0,
-                    ts_rewrite: None,
+                    rewrite_frontier: vec![],
                     key_lower: vec![],
                     stats: None,
                 })
