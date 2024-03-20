@@ -313,7 +313,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoStateDiff> for StateDiff<T> {
         );
         field_diffs_into_proto(ProtoStateField::Writers, writers, &mut writer);
         field_diffs_into_proto(ProtoStateField::Since, since, &mut writer);
-        field_diffs_into_proto(ProtoStateField::Spine, spine, &mut writer);
+        field_diffs_into_proto(ProtoStateField::HollowBatches, spine, &mut writer);
 
         // After encoding all of our data, convert back into the proto.
         let field_diffs = writer.into_proto();
@@ -423,7 +423,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoStateDiff> for StateDiff<T> {
                             |v| v.into_rust(),
                         )?
                     }
-                    ProtoStateField::Spine => {
+                    ProtoStateField::HollowBatches => {
                         field_diff_into_rust::<ProtoHollowBatch, (), _, _, _, _>(
                             diff,
                             &mut state_diff.spine,
@@ -431,6 +431,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoStateDiff> for StateDiff<T> {
                             |()| Ok(()),
                         )?
                     }
+                    _ => {}
                 }
             }
         }
