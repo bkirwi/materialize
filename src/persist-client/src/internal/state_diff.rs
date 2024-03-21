@@ -29,7 +29,7 @@ use crate::internal::state::{
     ProtoStateField, ProtoStateFieldDiffType, ProtoStateFieldDiffs, State, StateCollections,
     WriterState,
 };
-use crate::internal::trace::{FueledMergeRes, Trace};
+use crate::internal::trace::{FlatTrace, FueledMergeRes, FuelingMerge, ThinSpineBatch, Trace};
 use crate::read::LeasedReaderId;
 use crate::write::WriterId;
 use crate::{Metrics, PersistConfig, ShardId};
@@ -77,7 +77,9 @@ pub struct StateDiff<T> {
     pub(crate) critical_readers: Vec<StateFieldDiff<CriticalReaderId, CriticalReaderState<T>>>,
     pub(crate) writers: Vec<StateFieldDiff<WriterId, WriterState<T>>>,
     pub(crate) since: Vec<StateFieldDiff<(), Antichain<T>>>,
-    pub(crate) spine: Vec<StateFieldDiff<HollowBatch<T>, ()>>,
+    pub(crate) hollow_batches: Vec<StateFieldDiff<HollowBatch<T>, ()>>,
+    pub(crate) spine_batches: Vec<StateFieldDiff<(usize, ThinSpineBatch<T>), ()>>,
+    pub(crate) spine_merges: Vec<StateFieldDiff<(usize, FuelingMerge<T>), ()>>,
 }
 
 impl<T: Timestamp + Codec64> StateDiff<T> {
@@ -101,7 +103,9 @@ impl<T: Timestamp + Codec64> StateDiff<T> {
             critical_readers: Vec::default(),
             writers: Vec::default(),
             since: Vec::default(),
-            spine: Vec::default(),
+            hollow_batches: Vec::default(),
+            spine_batches: Vec::default(),
+            spine_merges: Vec::default(),
         }
     }
 }
@@ -167,12 +171,12 @@ impl<T: Timestamp + Lattice + Codec64> StateDiff<T> {
         );
         diff_field_sorted_iter(from_writers.iter(), to_writers, &mut diffs.writers);
         diff_field_single(from_trace.since(), to_trace.since(), &mut diffs.since);
-        diff_field_spine(from_trace, to_trace, &mut diffs.spine);
+        diff_field_spine(from_trace, to_trace, &mut diffs.hollow_batches);
         diffs
     }
 
     pub(crate) fn map_blob_inserts<F: for<'a> FnMut(HollowBlobRef<'a, T>)>(&self, mut f: F) {
-        for spine_diff in self.spine.iter() {
+        for spine_diff in self.hollow_batches.iter() {
             match &spine_diff.val {
                 StateFieldValDiff::Insert(()) => {
                     f(HollowBlobRef::Batch(&spine_diff.key));
@@ -196,7 +200,7 @@ impl<T: Timestamp + Lattice + Codec64> StateDiff<T> {
     }
 
     pub(crate) fn map_blob_deletes<F: for<'a> FnMut(HollowBlobRef<'a, T>)>(&self, mut f: F) {
-        for spine_diff in self.spine.iter() {
+        for spine_diff in self.hollow_batches.iter() {
             match &spine_diff.val {
                 StateFieldValDiff::Insert(()) => {} // No-op
                 StateFieldValDiff::Update((), ()) => {
@@ -340,7 +344,9 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
             critical_readers: diff_critical_readers,
             writers: diff_writers,
             since: diff_since,
-            spine: diff_spine,
+            hollow_batches: diff_spine,
+            spine_batches,
+            spine_merges,
         } = diff;
         if self.seqno == diff_seqno_to {
             return Ok(());
@@ -397,8 +403,13 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
             }
         }
         if !diff_spine.is_empty() {
-            apply_diffs_spine(metrics, diff_spine, trace)?;
-            debug_assert_eq!(trace.validate(), Ok(()), "{:?}", trace);
+            if !spine_batches.is_empty() {
+                let trace = std::mem::take(&mut self.collections.trace);
+                let flat: FlatTrace<T> = trace.into();
+            } else {
+                apply_diffs_spine(metrics, diff_spine, trace)?;
+                debug_assert_eq!(trace.validate(), Ok(()), "{:?}", trace);
+            }
         }
 
         // There's various sanity checks that this method could run (e.g. since,

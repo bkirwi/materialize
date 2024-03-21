@@ -47,31 +47,27 @@
 //! [Batch]: differential_dataflow::trace::Batch
 //! [Batch::Merger]: differential_dataflow::trace::Batch::Merger
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
 use mz_ore::cast::CastFrom;
-use mz_ore::collections::HashMap;
 #[allow(unused_imports)] // False positive.
 use mz_ore::fmt::FormatBuffer;
-use mz_persist_types::Codec64;
-use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
 use timely::progress::frontier::AntichainRef;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tracing::{debug, warn};
 
-use crate::internal::state::{
-    HollowBatch, ProtoHollowBatchRef, ProtoSpineBatch, ProtoSpineMerge, ProtoTrace,
-};
+use crate::internal::state::HollowBatch;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FueledMergeReq<T> {
     pub desc: Description<T>,
-    pub inputs: Vec<Arc<IdHollowBatch<T>>>,
+    pub inputs: Vec<IdHollowBatch<T>>,
 }
 
 #[derive(Debug)]
@@ -122,48 +118,59 @@ impl<T: Timestamp + Lattice> Default for Trace<T> {
     }
 }
 
-impl<T: Timestamp + Lattice + Codec64> RustType<ProtoTrace> for Trace<T> {
-    fn into_proto(&self) -> ProtoTrace {
-        let since = Some(self.since().into_proto());
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThinSpineBatch<T> {
+    pub(crate) id: SpineId,
+    pub(crate) desc: Description<T>,
+    pub(crate) parts: Vec<(SpineId, Description<T>)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlatTrace<T> {
+    pub(crate) since: Antichain<T>,
+    pub(crate) hollow_batches: Vec<Arc<HollowBatch<T>>>,
+    pub(crate) spine_batches: Vec<(usize, ThinSpineBatch<T>)>,
+    pub(crate) spine_merges: Vec<(usize, FuelingMerge<T>)>,
+}
+
+impl<T: Timestamp + Lattice> From<Trace<T>> for FlatTrace<T> {
+    fn from(value: Trace<T>) -> Self {
+        let since = value.spine.since;
         let mut hollow_batches = vec![];
         let mut spine_batches = vec![];
-        let mut merges = vec![];
+        let mut spine_merges = vec![];
 
-        let mut push_hollow_batch = |batch: &IdHollowBatch<T>| {
-            let id = batch.id.into_proto();
-            let desc = batch.batch.desc.into_proto();
-            let batch = batch.batch.into_proto();
-            hollow_batches.push(batch);
-            ProtoHollowBatchRef {
-                id: Some(id),
-                desc: Some(desc),
-            }
+        let mut push_hollow_batch = |batch: IdHollowBatch<T>| {
+            let desc = batch.batch.desc.clone();
+            hollow_batches.push(Arc::clone(&batch.batch));
+            (batch.id, desc)
         };
 
-        let mut push_spine_batch = |level: usize, batch: &SpineBatch<T>| {
+        let mut push_spine_batch = |level: usize, batch: SpineBatch<T>| {
             let spine_batch = match batch {
-                SpineBatch::Merged(id_batch) => ProtoSpineBatch {
-                    id: Some(id_batch.id.into_proto()),
-                    desc: Some(id_batch.batch.desc.into_proto()),
+                SpineBatch::Merged(id_batch) => ThinSpineBatch {
+                    id: id_batch.id,
+                    desc: id_batch.batch.desc.clone(),
                     parts: vec![push_hollow_batch(id_batch)],
-                    level: level.into_proto(),
                 },
                 SpineBatch::Fueled {
                     id,
                     desc,
                     parts,
                     len: _,
-                } => ProtoSpineBatch {
-                    id: Some(id.into_proto()),
-                    desc: Some(desc.into_proto()),
-                    parts: parts.iter().map(|batch| push_hollow_batch(batch)).collect(),
-                    level: level.into_proto(),
+                } => ThinSpineBatch {
+                    id,
+                    desc,
+                    parts: parts
+                        .into_iter()
+                        .map(|id_batch| push_hollow_batch(id_batch))
+                        .collect(),
                 },
             };
-            spine_batches.push(spine_batch);
+            spine_batches.push((level, spine_batch));
         };
 
-        for (level, state) in self.spine.merging.iter().enumerate() {
+        for (level, state) in value.spine.merging.into_iter().enumerate() {
             match state {
                 MergeState::Vacant => {}
                 MergeState::Single(Some(batch)) => push_spine_batch(level, batch),
@@ -173,148 +180,124 @@ impl<T: Timestamp + Lattice + Codec64> RustType<ProtoTrace> for Trace<T> {
                 MergeState::Double(MergeVariant::InProgress(left, right, merge)) => {
                     push_spine_batch(level, left);
                     push_spine_batch(level, right);
-                    merges.push(ProtoSpineMerge {
-                        level: level.into_proto(),
-                        since: Some(merge.since.into_proto()),
-                        remaining_work: merge.remaining_work.into_proto(),
-                    })
+                    spine_merges.push((level, merge));
                 }
-                _ => warn!("ignoring unespected structurally-empty batch"),
+                _ => warn!("ignoring unexpected structurally-empty batch"),
             }
         }
 
-        if !self.roundtrip_structure {
+        if !value.roundtrip_structure {
             spine_batches.clear();
-            merges.clear();
+            spine_merges.clear();
         }
 
-        ProtoTrace {
+        FlatTrace {
             since,
             hollow_batches,
             spine_batches,
-            merges,
+            spine_merges,
         }
     }
+}
 
-    fn from_proto(proto: ProtoTrace) -> Result<Self, TryFromProtoError> {
-        let has_structure = !proto.spine_batches.is_empty() || !proto.merges.is_empty();
+impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
+    type Error = String;
+    fn try_from(value: FlatTrace<T>) -> Result<Self, String> {
+        let FlatTrace {
+            since,
+            mut hollow_batches,
+            mut spine_batches,
+            mut spine_merges,
+        } = value;
 
-        let trace: Trace<T> = if has_structure {
-            let ProtoTrace {
-                since,
-                hollow_batches,
-                mut spine_batches,
-                merges,
-            } = proto;
-            let since = since.into_rust_if_some("since")?;
-            let mut merge_by_level = BTreeMap::new();
-            for merge in merges {
-                let level: usize = merge.level.into_rust()?;
-                let merge = FuelingMerge {
-                    since: merge.since.into_rust_if_some("FuelingMerge::since")?,
-                    remaining_work: merge.remaining_work.into_rust()?,
-                };
-                merge_by_level.insert(level, merge);
+        let preserve_structure = hollow_batches.is_empty() || !spine_batches.is_empty();
+
+        let compare_chains = |left: &Antichain<T>, right: &Antichain<T>| {
+            if PartialOrder::less_than(left, right) {
+                Ordering::Less
+            } else if PartialOrder::less_than(right, left) {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
             }
+        };
 
-            let mut hollow_batch_by_lower = hollow_batches
-                .into_iter()
-                .map(|b| {
-                    b.into_rust()
-                        .map(|batch: HollowBatch<T>| (batch.desc.lower().clone(), batch))
-                })
-                .collect::<Result<HashMap<_, _>, _>>()?;
+        // We sort the batches from "oldest" to "newest".
+        hollow_batches.sort_by(|a, b| compare_chains(a.desc.lower(), b.desc.lower()));
+        spine_batches.sort_by_key(|(_, batch)| batch.id.0);
 
-            let mut get_batch = |batch_ref: ProtoHollowBatchRef| {
-                let id = batch_ref.id.into_rust_if_some("ProtoHollowBatchRef::id")?;
-                let desc: Description<T> = batch_ref
-                    .desc
-                    .into_rust_if_some("ProtoHollowBatchRef::desc")?;
-                hollow_batch_by_lower
-                    .remove(&desc.lower())
-                    .ok_or_else(|| {
-                        TryFromProtoError::InvalidPersistState(format!("Missing desc: {desc:?}"))
-                    })
-                    .map(|batch| IdHollowBatch { id, batch })
+        // Merges are sorted by level, low to high.
+        spine_merges.sort_by_key(|(level, _)| *level);
+
+        let trace: Trace<T> = if preserve_structure {
+            let mut hollow_batches = hollow_batches.into_iter();
+            let mut pop_batch =
+                |id: SpineId, desc: Description<T>| -> Result<IdHollowBatch<T>, String> {
+                    let batch = hollow_batches.next().ok_or_else(|| {
+                        format!("missing referenced hollow batch {id:?} {desc:?}")
+                    })?;
+                    Ok(IdHollowBatch { id, batch })
+                };
+
+            let (upper, next_id) = if let Some((_, batch)) = spine_batches.last() {
+                (batch.desc.upper().clone(), batch.id.1)
+            } else {
+                (Antichain::from_elem(T::minimum()), 0)
             };
-
-            spine_batches.sort_by_key(|b| b.id.as_ref().map(|id| id.lo));
-
-            let max_level: usize = spine_batches
+            let levels = spine_batches
                 .first()
-                .expect("non-empty batches")
-                .level
-                .into_rust()?;
-            let mut levels = vec![MergeState::Vacant; max_level + 1];
-
-            let mut upper = Antichain::new();
-            let mut next_id = 0;
-
-            for mut batch in spine_batches {
-                let id: SpineId = batch.id.into_rust_if_some("ProtoSpineBatch::id")?;
-                let level: usize = batch.level.into_rust()?;
+                .map(|(level, _)| *level + 1)
+                .unwrap_or(0);
+            let mut merging = vec![MergeState::Vacant; levels];
+            for (level, mut batch) in spine_batches {
                 let batch = if batch.parts.len() == 1 {
-                    let batch_part = batch.parts.pop().expect("popping from nonempty vec");
-                    SpineBatch::Merged(Arc::new(get_batch(batch_part)?))
+                    let (id, desc) = batch.parts.pop().expect("popping from nonempty vec");
+                    SpineBatch::Merged(pop_batch(id, desc)?)
                 } else {
-                    let desc = batch.desc.into_rust_if_some("ProtoSpineBatch::desc")?;
                     let parts = batch
                         .parts
                         .into_iter()
-                        .map(|b| get_batch(b).map(Arc::new))
+                        .map(|(id, desc)| pop_batch(id, desc))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let len = parts.iter().map(|p| p.batch.len).sum();
+                    let len = parts.iter().map(|p| (*p).batch.len).sum();
                     SpineBatch::Fueled {
-                        id,
-                        desc,
+                        id: batch.id,
+                        desc: batch.desc,
                         parts,
                         len,
                     }
                 };
 
-                upper = batch.upper().clone();
-                next_id = batch.id().1;
-
-                while level >= levels.len() {
-                    levels.push(MergeState::Vacant);
-                }
-
-                let state = std::mem::replace(&mut levels[level], MergeState::Vacant);
+                let state = std::mem::replace(&mut merging[level], MergeState::Vacant);
                 let state = match state {
                     MergeState::Vacant => MergeState::Single(Some(batch)),
                     MergeState::Single(Some(other)) => {
-                        let merge = merge_by_level.remove(&level).ok_or_else(|| {
-                            TryFromProtoError::InvalidPersistState(format!(
-                                "Expected merge at level {level}"
-                            ))
-                        })?;
+                        let (_merge_level, merge) = spine_merges
+                            .pop()
+                            .ok_or_else(|| format!("Expected merge at level {level}"))?;
                         MergeState::Double(MergeVariant::InProgress(other, batch, merge))
                     }
-                    _ => Err(TryFromProtoError::InvalidPersistState(format!(
-                        "Too many batches at level {level}"
-                    )))?,
+                    _ => Err(format!("Too many batches at level {level}"))?,
                 };
 
-                levels[level] = state;
+                merging[level] = state;
             }
             let spine = Spine {
                 effort: 1,
                 next_id,
                 since,
                 upper,
-                merging: levels,
+                merging,
             };
 
-            if !hollow_batch_by_lower.is_empty() {
-                Err(TryFromProtoError::InvalidPersistState(format!(
-                    "Found {} leftover hollow batches after reconstructing spine",
-                    hollow_batch_by_lower.len()
-                )))?;
+            let leftover_batches = hollow_batches.count();
+            if leftover_batches != 0 {
+                Err(format!(
+                    "Found {leftover_batches} leftover hollow batches after reconstructing spine"
+                ))?;
             }
 
-            spine
-                .validate()
-                .map_err(|e| TryFromProtoError::InvalidPersistState(e))?;
+            spine.validate()?;
 
             Trace {
                 spine,
@@ -322,16 +305,15 @@ impl<T: Timestamp + Lattice + Codec64> RustType<ProtoTrace> for Trace<T> {
             }
         } else {
             let mut ret = Trace::default();
-            ret.downgrade_since(&proto.since.into_rust_if_some("since")?);
+            ret.downgrade_since(&since);
             let mut batches_pushed = 0;
-            for batch in proto.hollow_batches.into_iter() {
-                let batch: HollowBatch<T> = batch.into_rust()?;
+            for batch in hollow_batches {
                 if PartialOrder::less_than(ret.since(), batch.desc.since()) {
-                    return Err(TryFromProtoError::InvalidPersistState(format!(
+                    return Err(format!(
                         "invalid ProtoTrace: the spine's since {:?} was less than a batch's since {:?}",
                         ret.since(),
                         batch.desc.since()
-                    )));
+                    ));
                 }
                 // We could perhaps more directly serialize and rehydrate the
                 // internals of the Spine, but this is nice because it insulates
@@ -342,7 +324,7 @@ impl<T: Timestamp + Lattice + Codec64> RustType<ProtoTrace> for Trace<T> {
                 //
                 // Ignore merge_reqs because whichever process generated this diff is
                 // assigned the work.
-                let () = ret.push_batch_no_merge_reqs(batch);
+                let () = ret.push_batch_no_merge_reqs(Arc::unwrap_or_clone(batch));
 
                 batches_pushed += 1;
                 if batches_pushed % 1000 == 0 {
@@ -361,6 +343,246 @@ impl<T: Timestamp + Lattice + Codec64> RustType<ProtoTrace> for Trace<T> {
         Ok(trace)
     }
 }
+
+// impl<T: Timestamp + Lattice + Codec64> RustType<ProtoTrace> for Trace<T> {
+//     fn into_proto(&self) -> ProtoTrace {
+//         let since = Some(self.since().into_proto());
+//         let mut hollow_batches = vec![];
+//         let mut spine_batches = vec![];
+//         let mut merges = vec![];
+//
+//         let mut push_hollow_batch = |batch: &IdHollowBatch<T>| {
+//             let id = batch.id.into_proto();
+//             let desc = batch.batch.desc.into_proto();
+//             let batch = batch.batch.into_proto();
+//             hollow_batches.push(batch);
+//             ProtoHollowBatchRef {
+//                 id: Some(id),
+//                 desc: Some(desc),
+//             }
+//         };
+//
+//         let mut push_spine_batch = |level: usize, batch: &SpineBatch<T>| {
+//             let spine_batch = match batch {
+//                 SpineBatch::Merged(id_batch) => ProtoSpineBatch {
+//                     id: Some(id_batch.id.into_proto()),
+//                     desc: Some(id_batch.batch.desc.into_proto()),
+//                     parts: vec![push_hollow_batch(id_batch)],
+//                     level: level.into_proto(),
+//                 },
+//                 SpineBatch::Fueled {
+//                     id,
+//                     desc,
+//                     parts,
+//                     len: _,
+//                 } => ProtoSpineBatch {
+//                     id: Some(id.into_proto()),
+//                     desc: Some(desc.into_proto()),
+//                     parts: parts.iter().map(|batch| push_hollow_batch(batch)).collect(),
+//                     level: level.into_proto(),
+//                 },
+//             };
+//             spine_batches.push(spine_batch);
+//         };
+//
+//         for (level, state) in self.spine.merging.iter().enumerate() {
+//             match state {
+//                 MergeState::Vacant => {}
+//                 MergeState::Single(Some(batch)) => push_spine_batch(level, batch),
+//                 MergeState::Double(MergeVariant::Complete(Some(batch))) => {
+//                     push_spine_batch(level, batch)
+//                 }
+//                 MergeState::Double(MergeVariant::InProgress(left, right, merge)) => {
+//                     push_spine_batch(level, left);
+//                     push_spine_batch(level, right);
+//                     merges.push(ProtoSpineMerge {
+//                         level: level.into_proto(),
+//                         since: Some(merge.since.into_proto()),
+//                         remaining_work: merge.remaining_work.into_proto(),
+//                     })
+//                 }
+//                 _ => warn!("ignoring unespected structurally-empty batch"),
+//             }
+//         }
+//
+//         if !self.roundtrip_structure {
+//             spine_batches.clear();
+//             merges.clear();
+//         }
+//
+//         ProtoTrace {
+//             since,
+//             hollow_batches,
+//             spine_batches,
+//             merges,
+//         }
+//     }
+//
+//     fn from_proto(proto: ProtoTrace) -> Result<Self, TryFromProtoError> {
+//         let has_structure = !proto.spine_batches.is_empty() || !proto.merges.is_empty();
+//
+//         let trace: Trace<T> = if has_structure {
+//             let ProtoTrace {
+//                 since,
+//                 hollow_batches,
+//                 mut spine_batches,
+//                 merges,
+//             } = proto;
+//             let since = since.into_rust_if_some("since")?;
+//             let mut merge_by_level = BTreeMap::new();
+//             for merge in merges {
+//                 let level: usize = merge.level.into_rust()?;
+//                 let merge = FuelingMerge {
+//                     since: merge.since.into_rust_if_some("FuelingMerge::since")?,
+//                     remaining_work: merge.remaining_work.into_rust()?,
+//                 };
+//                 merge_by_level.insert(level, merge);
+//             }
+//
+//             let mut hollow_batch_by_lower = hollow_batches
+//                 .into_iter()
+//                 .map(|b| {
+//                     b.into_rust()
+//                         .map(|batch: HollowBatch<T>| (batch.desc.lower().clone(), batch))
+//                 })
+//                 .collect::<Result<HashMap<_, _>, _>>()?;
+//
+//             let mut get_batch = |batch_ref: ProtoHollowBatchRef| {
+//                 let id = batch_ref.id.into_rust_if_some("ProtoHollowBatchRef::id")?;
+//                 let desc: Description<T> = batch_ref
+//                     .desc
+//                     .into_rust_if_some("ProtoHollowBatchRef::desc")?;
+//                 hollow_batch_by_lower
+//                     .remove(&desc.lower())
+//                     .ok_or_else(|| {
+//                         TryFromProtoError::InvalidPersistState(format!("Missing desc: {desc:?}"))
+//                     })
+//                     .map(|batch| IdHollowBatch { id, batch })
+//             };
+//
+//             spine_batches.sort_by_key(|b| b.id.as_ref().map(|id| id.lo));
+//
+//             let max_level: usize = spine_batches
+//                 .first()
+//                 .expect("non-empty batches")
+//                 .level
+//                 .into_rust()?;
+//             let mut levels = vec![MergeState::Vacant; max_level + 1];
+//
+//             let mut upper = Antichain::new();
+//             let mut next_id = 0;
+//
+//             for mut batch in spine_batches {
+//                 let id: SpineId = batch.id.into_rust_if_some("ProtoSpineBatch::id")?;
+//                 let level: usize = batch.level.into_rust()?;
+//                 let batch = if batch.parts.len() == 1 {
+//                     let batch_part = batch.parts.pop().expect("popping from nonempty vec");
+//                     SpineBatch::Merged(Arc::new(get_batch(batch_part)?))
+//                 } else {
+//                     let desc = batch.desc.into_rust_if_some("ProtoSpineBatch::desc")?;
+//                     let parts = batch
+//                         .parts
+//                         .into_iter()
+//                         .map(|b| get_batch(b).map(Arc::new))
+//                         .collect::<Result<Vec<_>, _>>()?;
+//                     let len = parts.iter().map(|p| p.batch.len).sum();
+//                     SpineBatch::Fueled {
+//                         id,
+//                         desc,
+//                         parts,
+//                         len,
+//                     }
+//                 };
+//
+//                 upper = batch.upper().clone();
+//                 next_id = batch.id().1;
+//
+//                 while level >= levels.len() {
+//                     levels.push(MergeState::Vacant);
+//                 }
+//
+//                 let state = std::mem::replace(&mut levels[level], MergeState::Vacant);
+//                 let state = match state {
+//                     MergeState::Vacant => MergeState::Single(Some(batch)),
+//                     MergeState::Single(Some(other)) => {
+//                         let merge = merge_by_level.remove(&level).ok_or_else(|| {
+//                             TryFromProtoError::InvalidPersistState(format!(
+//                                 "Expected merge at level {level}"
+//                             ))
+//                         })?;
+//                         MergeState::Double(MergeVariant::InProgress(other, batch, merge))
+//                     }
+//                     _ => Err(TryFromProtoError::InvalidPersistState(format!(
+//                         "Too many batches at level {level}"
+//                     )))?,
+//                 };
+//
+//                 levels[level] = state;
+//             }
+//             let spine = Spine {
+//                 effort: 1,
+//                 next_id,
+//                 since,
+//                 upper,
+//                 merging: levels,
+//             };
+//
+//             if !hollow_batch_by_lower.is_empty() {
+//                 Err(TryFromProtoError::InvalidPersistState(format!(
+//                     "Found {} leftover hollow batches after reconstructing spine",
+//                     hollow_batch_by_lower.len()
+//                 )))?;
+//             }
+//
+//             spine
+//                 .validate()
+//                 .map_err(|e| TryFromProtoError::InvalidPersistState(e))?;
+//
+//             Trace {
+//                 spine,
+//                 roundtrip_structure: true,
+//             }
+//         } else {
+//             let mut ret = Trace::default();
+//             ret.downgrade_since(&proto.since.into_rust_if_some("since")?);
+//             let mut batches_pushed = 0;
+//             for batch in proto.hollow_batches.into_iter() {
+//                 let batch: HollowBatch<T> = batch.into_rust()?;
+//                 if PartialOrder::less_than(ret.since(), batch.desc.since()) {
+//                     return Err(TryFromProtoError::InvalidPersistState(format!(
+//                         "invalid ProtoTrace: the spine's since {:?} was less than a batch's since {:?}",
+//                         ret.since(),
+//                         batch.desc.since()
+//                     )));
+//                 }
+//                 // We could perhaps more directly serialize and rehydrate the
+//                 // internals of the Spine, but this is nice because it insulates
+//                 // us against changes in the Spine logic. The current logic has
+//                 // turned out to be relatively expensive in practice, but as we
+//                 // tune things (especially when we add inc state) the rate of
+//                 // this deserialization should go down. Revisit as necessary.
+//                 //
+//                 // Ignore merge_reqs because whichever process generated this diff is
+//                 // assigned the work.
+//                 let () = ret.push_batch_no_merge_reqs(batch);
+//
+//                 batches_pushed += 1;
+//                 if batches_pushed % 1000 == 0 {
+//                     let mut batch_count = 0;
+//                     ret.map_batches(|_| batch_count += 1);
+//                     debug!("Decoded and pushed {batches_pushed} batches; trace size {batch_count}");
+//                 }
+//             }
+//             debug_assert_eq!(ret.validate(), Ok(()), "{:?}", ret);
+//
+//             ret.roundtrip_structure = false;
+//
+//             ret
+//         };
+//
+//         Ok(trace)
+//     }
+// }
 
 impl<T> Trace<T> {
     pub fn since(&self) -> &Antichain<T> {
@@ -534,16 +756,16 @@ pub struct SpineId(pub usize, pub usize);
 #[derive(Debug, Clone, PartialEq)]
 pub struct IdHollowBatch<T> {
     pub id: SpineId,
-    pub batch: HollowBatch<T>,
+    pub batch: Arc<HollowBatch<T>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum SpineBatch<T> {
-    Merged(Arc<IdHollowBatch<T>>),
+    Merged(IdHollowBatch<T>),
     Fueled {
         id: SpineId,
         desc: Description<T>,
-        parts: Vec<Arc<IdHollowBatch<T>>>,
+        parts: Vec<IdHollowBatch<T>>,
         // A cached version of parts.iter().map(|x| x.len).sum()
         len: usize,
     },
@@ -626,15 +848,15 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
         upper: Antichain<T>,
         since: Antichain<T>,
     ) -> Self {
-        SpineBatch::Merged(Arc::new(IdHollowBatch {
+        SpineBatch::Merged(IdHollowBatch {
             id,
-            batch: HollowBatch {
+            batch: Arc::new(HollowBatch {
                 desc: Description::new(lower, upper, since),
                 parts: vec![],
                 len: 0,
                 runs: vec![],
-            },
-        }))
+            }),
+        })
     }
 
     pub fn begin_merge(
@@ -677,10 +899,10 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
             if res.output.len > self.len() {
                 return ApplyMergeResult::NotAppliedTooManyUpdates;
             }
-            *self = SpineBatch::Merged(Arc::new(IdHollowBatch {
+            *self = SpineBatch::Merged(IdHollowBatch {
                 id: self.id(),
-                batch: res.output.clone(),
-            }));
+                batch: Arc::new(res.output.clone()),
+            });
             return ApplyMergeResult::AppliedExact;
         }
 
@@ -718,10 +940,10 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
                     (Some((lower, id_lower)), Some((upper, id_upper))) => {
                         let mut new_parts = vec![];
                         new_parts.extend_from_slice(&parts[..lower]);
-                        new_parts.push(Arc::new(IdHollowBatch {
+                        new_parts.push(IdHollowBatch {
                             id: SpineId(id_lower, id_upper),
-                            batch: res.output.clone(),
-                        }));
+                            batch: Arc::new(res.output.clone()),
+                        });
                         new_parts.extend_from_slice(&parts[upper + 1..]);
                         let new_spine_batch = SpineBatch::Fueled {
                             id: *id,
@@ -815,10 +1037,10 @@ impl<T: Timestamp + Lattice> SpineBatch<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FuelingMerge<T> {
-    since: Antichain<T>,
-    remaining_work: usize,
+    pub(crate) since: Antichain<T>,
+    pub(crate) remaining_work: usize,
 }
 
 impl<T: Timestamp + Lattice> FuelingMerge<T> {
@@ -1029,7 +1251,10 @@ impl<T: Timestamp + Lattice> Spine<T> {
             self.next_id += 1;
             SpineId(id, self.next_id)
         };
-        let batch = SpineBatch::Merged(Arc::new(IdHollowBatch { id, batch }));
+        let batch = SpineBatch::Merged(IdHollowBatch {
+            id,
+            batch: Arc::new(batch),
+        });
 
         self.upper.clone_from(batch.upper());
 
