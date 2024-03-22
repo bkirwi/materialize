@@ -271,7 +271,7 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
                         let (_merge_level, merge) = spine_merges
                             .pop()
                             .ok_or_else(|| format!("Expected merge at level {level}"))?;
-                        MergeState::Double(MergeVariant::InProgress(other, batch, merge))
+                        MergeState::Double(single, batch, merge)
                     }
                     _ => Err(format!("Too many batches at level {level}"))?,
                 };
