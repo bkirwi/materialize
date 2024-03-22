@@ -266,8 +266,8 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
 
                 let state = std::mem::replace(&mut merging[level], MergeState::Vacant);
                 let state = match state {
-                    MergeState::Vacant => MergeState::Single(Some(batch)),
-                    MergeState::Single(Some(other)) => {
+                    MergeState::Vacant => MergeState::Single(batch),
+                    MergeState::Single(single) => {
                         let (_merge_level, merge) = spine_merges
                             .pop()
                             .ok_or_else(|| format!("Expected merge at level {level}"))?;
