@@ -3117,7 +3117,7 @@ where
                         match finalize().await {
                             Err(e) => {
                                 // Rather than error, just leave this shard as one to finalize later.
-                                warn!("error during background finalization: {e:?}");
+                                warn!("error during background finalization for shard {shard_id}: {e:?}");
                             }
                             Ok(()) => {}
                         }
