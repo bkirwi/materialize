@@ -173,11 +173,8 @@ impl<T: Timestamp + Lattice> From<Trace<T>> for FlatTrace<T> {
         for (level, state) in value.spine.merging.into_iter().enumerate() {
             match state {
                 MergeState::Vacant => {}
-                MergeState::Single(Some(batch)) => push_spine_batch(level, batch),
-                MergeState::Double(MergeVariant::Complete(Some(batch))) => {
-                    push_spine_batch(level, batch)
-                }
-                MergeState::Double(MergeVariant::InProgress(left, right, merge)) => {
+                MergeState::Single(batch) => push_spine_batch(level, batch),
+                MergeState::Double(left, right, merge) => {
                     push_spine_batch(level, left);
                     push_spine_batch(level, right);
                     spine_merges.push((level, merge));
