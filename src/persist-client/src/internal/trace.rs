@@ -179,7 +179,6 @@ impl<T: Timestamp + Lattice> From<Trace<T>> for FlatTrace<T> {
                     push_spine_batch(level, right);
                     spine_merges.push((level, merge));
                 }
-                _ => warn!("ignoring unexpected structurally-empty batch"),
             }
         }
 
