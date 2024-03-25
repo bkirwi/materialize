@@ -133,7 +133,7 @@ pub struct FlatTrace<T> {
     pub(crate) legacy_batches: BTreeMap<Arc<HollowBatch<T>>, ()>,
     pub(crate) hollow_batches: BTreeMap<SpineId, Arc<HollowBatch<T>>>,
     pub(crate) spine_batches: BTreeMap<SpineId, ThinSpineBatch<T>>,
-    pub(crate) spine_merges: BTreeMap<usize, FuelingMerge<T>>,
+    pub(crate) fueling_merges: BTreeMap<usize, FuelingMerge<T>>,
 }
 
 impl<'a, T: Timestamp + Lattice> From<&'a Trace<T>> for FlatTrace<T> {
@@ -211,7 +211,7 @@ impl<'a, T: Timestamp + Lattice> From<&'a Trace<T>> for FlatTrace<T> {
             legacy_batches,
             hollow_batches,
             spine_batches,
-            spine_merges,
+            fueling_merges: spine_merges,
         }
     }
 }
@@ -224,7 +224,7 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
             mut legacy_batches,
             mut hollow_batches,
             mut spine_batches,
-            mut spine_merges,
+            fueling_merges: mut spine_merges,
         } = value;
 
         let has_structure = hollow_batches.is_empty() || !spine_batches.is_empty();

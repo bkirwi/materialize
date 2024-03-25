@@ -398,10 +398,10 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
 
         if !diff_spine.is_empty() {
             if !spine_batches.is_empty() {
-                let mut flat: FlatTrace<T> = (&self.collections.trace).into();
+                let mut flat: FlatTrace<T> = (&*trace).into();
                 apply_diffs_single("since", diff_since, &mut flat.since)?;
                 apply_diffs_map(
-                    "legacy-batches",
+                    "legacy_batches",
                     diff_spine
                         .into_iter()
                         .map(|StateFieldDiff { key, val }| StateFieldDiff {
@@ -410,9 +410,9 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
                         }),
                     &mut flat.legacy_batches,
                 )?;
-                apply_diffs_map("hollow-batches", hollow_batches, &mut flat.hollow_batches)?;
-                apply_diffs_map("spine-batches", spine_batches, &mut flat.spine_batches)?;
-                apply_diffs_map("legacy-batches", spine_merges, &mut flat.spine_merges)?;
+                apply_diffs_map("hollow_batches", hollow_batches, &mut flat.hollow_batches)?;
+                apply_diffs_map("spine_batches", spine_batches, &mut flat.spine_batches)?;
+                apply_diffs_map("merges", spine_merges, &mut flat.fueling_merges)?;
                 *trace = flat.try_into()?;
             } else {
                 for x in diff_since {

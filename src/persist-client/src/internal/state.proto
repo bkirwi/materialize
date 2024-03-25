@@ -57,10 +57,9 @@ message ProtoHollowBatchRef {
 }
 
 message ProtoSpineBatch {
-    ProtoSpineId id = 1;
+    uint64 level = 1;
     ProtoU64Description desc = 2;
     repeated ProtoHollowBatchRef parts = 3;
-    uint64 level = 4;
 }
 
 message ProtoIdSpineBatch {
@@ -73,8 +72,8 @@ message ProtoFuelingMerge {
     uint64 remaining_work = 2;
 }
 
-message ProtoIdFuelingMerge {
-    ProtoSpineId id = 1;
+message ProtoLevelFuelingMerge {
+    uint64 level = 1;
     ProtoFuelingMerge merge = 2;
 }
 
@@ -87,8 +86,8 @@ message ProtoTrace {
     ProtoU64Antichain since = 1;
     repeated ProtoHollowBatch legacy_batches = 2;
     repeated ProtoIdHollowBatch hollow_batches = 3;
-    repeated ProtoSpineBatch spine_batches = 4;
-    map<uint64, ProtoFuelingMerge> merges = 5;
+    repeated ProtoIdSpineBatch spine_batches = 4;
+    repeated ProtoLevelFuelingMerge merges = 5;
 }
 
 message ProtoLeasedReaderState {
