@@ -46,6 +46,11 @@ message ProtoSpineId {
     uint64 hi = 2;
 }
 
+message ProtoIdHollowBatch {
+    ProtoSpineId id = 1;
+    ProtoHollowBatch batch = 2;
+}
+
 message ProtoHollowBatchRef {
     ProtoSpineId id = 1;
     ProtoU64Description desc = 2;
@@ -71,9 +76,10 @@ message ProtoHollowRollup {
 
 message ProtoTrace {
     ProtoU64Antichain since = 1;
-    repeated ProtoHollowBatch hollow_batches = 2;
-    repeated ProtoSpineBatch spine_batches = 3;
-    repeated ProtoSpineMerge merges = 4;
+    repeated ProtoHollowBatch legacy_batches = 2;
+    repeated ProtoIdHollowBatch hollow_batches = 3;
+    repeated ProtoSpineBatch spine_batches = 4;
+    repeated ProtoSpineMerge merges = 5;
 }
 
 message ProtoLeasedReaderState {

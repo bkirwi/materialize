@@ -48,7 +48,7 @@
 //! [Batch::Merger]: differential_dataflow::trace::Batch::Merger
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -56,9 +56,9 @@ use std::sync::Arc;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
 use mz_ore::cast::CastFrom;
+use mz_ore::collections::HashSet;
 #[allow(unused_imports)] // False positive.
 use mz_ore::fmt::FormatBuffer;
-use serde_json::map::BTreeMap;
 use timely::progress::frontier::AntichainRef;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
@@ -84,7 +84,7 @@ pub struct FueledMergeRes<T> {
 #[derive(Debug, Clone)]
 pub struct Trace<T> {
     spine: Spine<T>,
-    roundtrip_structure: bool,
+    roundtrip_structure: Option<BTreeMap<Arc<HollowBatch<T>>, ()>>,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -115,7 +115,7 @@ impl<T: Timestamp + Lattice> Default for Trace<T> {
     fn default() -> Self {
         Self {
             spine: Spine::new(),
-            roundtrip_structure: true,
+            roundtrip_structure: Some(Default::default()),
         }
     }
 }
@@ -130,67 +130,85 @@ pub struct ThinSpineBatch<T> {
 #[derive(Clone, Debug)]
 pub struct FlatTrace<T> {
     pub(crate) since: Antichain<T>,
+    pub(crate) legacy_batches: BTreeMap<Arc<HollowBatch<T>>, ()>,
     pub(crate) hollow_batches: BTreeMap<SpineId, Arc<HollowBatch<T>>>,
     pub(crate) spine_batches: BTreeMap<SpineId, ThinSpineBatch<T>>,
     pub(crate) spine_merges: BTreeMap<usize, FuelingMerge<T>>,
 }
 
-impl<T: Timestamp + Lattice> From<Trace<T>> for FlatTrace<T> {
-    fn from(value: Trace<T>) -> Self {
-        let since = value.spine.since;
+impl<'a, T: Timestamp + Lattice> From<&'a Trace<T>> for FlatTrace<T> {
+    fn from(value: &'a Trace<T>) -> Self {
+        let since = value.spine.since.clone();
+        let mut legacy_batches = BTreeMap::new();
         let mut hollow_batches = BTreeMap::new();
         let mut spine_batches = BTreeMap::new();
         let mut spine_merges = BTreeMap::new();
 
-        let mut push_hollow_batch = |batch: IdHollowBatch<T>| {
-            let desc = batch.batch.desc.clone();
-            hollow_batches.insert(batch.id, Arc::clone(&batch.batch));
-            (batch.id, desc)
+        let mut push_hollow_batch = |id_batch: &IdHollowBatch<T>| {
+            let id = id_batch.id;
+            let batch = Arc::clone(&id_batch.batch);
+            let legacy_batch = value
+                .roundtrip_structure
+                .as_ref()
+                .map_or(false, |s| s.contains_key(&batch));
+            let desc = batch.desc.clone();
+            if legacy_batch {
+                legacy_batches.insert(batch, ());
+            } else {
+                hollow_batches.insert(id, batch);
+            }
+            (id, desc)
         };
 
-        let mut push_spine_batch = |level: usize, batch: SpineBatch<T>| {
-            let spine_batch = match batch {
-                SpineBatch::Merged(id_batch) => ThinSpineBatch {
-                    id: id_batch.id,
-                    desc: id_batch.batch.desc.clone(),
-                    parts: vec![push_hollow_batch(id_batch)],
-                },
+        let mut push_spine_batch = |level: usize, batch: &SpineBatch<T>| {
+            let (id, spine_batch) = match batch {
+                SpineBatch::Merged(id_batch) => (
+                    id_batch.id,
+                    ThinSpineBatch {
+                        level,
+                        desc: id_batch.batch.desc.clone(),
+                        parts: vec![push_hollow_batch(id_batch)],
+                    },
+                ),
                 SpineBatch::Fueled {
                     id,
                     desc,
                     parts,
                     len: _,
-                } => ThinSpineBatch {
-                    id,
-                    desc,
-                    parts: parts
-                        .into_iter()
-                        .map(|id_batch| push_hollow_batch(id_batch))
-                        .collect(),
-                },
+                } => (
+                    *id,
+                    ThinSpineBatch {
+                        level,
+                        desc: desc.clone(),
+                        parts: parts
+                            .into_iter()
+                            .map(|id_batch| push_hollow_batch(id_batch))
+                            .collect(),
+                    },
+                ),
             };
-            spine_batches.push((level, spine_batch));
+            if value.roundtrip_structure.is_some() {
+                spine_batches.insert(id, spine_batch);
+            }
         };
 
-        for (level, state) in value.spine.merging.into_iter().enumerate() {
+        for (level, state) in value.spine.merging.iter().enumerate() {
             match state {
                 MergeState::Vacant => {}
                 MergeState::Single(batch) => push_spine_batch(level, batch),
                 MergeState::Double(left, right, merge) => {
                     push_spine_batch(level, left);
                     push_spine_batch(level, right);
-                    spine_merges.push((level, merge));
+                    if value.roundtrip_structure.is_some() {
+                        spine_merges.insert(level, merge.clone());
+                    }
                 }
             }
         }
 
-        if !value.roundtrip_structure {
-            spine_batches.clear();
-            spine_merges.clear();
-        }
-
         FlatTrace {
             since,
+            legacy_batches,
             hollow_batches,
             spine_batches,
             spine_merges,
@@ -203,13 +221,17 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
     fn try_from(value: FlatTrace<T>) -> Result<Self, String> {
         let FlatTrace {
             since,
+            mut legacy_batches,
             mut hollow_batches,
             mut spine_batches,
             mut spine_merges,
         } = value;
 
-        let preserve_structure = hollow_batches.is_empty() || !spine_batches.is_empty();
+        let has_structure = hollow_batches.is_empty() || !spine_batches.is_empty();
+        let roundtrip_structure = has_structure.then(|| legacy_batches.clone());
 
+        // We need to look up legacy batches somehow, but we don't have a spine id for them.
+        // Instead, we order them in time order so we can pop them off one at a time.
         let compare_chains = |left: &Antichain<T>, right: &Antichain<T>| {
             if PartialOrder::less_than(left, right) {
                 Ordering::Less
@@ -220,34 +242,34 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
             }
         };
 
-        // We sort the batches from "oldest" to "newest".
-        hollow_batches.sort_by(|a, b| compare_chains(a.desc.lower(), b.desc.lower()));
-        spine_batches.sort_by_key(|(_, batch)| batch.id.0);
+        let mut legacy_batches: Vec<_> = legacy_batches.into_iter().map(|(k, _)| k).collect();
+        legacy_batches.sort_by(|a, b| compare_chains(a.desc.lower(), b.desc.lower()).reverse());
 
-        // Merges are sorted by level, low to high.
-        spine_merges.sort_by_key(|(level, _)| *level);
-
-        let trace: Trace<T> = if preserve_structure {
-            let mut hollow_batches = hollow_batches.into_iter();
-            let mut pop_batch =
-                |id: SpineId, desc: Description<T>| -> Result<IdHollowBatch<T>, String> {
-                    let batch = hollow_batches.next().ok_or_else(|| {
-                        format!("missing referenced hollow batch {id:?} {desc:?}")
-                    })?;
-                    Ok(IdHollowBatch { id, batch })
+        let spine: Spine<T> = if let Some(legacy) = &roundtrip_structure {
+            let mut pop_batch = |id: SpineId, desc: Description<T>| -> Result<_, String> {
+                let batch = if let Some(batch) = hollow_batches.remove(&id) {
+                    batch
+                } else {
+                    legacy_batches
+                        .pop()
+                        .filter(|b| b.desc == desc)
+                        .ok_or_else(|| format!("missing referenced hollow batch {id:?} {desc:?}"))?
                 };
+                Ok(IdHollowBatch { id, batch })
+            };
 
-            let (upper, next_id) = if let Some((_, batch)) = spine_batches.last() {
-                (batch.desc.upper().clone(), batch.id.1)
+            let (upper, next_id) = if let Some((id, batch)) = spine_batches.last_key_value() {
+                (batch.desc.upper().clone(), id.1)
             } else {
                 (Antichain::from_elem(T::minimum()), 0)
             };
             let levels = spine_batches
-                .first()
-                .map(|(level, _)| *level + 1)
+                .first_key_value()
+                .map(|(_, batch)| batch.level + 1)
                 .unwrap_or(0);
             let mut merging = vec![MergeState::Vacant; levels];
-            for (level, mut batch) in spine_batches {
+            for (id, mut batch) in spine_batches {
+                let level = batch.level;
                 let batch = if batch.parts.len() == 1 {
                     let (id, desc) = batch.parts.pop().expect("popping from nonempty vec");
                     SpineBatch::Merged(pop_batch(id, desc)?)
@@ -259,7 +281,7 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
                         .collect::<Result<Vec<_>, _>>()?;
                     let len = parts.iter().map(|p| (*p).batch.len).sum();
                     SpineBatch::Fueled {
-                        id: batch.id,
+                        id,
                         desc: batch.desc,
                         parts,
                         len,
@@ -270,8 +292,8 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
                 let state = match state {
                     MergeState::Vacant => MergeState::Single(batch),
                     MergeState::Single(single) => {
-                        let (_merge_level, merge) = spine_merges
-                            .pop()
+                        let merge = spine_merges
+                            .remove(&level)
                             .ok_or_else(|| format!("Expected merge at level {level}"))?;
                         MergeState::Double(single, batch, merge)
                     }
@@ -288,24 +310,30 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
                 merging,
             };
 
-            let leftover_batches = hollow_batches.count();
-            if leftover_batches != 0 {
-                Err(format!(
-                    "Found {leftover_batches} leftover hollow batches after reconstructing spine"
-                ))?;
-            }
+            assert!(
+                legacy_batches.is_empty(),
+                "{} legacy batches left after reconstructing spine",
+                legacy.len()
+            );
+            assert!(
+                hollow_batches.is_empty(),
+                "{} batches left after reconstructing spine",
+                hollow_batches.len()
+            );
+            assert!(
+                spine_merges.is_empty(),
+                "{} merges left after reconstructing spine",
+                spine_merges.len()
+            );
 
             spine.validate()?;
 
-            Trace {
-                spine,
-                roundtrip_structure: true,
-            }
+            spine
         } else {
             let mut ret = Trace::default();
             ret.downgrade_since(&since);
             let mut batches_pushed = 0;
-            for batch in hollow_batches {
+            for batch in legacy_batches {
                 if PartialOrder::less_than(ret.since(), batch.desc.since()) {
                     return Err(format!(
                         "invalid ProtoTrace: the spine's since {:?} was less than a batch's since {:?}",
@@ -332,13 +360,13 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
                 }
             }
             debug_assert_eq!(ret.validate(), Ok(()), "{:?}", ret);
-
-            ret.roundtrip_structure = false;
-
-            ret
+            ret.spine
         };
 
-        Ok(trace)
+        Ok(Trace {
+            spine,
+            roundtrip_structure,
+        })
     }
 }
 

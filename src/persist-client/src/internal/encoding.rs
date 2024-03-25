@@ -21,7 +21,7 @@ use mz_ore::halt;
 use mz_persist::location::{SeqNo, VersionedData};
 use mz_persist_types::stats::{PartStats, ProtoStructStats};
 use mz_persist_types::{Codec, Codec64};
-use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
+use mz_proto::{IntoRustIfSome, ProtoMapEntry, ProtoType, RustType, TryFromProtoError};
 use proptest::prelude::Arbitrary;
 use proptest::strategy::Strategy;
 use prost::Message;
@@ -38,10 +38,11 @@ use crate::internal::state::{
     CriticalReaderState, HandleDebugState, HollowBatch, HollowBatchPart, HollowRollup,
     IdempotencyToken, LeasedReaderState, OpaqueState, ProtoCriticalReaderState,
     ProtoHandleDebugState, ProtoHollowBatch, ProtoHollowBatchPart, ProtoHollowBatchRef,
-    ProtoHollowRollup, ProtoInlinedDiffs, ProtoLeasedReaderState, ProtoRollup, ProtoSpineBatch,
-    ProtoSpineId, ProtoSpineMerge, ProtoStateDiff, ProtoStateField, ProtoStateFieldDiffType,
-    ProtoStateFieldDiffs, ProtoTrace, ProtoU64Antichain, ProtoU64Description, ProtoVersionedData,
-    ProtoWriterState, State, StateCollections, TypedState, WriterState,
+    ProtoHollowRollup, ProtoIdHollowBatch, ProtoInlinedDiffs, ProtoLeasedReaderState, ProtoRollup,
+    ProtoSpineBatch, ProtoSpineId, ProtoSpineMerge, ProtoStateDiff, ProtoStateField,
+    ProtoStateFieldDiffType, ProtoStateFieldDiffs, ProtoTrace, ProtoU64Antichain,
+    ProtoU64Description, ProtoVersionedData, ProtoWriterState, State, StateCollections, TypedState,
+    WriterState,
 };
 use crate::internal::state_diff::{
     ProtoStateFieldDiff, ProtoStateFieldDiffsWriter, StateDiff, StateFieldDiff, StateFieldValDiff,
@@ -956,29 +957,45 @@ impl<T: Timestamp + Codec64> RustType<ProtoHollowBatchRef> for (SpineId, Descrip
     }
 }
 
-impl<T: Timestamp + Codec64> RustType<ProtoSpineBatch> for (usize, ThinSpineBatch<T>) {
-    fn into_proto(&self) -> ProtoSpineBatch {
-        let (level, batch) = self;
-        ProtoSpineBatch {
-            id: Some(batch.id.into_proto()),
-            desc: Some(batch.desc.into_proto()),
-            parts: batch.parts.into_proto(),
-            level: level.into_proto(),
+impl<T: Timestamp + Codec64> ProtoMapEntry<SpineId, Arc<HollowBatch<T>>> for ProtoIdHollowBatch {
+    fn from_rust<'a>(entry: (&'a SpineId, &'a Arc<HollowBatch<T>>)) -> Self {
+        let (id, batch) = entry;
+        ProtoIdHollowBatch {
+            id: Some(id.into_proto()),
+            batch: Some(batch.into_proto()),
         }
     }
 
-    fn from_proto(proto: ProtoSpineBatch) -> Result<Self, TryFromProtoError> {
+    fn into_rust(self) -> Result<(SpineId, Arc<HollowBatch<T>>), TryFromProtoError> {
+        let id = self.id.into_rust_if_some("id")?;
+        let batch = Arc::new(self.batch.into_rust_if_some("batch")?);
+        Ok((id, batch))
+    }
+}
+
+impl<T: Timestamp + Codec64> ProtoMapEntry<SpineId, ThinSpineBatch<T>> for ProtoSpineBatch {
+    fn from_rust<'a>(entry: (&'a SpineId, &'a ThinSpineBatch<T>)) -> Self {
+        let (id, batch) = entry;
+        ProtoSpineBatch {
+            id: Some(id.into_proto()),
+            desc: Some(batch.desc.into_proto()),
+            parts: batch.parts.into_proto(),
+            level: batch.level.into_proto(),
+        }
+    }
+
+    fn into_rust(self) -> Result<(SpineId, ThinSpineBatch<T>), TryFromProtoError> {
+        let proto = self;
         let level = proto.level.into_rust()?;
         let id = proto.id.into_rust_if_some("id")?;
         let desc = proto.desc.into_rust_if_some("desc")?;
         let parts = proto.parts.into_rust()?;
-        Ok((level, ThinSpineBatch { id, desc, parts }))
+        Ok((id, ThinSpineBatch { level, desc, parts }))
     }
 }
 
-impl<T: Timestamp + Codec64> RustType<ProtoSpineMerge> for (usize, FuelingMerge<T>) {
-    fn into_proto(&self) -> ProtoSpineMerge {
-        let (level, merge) = self;
+impl<T: Timestamp + Codec64> ProtoMapEntry<usize, FuelingMerge<T>> for ProtoSpineMerge {
+    fn from_rust<'a>((level, merge): (&'a usize, &'a FuelingMerge<T>)) -> Self {
         ProtoSpineMerge {
             level: level.into_proto(),
             since: Some(merge.since.into_proto()),
@@ -986,10 +1003,10 @@ impl<T: Timestamp + Codec64> RustType<ProtoSpineMerge> for (usize, FuelingMerge<
         }
     }
 
-    fn from_proto(proto: ProtoSpineMerge) -> Result<Self, TryFromProtoError> {
-        let level = proto.level.into_rust()?;
-        let since = proto.since.into_rust_if_some("since")?;
-        let remaining_work = proto.remaining_work.into_rust()?;
+    fn into_rust(self) -> Result<(usize, FuelingMerge<T>), TryFromProtoError> {
+        let level = self.level.into_rust()?;
+        let since = self.since.into_rust_if_some("since")?;
+        let remaining_work = self.remaining_work.into_rust()?;
         Ok((
             level,
             FuelingMerge {
@@ -1003,11 +1020,17 @@ impl<T: Timestamp + Codec64> RustType<ProtoSpineMerge> for (usize, FuelingMerge<
 impl<T: Timestamp + Codec64> RustType<ProtoTrace> for FlatTrace<T> {
     fn into_proto(&self) -> ProtoTrace {
         let since = self.since.into_proto();
+        let legacy_batches = self
+            .legacy_batches
+            .into_iter()
+            .map(|(b, _)| b.into_proto())
+            .collect();
         let hollow_batches = self.hollow_batches.into_proto();
         let spine_batches = self.spine_batches.into_proto();
         let merges = self.spine_merges.into_proto();
         ProtoTrace {
             since: Some(since),
+            legacy_batches,
             hollow_batches,
             spine_batches,
             merges,
@@ -1016,11 +1039,17 @@ impl<T: Timestamp + Codec64> RustType<ProtoTrace> for FlatTrace<T> {
 
     fn from_proto(proto: ProtoTrace) -> Result<Self, TryFromProtoError> {
         let since = proto.since.into_rust_if_some("since")?;
+        let legacy_batches = proto
+            .legacy_batches
+            .into_iter()
+            .map(|b| b.into_rust().map(|b| (b, ())))
+            .collect::<Result<_, _>>()?;
         let hollow_batches = proto.hollow_batches.into_rust()?;
         let spine_batches = proto.spine_batches.into_rust()?;
         let spine_merges = proto.merges.into_rust()?;
         Ok(FlatTrace {
             since,
+            legacy_batches,
             hollow_batches,
             spine_batches,
             spine_merges,
@@ -1030,7 +1059,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoTrace> for FlatTrace<T> {
 
 impl<T: Timestamp + Lattice + Codec64> RustType<ProtoTrace> for Trace<T> {
     fn into_proto(&self) -> ProtoTrace {
-        FlatTrace::from(self.clone()).into_proto()
+        FlatTrace::from(self).into_proto()
     }
 
     fn from_proto(proto: ProtoTrace) -> Result<Self, TryFromProtoError> {

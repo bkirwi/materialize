@@ -10,6 +10,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use differential_dataflow::lattice::Lattice;
@@ -29,7 +30,9 @@ use crate::internal::state::{
     ProtoStateField, ProtoStateFieldDiffType, ProtoStateFieldDiffs, State, StateCollections,
     WriterState,
 };
-use crate::internal::trace::{FlatTrace, FueledMergeRes, FuelingMerge, ThinSpineBatch, Trace};
+use crate::internal::trace::{
+    FlatTrace, FueledMergeRes, FuelingMerge, SpineId, ThinSpineBatch, Trace,
+};
 use crate::read::LeasedReaderId;
 use crate::write::WriterId;
 use crate::{Metrics, PersistConfig, ShardId};
@@ -77,9 +80,10 @@ pub struct StateDiff<T> {
     pub(crate) critical_readers: Vec<StateFieldDiff<CriticalReaderId, CriticalReaderState<T>>>,
     pub(crate) writers: Vec<StateFieldDiff<WriterId, WriterState<T>>>,
     pub(crate) since: Vec<StateFieldDiff<(), Antichain<T>>>,
-    pub(crate) hollow_batches: Vec<StateFieldDiff<HollowBatch<T>, ()>>,
-    pub(crate) spine_batches: Vec<StateFieldDiff<(usize, ThinSpineBatch<T>), ()>>,
-    pub(crate) spine_merges: Vec<StateFieldDiff<(usize, FuelingMerge<T>), ()>>,
+    pub(crate) legacy_batches: Vec<StateFieldDiff<HollowBatch<T>, ()>>,
+    pub(crate) hollow_batches: Vec<StateFieldDiff<SpineId, Arc<HollowBatch<T>>>>,
+    pub(crate) spine_batches: Vec<StateFieldDiff<SpineId, ThinSpineBatch<T>>>,
+    pub(crate) spine_merges: Vec<StateFieldDiff<usize, FuelingMerge<T>>>,
 }
 
 impl<T: Timestamp + Codec64> StateDiff<T> {
@@ -103,10 +107,31 @@ impl<T: Timestamp + Codec64> StateDiff<T> {
             critical_readers: Vec::default(),
             writers: Vec::default(),
             since: Vec::default(),
+            legacy_batches: Vec::default(),
             hollow_batches: Vec::default(),
             spine_batches: Vec::default(),
             spine_merges: Vec::default(),
         }
+    }
+
+    fn all_batches(&self) -> impl Iterator<Item = (&HollowBatch<T>, bool)> {
+        self.legacy_batches
+            .iter()
+            .map(|diff| {
+                (
+                    &diff.key,
+                    match diff.val {
+                        Insert(_) => true,
+                        Update(_, _) => panic!("cannot update spine field"),
+                        Delete(_) => false,
+                    },
+                )
+            })
+            .chain(self.hollow_batches.iter().map(|diff| match &diff.val {
+                Insert(batch) => (&*batch, true),
+                Update(_, _) => panic!("cannot update spine field"),
+                Delete(batch) => (&*batch, false),
+            }))
     }
 }
 
@@ -171,22 +196,14 @@ impl<T: Timestamp + Lattice + Codec64> StateDiff<T> {
         );
         diff_field_sorted_iter(from_writers.iter(), to_writers, &mut diffs.writers);
         diff_field_single(from_trace.since(), to_trace.since(), &mut diffs.since);
-        diff_field_spine(from_trace, to_trace, &mut diffs.hollow_batches);
+        diff_field_spine(from_trace, to_trace, &mut diffs.legacy_batches);
         diffs
     }
 
     pub(crate) fn map_blob_inserts<F: for<'a> FnMut(HollowBlobRef<'a, T>)>(&self, mut f: F) {
-        for spine_diff in self.hollow_batches.iter() {
-            match &spine_diff.val {
-                StateFieldValDiff::Insert(()) => {
-                    f(HollowBlobRef::Batch(&spine_diff.key));
-                }
-                StateFieldValDiff::Update((), ()) => {
-                    // spine fields are always inserted/deleted, this
-                    // would mean we encountered a malformed diff.
-                    panic!("cannot update spine field")
-                }
-                StateFieldValDiff::Delete(()) => {} // No-op
+        for (batch, exists) in self.all_batches() {
+            if exists {
+                f(HollowBlobRef::Batch(batch));
             }
         }
         for rollups_diff in self.rollups.iter() {
@@ -200,17 +217,9 @@ impl<T: Timestamp + Lattice + Codec64> StateDiff<T> {
     }
 
     pub(crate) fn map_blob_deletes<F: for<'a> FnMut(HollowBlobRef<'a, T>)>(&self, mut f: F) {
-        for spine_diff in self.hollow_batches.iter() {
-            match &spine_diff.val {
-                StateFieldValDiff::Insert(()) => {} // No-op
-                StateFieldValDiff::Update((), ()) => {
-                    // spine fields are always inserted/deleted, this
-                    // would mean we encountered a malformed diff.
-                    panic!("cannot update spine field")
-                }
-                StateFieldValDiff::Delete(()) => {
-                    f(HollowBlobRef::Batch(&spine_diff.key));
-                }
+        for (batch, exists) in self.all_batches() {
+            if !exists {
+                f(HollowBlobRef::Batch(batch));
             }
         }
         for rollups_diff in self.rollups.iter() {
@@ -344,7 +353,8 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
             critical_readers: diff_critical_readers,
             writers: diff_writers,
             since: diff_since,
-            hollow_batches: diff_spine,
+            legacy_batches: diff_spine,
+            hollow_batches,
             spine_batches,
             spine_merges,
         } = diff;
@@ -386,28 +396,42 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
         apply_diffs_map("critical_readers", diff_critical_readers, critical_readers)?;
         apply_diffs_map("writers", diff_writers, writers)?;
 
-        for x in diff_since {
-            match x.val {
-                Update(from, to) => {
-                    if trace.since() != &from {
-                        return Err(format!(
-                            "since update didn't match: {:?} vs {:?}",
-                            self.collections.trace.since(),
-                            &from
-                        ));
-                    }
-                    trace.downgrade_since(&to);
-                }
-                Insert(_) => return Err("cannot insert since field".to_string()),
-                Delete(_) => return Err("cannot delete since field".to_string()),
-            }
-        }
         if !diff_spine.is_empty() {
             if !spine_batches.is_empty() {
-                let trace = std::mem::take(&mut self.collections.trace);
-                let flat: FlatTrace<T> = trace.into();
+                let mut flat: FlatTrace<T> = (&self.collections.trace).into();
+                apply_diffs_single("since", diff_since, &mut flat.since)?;
+                apply_diffs_map(
+                    "legacy-batches",
+                    diff_spine
+                        .into_iter()
+                        .map(|StateFieldDiff { key, val }| StateFieldDiff {
+                            key: Arc::new(key),
+                            val,
+                        }),
+                    &mut flat.legacy_batches,
+                )?;
+                apply_diffs_map("hollow-batches", hollow_batches, &mut flat.hollow_batches)?;
+                apply_diffs_map("spine-batches", spine_batches, &mut flat.spine_batches)?;
+                apply_diffs_map("legacy-batches", spine_merges, &mut flat.spine_merges)?;
+                *trace = flat.try_into()?;
             } else {
-                apply_diffs_spine(metrics, diff_spine, trace)?;
+                for x in diff_since {
+                    match x.val {
+                        Update(from, to) => {
+                            if trace.since() != &from {
+                                return Err(format!(
+                                    "since update didn't match: {:?} vs {:?}",
+                                    self.collections.trace.since(),
+                                    &from
+                                ));
+                            }
+                            trace.downgrade_since(&to);
+                        }
+                        Insert(_) => return Err("cannot insert since field".to_string()),
+                        Delete(_) => return Err("cannot delete since field".to_string()),
+                    }
+                }
+                apply_legacy_diffs_spine(metrics, diff_spine, trace)?;
                 debug_assert_eq!(trace.validate(), Ok(()), "{:?}", trace);
             }
         }
@@ -585,7 +609,7 @@ where
 
 fn apply_diffs_map<K: Ord, V: PartialEq + Debug>(
     name: &str,
-    diffs: Vec<StateFieldDiff<K, V>>,
+    diffs: impl IntoIterator<Item = StateFieldDiff<K, V>>,
     map: &mut BTreeMap<K, V>,
 ) -> Result<(), String> {
     for diff in diffs {
@@ -648,7 +672,7 @@ fn diff_field_spine<T: Timestamp + Lattice>(
 // This might leave state in an invalid (umm) state when returning an error. The
 // caller ultimately ends up panic'ing on error, but if that changes, we might
 // want to revisit this.
-fn apply_diffs_spine<T: Timestamp + Lattice>(
+fn apply_legacy_diffs_spine<T: Timestamp + Lattice>(
     metrics: &Metrics,
     mut diffs: Vec<StateFieldDiff<HollowBatch<T>, ()>>,
     trace: &mut Trace<T>,
@@ -1287,7 +1311,7 @@ mod tests {
 
         let metrics = Metrics::new(&PersistConfig::new_for_tests(), &MetricsRegistry::new());
         assert_eq!(
-            apply_diffs_spine(&metrics, diffs, &mut state.collections.trace),
+            apply_legacy_diffs_spine(&metrics, diffs, &mut state.collections.trace),
             Ok(())
         );
 
