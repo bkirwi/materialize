@@ -36,11 +36,11 @@ use crate::internal::metrics::Metrics;
 use crate::internal::paths::{PartialBatchKey, PartialRollupKey};
 use crate::internal::state::{
     CriticalReaderState, HandleDebugState, HollowBatch, HollowBatchPart, HollowRollup,
-    IdempotencyToken, LeasedReaderState, OpaqueState, ProtoCriticalReaderState,
+    IdempotencyToken, LeasedReaderState, OpaqueState, ProtoCriticalReaderState, ProtoFuelingMerge,
     ProtoHandleDebugState, ProtoHollowBatch, ProtoHollowBatchPart, ProtoHollowBatchRef,
-    ProtoHollowRollup, ProtoIdHollowBatch, ProtoInlinedDiffs, ProtoLeasedReaderState, ProtoRollup,
-    ProtoSpineBatch, ProtoSpineId, ProtoSpineMerge, ProtoStateDiff, ProtoStateField,
-    ProtoStateFieldDiffType, ProtoStateFieldDiffs, ProtoTrace, ProtoU64Antichain,
+    ProtoHollowRollup, ProtoIdFuelingMerge, ProtoIdHollowBatch, ProtoInlinedDiffs,
+    ProtoLeasedReaderState, ProtoRollup, ProtoSpineBatch, ProtoSpineId, ProtoStateDiff,
+    ProtoStateField, ProtoStateFieldDiffType, ProtoStateFieldDiffs, ProtoTrace, ProtoU64Antichain,
     ProtoU64Description, ProtoVersionedData, ProtoWriterState, State, StateCollections, TypedState,
     WriterState,
 };
@@ -296,6 +296,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoStateDiff> for StateDiff<T> {
             critical_readers,
             writers,
             since,
+            legacy_batches,
             hollow_batches,
             spine_batches,
             spine_merges,
@@ -317,6 +318,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoStateDiff> for StateDiff<T> {
         );
         field_diffs_into_proto(ProtoStateField::Writers, writers, &mut writer);
         field_diffs_into_proto(ProtoStateField::Since, since, &mut writer);
+        field_diffs_into_proto(ProtoStateField::LegacyBatches, legacy_batches, &mut writer);
         field_diffs_into_proto(ProtoStateField::HollowBatches, hollow_batches, &mut writer);
         field_diffs_into_proto(ProtoStateField::SpineBatches, spine_batches, &mut writer);
         field_diffs_into_proto(ProtoStateField::SpineMerges, spine_merges, &mut writer);
@@ -446,7 +448,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoStateDiff> for StateDiff<T> {
                         )?
                     }
                     ProtoStateField::SpineMerges => {
-                        field_diff_into_rust::<ProtoSpineMerge, (), _, _, _, _>(
+                        field_diff_into_rust::<usize, ProtoFuelingMerge, _, _, _, _>(
                             diff,
                             &mut state_diff.spine_merges,
                             |k| k.into_rust(),
@@ -994,12 +996,11 @@ impl<T: Timestamp + Codec64> ProtoMapEntry<SpineId, ThinSpineBatch<T>> for Proto
     }
 }
 
-impl<T: Timestamp + Codec64> ProtoMapEntry<usize, FuelingMerge<T>> for ProtoSpineMerge {
+impl<T: Timestamp + Codec64> ProtoMapEntry<usize, FuelingMerge<T>> for ProtoFuelingMerge {
     fn from_rust<'a>((level, merge): (&'a usize, &'a FuelingMerge<T>)) -> Self {
-        ProtoSpineMerge {
+        ProtoIdFuelingMerge {
             level: level.into_proto(),
-            since: Some(merge.since.into_proto()),
-            remaining_work: merge.remaining_work.into_proto(),
+            merge: Some(merge.into_proto()),
         }
     }
 

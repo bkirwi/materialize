@@ -114,7 +114,7 @@ impl<T: Timestamp + Codec64> StateDiff<T> {
         }
     }
 
-    fn all_batches(&self) -> impl Iterator<Item = (&HollowBatch<T>, bool)> {
+    pub fn all_batches(&self) -> impl Iterator<Item = (&HollowBatch<T>, bool)> {
         self.legacy_batches
             .iter()
             .map(|diff| {
@@ -128,9 +128,9 @@ impl<T: Timestamp + Codec64> StateDiff<T> {
                 )
             })
             .chain(self.hollow_batches.iter().map(|diff| match &diff.val {
-                Insert(batch) => (&*batch, true),
+                Insert(batch) => (&**batch, true),
                 Update(_, _) => panic!("cannot update spine field"),
-                Delete(batch) => (&*batch, false),
+                Delete(batch) => (&**batch, false),
             }))
     }
 }

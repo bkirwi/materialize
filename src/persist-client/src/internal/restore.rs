@@ -33,7 +33,7 @@ pub(crate) async fn restore_blob(
         return Ok(vec![]);
     };
 
-    fn after<A>(diff: StateFieldValDiff<A>) -> Option<A> {
+    fn after<A>(diff: &StateFieldValDiff<A>) -> Option<&A> {
         match diff {
             StateFieldValDiff::Insert(a) => Some(a),
             StateFieldValDiff::Update(_, a) => Some(a),
@@ -50,12 +50,12 @@ pub(crate) async fn restore_blob(
 
     for diff in diffs.0 {
         let diff: StateDiff<u64> = StateDiff::decode(build_version, diff.data);
-        for rollup in diff.rollups {
+        for rollup in &diff.rollups {
             // We never actually reference rollups from before the first live diff.
             if rollup.key < first_live_seqno {
                 continue;
             }
-            let Some(value) = after(rollup.val) else {
+            let Some(value) = after(&rollup.val) else {
                 continue;
             };
             let key = value.key.complete(&shard_id);
@@ -91,9 +91,9 @@ pub(crate) async fn restore_blob(
                 }
             }
         }
-        for batch in diff.hollow_batches {
-            if let Some(_) = after(batch.val) {
-                for part in batch.key.parts {
+        for (batch, exists) in diff.all_batches() {
+            if exists {
+                for part in &batch.parts {
                     let key = part.key.complete(&shard_id);
                     check_restored(&key, blob.restore(&key).await);
                 }
