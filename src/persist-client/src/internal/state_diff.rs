@@ -353,7 +353,7 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
             critical_readers: diff_critical_readers,
             writers: diff_writers,
             since: diff_since,
-            legacy_batches: diff_spine,
+            legacy_batches: diff_legacy_batches,
             hollow_batches,
             spine_batches,
             spine_merges,
@@ -396,45 +396,46 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
         apply_diffs_map("critical_readers", diff_critical_readers, critical_readers)?;
         apply_diffs_map("writers", diff_writers, writers)?;
 
-        if !diff_spine.is_empty() {
-            if !spine_batches.is_empty() {
-                let mut flat: FlatTrace<T> = (&*trace).into();
-                apply_diffs_single("since", diff_since, &mut flat.since)?;
-                apply_diffs_map(
-                    "legacy_batches",
-                    diff_spine
-                        .into_iter()
-                        .map(|StateFieldDiff { key, val }| StateFieldDiff {
-                            key: Arc::new(key),
-                            val,
-                        }),
-                    &mut flat.legacy_batches,
-                )?;
-                apply_diffs_map("hollow_batches", hollow_batches, &mut flat.hollow_batches)?;
-                apply_diffs_map("spine_batches", spine_batches, &mut flat.spine_batches)?;
-                apply_diffs_map("merges", spine_merges, &mut flat.fueling_merges)?;
-                *trace = flat.try_into()?;
-            } else {
-                for x in diff_since {
-                    match x.val {
-                        Update(from, to) => {
-                            if trace.since() != &from {
-                                return Err(format!(
-                                    "since update didn't match: {:?} vs {:?}",
-                                    self.collections.trace.since(),
-                                    &from
-                                ));
-                            }
-                            trace.downgrade_since(&to);
-                        }
-                        Insert(_) => return Err("cannot insert since field".to_string()),
-                        Delete(_) => return Err("cannot delete since field".to_string()),
-                    }
-                }
-                apply_legacy_diffs_spine(metrics, diff_spine, trace)?;
-                debug_assert_eq!(trace.validate(), Ok(()), "{:?}", trace);
-            }
-        }
+        let mut flat: FlatTrace<T> = (&*trace).into();
+        apply_diffs_single("since", diff_since, &mut flat.since)?;
+        apply_diffs_map(
+            "legacy_batches",
+            diff_legacy_batches
+                .into_iter()
+                .map(|StateFieldDiff { key, val }| StateFieldDiff {
+                    key: Arc::new(key),
+                    val,
+                }),
+            &mut flat.legacy_batches,
+        )?;
+        apply_diffs_map("hollow_batches", hollow_batches, &mut flat.hollow_batches)?;
+        apply_diffs_map("spine_batches", spine_batches, &mut flat.spine_batches)?;
+        apply_diffs_map("merges", spine_merges, &mut flat.fueling_merges)?;
+        *trace = flat.try_into()?;
+        // if !diff_legacy_batches.is_empty() {
+        //     if !spine_batches.is_empty() {
+        //
+        //     } else {
+        //         for x in diff_since {
+        //             match x.val {
+        //                 Update(from, to) => {
+        //                     if trace.since() != &from {
+        //                         return Err(format!(
+        //                             "since update didn't match: {:?} vs {:?}",
+        //                             self.collections.trace.since(),
+        //                             &from
+        //                         ));
+        //                     }
+        //                     trace.downgrade_since(&to);
+        //                 }
+        //                 Insert(_) => return Err("cannot insert since field".to_string()),
+        //                 Delete(_) => return Err("cannot delete since field".to_string()),
+        //             }
+        //         }
+        //         apply_legacy_diffs_spine(metrics, diff_legacy_batches, trace)?;
+        //         debug_assert_eq!(trace.validate(), Ok(()), "{:?}", trace);
+        //     }
+        // }
 
         // There's various sanity checks that this method could run (e.g. since,
         // upper, seqno_since, etc don't regress or that diff.latest_rollup ==

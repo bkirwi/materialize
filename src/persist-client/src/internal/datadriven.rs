@@ -181,6 +181,7 @@ mod tests {
         use crate::internal::machine::datadriven as machine_dd;
 
         ::datadriven::walk_async("tests/machine", |mut f| {
+            dbg!(&f);
             let initial_state_fut = machine_dd::MachineState::new();
             async move {
                 let state = Arc::new(Mutex::new(initial_state_fut.await));
