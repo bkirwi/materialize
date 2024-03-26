@@ -7,7 +7,6 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -16,7 +15,6 @@ use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use differential_dataflow::lattice::Lattice;
-use differential_dataflow::trace::implementations::spine_fueled::Spine;
 use differential_dataflow::trace::Description;
 use mz_ore::halt;
 use mz_persist::location::{SeqNo, VersionedData};

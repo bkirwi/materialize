@@ -49,7 +49,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -314,22 +313,22 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
                 merging,
             };
 
-            // if !legacy_batches.is_empty() {
-            //     return Err(format!(
-            //         "{} legacy batches left after reconstructing spine: {spine:#?}",
-            //         legacy_batches.len()
-            //     ))?;
-            // }
-            // assert!(
-            //     hollow_batches.is_empty(),
-            //     "{} batches left after reconstructing spine: {spine:#?}",
-            //     hollow_batches.len()
-            // );
-            // assert!(
-            //     spine_merges.is_empty(),
-            //     "{} merges left after reconstructing spine: {spine:#?}",
-            //     spine_merges.len()
-            // );
+            if !legacy_batches.is_empty() {
+                return Err(format!(
+                    "{} legacy batches left after reconstructing spine: {spine:#?}",
+                    legacy_batches.len()
+                ))?;
+            }
+            assert!(
+                hollow_batches.is_empty(),
+                "{} batches left after reconstructing spine: {spine:#?}",
+                hollow_batches.len()
+            );
+            assert!(
+                spine_merges.is_empty(),
+                "{} merges left after reconstructing spine: {spine:#?}",
+                spine_merges.len()
+            );
 
             spine.validate()?;
 
@@ -338,7 +337,7 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
             let mut ret = Trace::default();
             ret.downgrade_since(&since);
             let mut batches_pushed = 0;
-            for batch in legacy_batches {
+            while let Some(batch) = legacy_batches.pop() {
                 if PartialOrder::less_than(ret.since(), batch.desc.since()) {
                     return Err(format!(
                         "invalid ProtoTrace: the spine's since {:?} was less than a batch's since {:?}",
