@@ -430,6 +430,7 @@ impl<T: Timestamp + Lattice> Trace<T> {
 
     #[must_use]
     pub fn push_batch(&mut self, batch: HollowBatch<T>) -> Vec<FueledMergeReq<T>> {
+        self.ensure_roundtrip_structure();
         let mut merge_reqs = Vec::new();
         self.spine.insert(
             batch,
@@ -445,6 +446,16 @@ impl<T: Timestamp + Lattice> Trace<T> {
         // It's a waste to do all of these (we'll throw away the results), so we
         // filter out any that are entirely covered by some other request.
         Self::remove_redundant_merge_reqs(merge_reqs)
+    }
+
+    fn ensure_roundtrip_structure(&mut self) {
+        if self.roundtrip_structure.is_none() {
+            let mut legacy_batches = BTreeMap::new();
+            self.map_batches(|b| {
+                legacy_batches.insert(Arc::new(b.clone()), ());
+            });
+            self.roundtrip_structure = Some(legacy_batches);
+        }
     }
 
     /// The same as [Self::push_batch] but without the `FueledMergeReq`s, which
