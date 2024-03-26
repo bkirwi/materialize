@@ -83,7 +83,7 @@ pub struct StateDiff<T> {
     pub(crate) legacy_batches: Vec<StateFieldDiff<HollowBatch<T>, ()>>,
     pub(crate) hollow_batches: Vec<StateFieldDiff<SpineId, Arc<HollowBatch<T>>>>,
     pub(crate) spine_batches: Vec<StateFieldDiff<SpineId, ThinSpineBatch<T>>>,
-    pub(crate) spine_merges: Vec<StateFieldDiff<usize, FuelingMerge<T>>>,
+    pub(crate) fueling_merges: Vec<StateFieldDiff<usize, FuelingMerge<T>>>,
 }
 
 impl<T: Timestamp + Codec64> StateDiff<T> {
@@ -110,28 +110,31 @@ impl<T: Timestamp + Codec64> StateDiff<T> {
             legacy_batches: Vec::default(),
             hollow_batches: Vec::default(),
             spine_batches: Vec::default(),
-            spine_merges: Vec::default(),
+            fueling_merges: Vec::default(),
         }
     }
 
     pub fn all_batches(&self) -> impl Iterator<Item = (&HollowBatch<T>, bool)> {
-        self.legacy_batches
-            .iter()
-            .map(|diff| {
-                (
-                    &diff.key,
-                    match diff.val {
-                        Insert(_) => true,
-                        Update(_, _) => panic!("cannot update spine field"),
-                        Delete(_) => false,
-                    },
-                )
-            })
-            .chain(self.hollow_batches.iter().map(|diff| match &diff.val {
-                Insert(batch) => (&**batch, true),
-                Update(_, _) => panic!("cannot update spine field"),
-                Delete(batch) => (&**batch, false),
-            }))
+        let legacy = self.legacy_batches.iter().map(|diff| {
+            (
+                &diff.key,
+                match diff.val {
+                    Insert(_) => true,
+                    Update(_, _) => {
+                        panic!("cannot update spine field")
+                    }
+                    Delete(_) => false,
+                },
+            )
+        });
+        let modern = self.hollow_batches.iter().flat_map(|diff| match &diff.val {
+            Insert(batch) => Some((&**batch, true)).into_iter().chain(None.into_iter()),
+            Update(before, after) => Some((&**before, false))
+                .into_iter()
+                .chain(Some((&**after, true)).into_iter()),
+            Delete(batch) => Some((&**batch, false)).into_iter().chain(None.into_iter()),
+        });
+        legacy.chain(modern)
     }
 }
 
@@ -196,7 +199,29 @@ impl<T: Timestamp + Lattice + Codec64> StateDiff<T> {
         );
         diff_field_sorted_iter(from_writers.iter(), to_writers, &mut diffs.writers);
         diff_field_single(from_trace.since(), to_trace.since(), &mut diffs.since);
-        diff_field_spine(from_trace, to_trace, &mut diffs.legacy_batches);
+        // diff_field_spine(from_trace, to_trace, &mut diffs.legacy_batches);
+        let from_flat: FlatTrace<_> = from_trace.into();
+        let to_flat: FlatTrace<_> = to_trace.into();
+        diff_field_sorted_iter(
+            from_flat.legacy_batches.iter().map(|(k, v)| (&**k, v)),
+            to_flat.legacy_batches.iter().map(|(k, v)| (&**k, v)),
+            &mut diffs.legacy_batches,
+        );
+        diff_field_sorted_iter(
+            from_flat.hollow_batches.iter(),
+            to_flat.hollow_batches.iter(),
+            &mut diffs.hollow_batches,
+        );
+        diff_field_sorted_iter(
+            from_flat.spine_batches.iter(),
+            to_flat.spine_batches.iter(),
+            &mut diffs.spine_batches,
+        );
+        diff_field_sorted_iter(
+            from_flat.fueling_merges.iter(),
+            to_flat.fueling_merges.iter(),
+            &mut diffs.fueling_merges,
+        );
         diffs
     }
 
@@ -260,7 +285,7 @@ impl<T: Timestamp + Lattice + Codec64> StateDiff<T> {
         if &roundtrip_state != to_state {
             // The weird spacing in this format string is so they all line up
             // when printed out.
-            return Err(format!("state didn't roundtrip\n  from_state {:?}\n  to_state   {:?}\n  rt_state   {:?}\n  diff       {:?}\n", from_state, to_state, roundtrip_state, diff));
+            return Err(format!("state didn't roundtrip\n  from_state {:#?}\n  to_state   {:#?}\n  rt_state   {:#?}\n  diff       {:#?}\n", from_state, to_state, roundtrip_state, diff));
         }
 
         let encoded_diff = diff.into_proto().encode_to_vec();
@@ -356,7 +381,7 @@ impl<T: Timestamp + Lattice + Codec64> State<T> {
             legacy_batches: diff_legacy_batches,
             hollow_batches,
             spine_batches,
-            spine_merges,
+            fueling_merges: spine_merges,
         } = diff;
         if self.seqno == diff_seqno_to {
             return Ok(());

@@ -300,7 +300,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoStateDiff> for StateDiff<T> {
             legacy_batches,
             hollow_batches,
             spine_batches,
-            spine_merges,
+            fueling_merges: spine_merges,
         } = self;
 
         let proto = ProtoStateFieldDiffs::default();
@@ -459,7 +459,7 @@ impl<T: Timestamp + Codec64> RustType<ProtoStateDiff> for StateDiff<T> {
                     ProtoStateField::SpineMerges => {
                         field_diff_into_rust::<u64, ProtoFuelingMerge, _, _, _, _>(
                             diff,
-                            &mut state_diff.spine_merges,
+                            &mut state_diff.fueling_merges,
                             |k| k.into_rust(),
                             |v| v.into_rust(),
                         )?

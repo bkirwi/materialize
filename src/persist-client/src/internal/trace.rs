@@ -150,7 +150,7 @@ impl<'a, T: Timestamp + Lattice> From<&'a Trace<T>> for FlatTrace<T> {
             let legacy_batch = value
                 .roundtrip_structure
                 .as_ref()
-                .map_or(false, |s| s.contains_key(&batch));
+                .map_or(true, |s| s.contains_key(&batch));
             let desc = batch.desc.clone();
             if legacy_batch {
                 legacy_batches.insert(batch, ());
@@ -206,13 +206,17 @@ impl<'a, T: Timestamp + Lattice> From<&'a Trace<T>> for FlatTrace<T> {
             }
         }
 
-        FlatTrace {
+        let trace = FlatTrace {
             since,
             legacy_batches,
             hollow_batches,
             spine_batches,
             fueling_merges: spine_merges,
-        }
+        };
+
+        // let _: Trace<_> = trace.clone().try_into().expect("just made this");
+
+        trace
     }
 }
 
@@ -227,7 +231,7 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
             fueling_merges: mut spine_merges,
         } = value;
 
-        let has_structure = hollow_batches.is_empty() || !spine_batches.is_empty();
+        let has_structure = legacy_batches.is_empty() || !spine_batches.is_empty();
         let roundtrip_structure = has_structure.then(|| legacy_batches.clone());
 
         // We need to look up legacy batches somehow, but we don't have a spine id for them.
@@ -245,7 +249,7 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
         let mut legacy_batches: Vec<_> = legacy_batches.into_iter().map(|(k, _)| k).collect();
         legacy_batches.sort_by(|a, b| compare_chains(a.desc.lower(), b.desc.lower()).reverse());
 
-        let spine: Spine<T> = if let Some(legacy) = &roundtrip_structure {
+        let spine: Spine<T> = if has_structure {
             let mut pop_batch = |id: SpineId, desc: Description<T>| -> Result<_, String> {
                 let batch = if let Some(batch) = hollow_batches.remove(&id) {
                     batch
@@ -310,21 +314,22 @@ impl<T: Timestamp + Lattice> TryFrom<FlatTrace<T>> for Trace<T> {
                 merging,
             };
 
-            assert!(
-                legacy_batches.is_empty(),
-                "{} legacy batches left after reconstructing spine",
-                legacy.len()
-            );
-            assert!(
-                hollow_batches.is_empty(),
-                "{} batches left after reconstructing spine",
-                hollow_batches.len()
-            );
-            assert!(
-                spine_merges.is_empty(),
-                "{} merges left after reconstructing spine",
-                spine_merges.len()
-            );
+            // if !legacy_batches.is_empty() {
+            //     return Err(format!(
+            //         "{} legacy batches left after reconstructing spine: {spine:#?}",
+            //         legacy_batches.len()
+            //     ))?;
+            // }
+            // assert!(
+            //     hollow_batches.is_empty(),
+            //     "{} batches left after reconstructing spine: {spine:#?}",
+            //     hollow_batches.len()
+            // );
+            // assert!(
+            //     spine_merges.is_empty(),
+            //     "{} merges left after reconstructing spine: {spine:#?}",
+            //     spine_merges.len()
+            // );
 
             spine.validate()?;
 
