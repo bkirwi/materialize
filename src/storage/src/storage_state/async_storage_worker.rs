@@ -23,7 +23,7 @@ use mz_persist_client::read::ListenEvent;
 use mz_persist_client::Diagnostics;
 use mz_persist_types::codec_impls::UnitSchema;
 use mz_persist_types::Codec64;
-use mz_repr::{Diff, GlobalId, Row};
+use mz_repr::{Diff, GlobalId, Row, TimestampManipulation};
 use mz_service::local::Activatable;
 use mz_storage_types::controller::CollectionMetadata;
 use mz_storage_types::sources::{
@@ -142,9 +142,10 @@ where
                         )
                         .await
                         .expect("shard unavailable");
+                    let since = read_handle.since().clone();
 
                     let sub = read_handle
-                        .subscribe(as_of.clone())
+                        .subscribe(since)
                         .await
                         .expect("always valid to read at since");
 
@@ -185,7 +186,7 @@ where
     source_resume_uppers
 }
 
-impl<T: Timestamp + Lattice + Codec64 + Display> AsyncStorageWorker<T> {
+impl<T: Codec64 + Display + TimestampManipulation> AsyncStorageWorker<T> {
     /// Creates a new [`AsyncStorageWorker`].
     ///
     /// IMPORTANT: The passed in `activatable` is activated when new responses
@@ -223,15 +224,13 @@ impl<T: Timestamp + Lattice + Codec64 + Display> AsyncStorageWorker<T> {
                         // arbitrarily hold back collections to perform historical queries and when
                         // the storage command protocol is updated such that these calculations are
                         // performed by the controller and not here.
-                        let mut as_of = Antichain::new();
                         let mut resume_uppers = BTreeMap::new();
-                        let mut seen_remap_shard = None;
 
                         for (id, export) in ingestion_description.source_exports.iter() {
                             // Explicit destructuring to force a compile error when the metadata change
                             let CollectionMetadata {
                                 persist_location,
-                                remap_shard,
+                                remap_shard: _,
                                 data_shard,
                                 // The status shard only contains non-definite status updates
                                 status_shard: _,
@@ -263,64 +262,19 @@ impl<T: Timestamp + Lattice + Codec64 + Display> AsyncStorageWorker<T> {
                             let upper = write_handle.fetch_recent_upper().await;
                             resume_uppers.insert(*id, upper.clone());
                             write_handle.expire().await;
+                        }
 
-                            // TODO(petrosagg): The as_of of the ingestion should normally be based
-                            // on the since frontiers of its outputs. Even though the storage
-                            // controller makes sure to make downgrade decisions in an organized
-                            // and ordered fashion, it then proceeds to persist them in an
-                            // asynchronous and disorganized fashion to persist. The net effect is
-                            // that upon restart, or upon observing the persist state like this
-                            // function, one can see non-sensical results like the since of A be in
-                            // advance of B even when B depends on A! This can happen because the
-                            // downgrade of B gets reordered and lost. Here is our best attempt at
-                            // playing detective of what the controller meant to do by blindly
-                            // assuming that the since of the remap shard is a suitable since
-                            // frontier without consulting the since frontier of the outputs. One
-                            // day we will enforce order to chaos and this comment will be deleted.
-                            if let Some(remap_shard) = remap_shard {
-                                match seen_remap_shard.as_ref() {
-                                    None => {
-                                        let read_handle = client
-                                            .open_leased_reader::<SourceData, (), T, Diff>(
-                                                *remap_shard,
-                                                Arc::new(
-                                                    ingestion_description
-                                                        .desc
-                                                        .connection
-                                                        .timestamp_desc(),
-                                                ),
-                                                Arc::new(UnitSchema),
-                                                Diagnostics {
-                                                    shard_name: ingestion_description
-                                                        .remap_collection_id
-                                                        .to_string(),
-                                                    handle_purpose: format!(
-                                                        "resumption data for {}",
-                                                        id
-                                                    ),
-                                                },
-                                                false,
-                                            )
-                                            .await
-                                            .unwrap();
-                                        as_of.clone_from(read_handle.since());
-                                        mz_ore::task::spawn(
-                                            move || "deferred_expire",
-                                            async move {
-                                                tokio::time::sleep(std::time::Duration::from_secs(
-                                                    300,
-                                                ))
-                                                .await;
-                                                read_handle.expire().await;
-                                            },
-                                        );
-                                        seen_remap_shard = Some(remap_shard.clone());
-                                    }
-                                    Some(shard) => assert_eq!(
-                                        shard, remap_shard,
-                                        "ingestion with multiple remap shards"
-                                    ),
-                                }
+                        // Choose an as-of that's earlier than any of our output uppers, so we can
+                        // resume appending to that output exactly where we left off.
+                        let mut as_of = Antichain::new();
+                        for resume_upper in resume_uppers.values() {
+                            // This duplicates some logic in the storage controller. Perhaps, in a
+                            // future where the controller logic is more distributed, we can simply
+                            // use the implied capability of the reclock collection and remove our
+                            // explicit timestamp-manipulation bound.
+                            if let Some(upper) = resume_upper.as_option() {
+                                let resume_from: T = upper.step_back().unwrap_or(T::minimum());
+                                as_of.insert(resume_from);
                             }
                         }
 

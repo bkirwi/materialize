@@ -192,10 +192,7 @@ impl<'w, A: Allocate> Worker<'w, A> {
         // also how the command channel works currently. We can wrap it inside a
         // struct that holds both a channel and an `Activatable`, but I don't
         // think that would help too much.
-        let async_worker = async_storage_worker::AsyncStorageWorker::new(
-            thread::current(),
-            Arc::clone(&persist_clients),
-        );
+        let async_worker = AsyncStorageWorker::new(thread::current(), Arc::clone(&persist_clients));
         let async_worker = Rc::new(RefCell::new(async_worker));
         let cluster_memory_limit = instance_context.cluster_memory_limit;
 
