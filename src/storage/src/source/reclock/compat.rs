@@ -102,23 +102,11 @@ where
             .context("error opening persist shard")?;
 
         let upper = write_handle.upper();
-        // We want a leased reader because elsewhere in the code the `as_of`
-        // time may also be determined by another `ReadHandle`, and the pair of
-        // them offer the invariant that we need (that the `as_of` if <= this
-        // `since`). Using a `SinceHandle` here does not offer the same
-        // invariant when paired with a `ReadHandle`.
-        let since = read_handle.since();
+        let since = read_handle.since().clone();
 
         // Allow manually simulating the scenario where the since of the remap
         // shard has advanced too far.
         fail_point!("invalid_remap_as_of");
-        assert!(
-            PartialOrder::less_equal(since, &as_of),
-            "invalid as_of: as_of({as_of:?}) < since({since:?}), \
-            source {id}, \
-            remap_shard: {:?}",
-            metadata.remap_shard
-        );
 
         assert!(
             as_of.elements() == [IntoTime::minimum()] || PartialOrder::less_than(&as_of, upper),
@@ -135,13 +123,13 @@ where
         use futures::stream;
         let events = stream::once(async move {
             let updates = read_handle
-                .snapshot_and_fetch(as_of.clone())
+                .snapshot_and_fetch(since.clone())
                 .await
                 .expect("since <= as_of asserted");
             let snapshot = stream::once(std::future::ready(ListenEvent::Updates(updates)));
 
             let listener = read_handle
-                .listen(as_of.clone())
+                .listen(since)
                 .await
                 .expect("since <= as_of asserted");
 
@@ -154,6 +142,14 @@ where
             snapshot.chain(listen_stream)
         })
         .flatten()
+        .map(move |mut event| {
+            if let ListenEvent::Updates(updates) = &mut event {
+                for (_, t, _) in updates {
+                    t.advance_by(as_of.borrow())
+                }
+            }
+            event
+        })
         .boxed_local();
 
         Ok(Self {
