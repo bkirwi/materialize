@@ -33,7 +33,6 @@ use mz_storage_types::sources::{
     SourceConnection, SourceData, SourceEnvelope, SourceTimestamp,
 };
 use timely::order::PartialOrder;
-use timely::progress::frontier::AntichainRef;
 use timely::progress::{Antichain, Timestamp};
 use tokio::sync::mpsc;
 
@@ -274,22 +273,17 @@ impl<T: Timestamp + Lattice + Codec64 + Display + TimestampManipulation> AsyncSt
                                 .await
                                 .expect("data shard");
 
-                            let export_as_of =
-                                if upper.borrow() == AntichainRef::new(&[T::minimum()]) {
-                                    // This is a brand-new export! Normally we need to ensure
-                                    // that reclocking info is available at the upper, so that the
-                                    // data we write out is reclocked precisely... but we generally
-                                    // can't read our reclocking collection at the beginning of time.
-                                    // Instead, we only require that our reclocking data is correct
-                                    // as-of the initial since of our new export. We assume that the
-                                    // controller has advanced its handle to the initial since, and
-                                    // that the remap collection is readable at that time.
-                                    read_handle.since()
-                                } else {
-                                    upper
-                                };
+                            let export_as_of = {
+                                let mut frontier: Antichain<_> = upper
+                                    .elements()
+                                    .iter()
+                                    .map(|t| t.step_back().unwrap_or(t.clone()))
+                                    .collect();
+                                frontier.join_assign(read_handle.since());
+                                frontier
+                            };
 
-                            as_of.meet_assign(export_as_of);
+                            as_of.meet_assign(&export_as_of);
 
                             resume_uppers.insert(*id, upper.clone());
                             write_handle.expire().await;
