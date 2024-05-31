@@ -121,7 +121,7 @@ where
         );
 
         assert!(
-            as_of.elements() == [IntoTime::minimum()] || PartialOrder::less_than(&as_of, upper),
+            as_of.elements() == [IntoTime::minimum()] || PartialOrder::less_equal(&as_of, upper),
             "invalid as_of: upper({upper:?}) <= as_of({as_of:?})",
         );
 
