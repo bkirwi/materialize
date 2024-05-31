@@ -20,11 +20,12 @@ use std::sync::Arc;
 use differential_dataflow::lattice::Lattice;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::read::ListenEvent;
-use mz_persist_client::Diagnostics;
+use mz_persist_client::{Diagnostics, PersistClient};
 use mz_persist_types::codec_impls::UnitSchema;
 use mz_persist_types::Codec64;
-use mz_repr::{Diff, GlobalId, Row};
+use mz_repr::{Diff, GlobalId, Row, TimestampManipulation};
 use mz_service::local::Activatable;
+use mz_storage_client::controller::PersistEpoch;
 use mz_storage_types::controller::CollectionMetadata;
 use mz_storage_types::sources::{
     GenericSourceConnection, IngestionDescription, KafkaSourceConnection,
@@ -32,6 +33,7 @@ use mz_storage_types::sources::{
     SourceConnection, SourceData, SourceEnvelope, SourceTimestamp,
 };
 use timely::order::PartialOrder;
+use timely::progress::frontier::AntichainRef;
 use timely::progress::{Antichain, Timestamp};
 use tokio::sync::mpsc;
 
@@ -185,7 +187,7 @@ where
     source_resume_uppers
 }
 
-impl<T: Timestamp + Lattice + Codec64 + Display> AsyncStorageWorker<T> {
+impl<T: Timestamp + Lattice + Codec64 + Display + TimestampManipulation> AsyncStorageWorker<T> {
     /// Creates a new [`AsyncStorageWorker`].
     ///
     /// IMPORTANT: The passed in `activatable` is activated when new responses
@@ -223,15 +225,15 @@ impl<T: Timestamp + Lattice + Codec64 + Display> AsyncStorageWorker<T> {
                         // arbitrarily hold back collections to perform historical queries and when
                         // the storage command protocol is updated such that these calculations are
                         // performed by the controller and not here.
-                        let mut as_of = Antichain::new();
                         let mut resume_uppers = BTreeMap::new();
-                        let mut seen_remap_shard = None;
+
+                        let mut as_of = Antichain::new();
 
                         for (id, export) in ingestion_description.source_exports.iter() {
                             // Explicit destructuring to force a compile error when the metadata change
                             let CollectionMetadata {
                                 persist_location,
-                                remap_shard,
+                                remap_shard: _,
                                 data_shard,
                                 // The status shard only contains non-definite status updates
                                 status_shard: _,
@@ -247,81 +249,50 @@ impl<T: Timestamp + Lattice + Codec64 + Display> AsyncStorageWorker<T> {
                                 .open(persist_location.clone())
                                 .await
                                 .expect("error creating persist client");
+                            let diagnostics = Diagnostics {
+                                shard_name: id.to_string(),
+                                handle_purpose: format!("resumption data {}", id),
+                            };
 
                             let mut write_handle = client
                                 .open_writer::<SourceData, (), T, Diff>(
                                     *data_shard,
                                     Arc::new(relation_desc.clone()),
                                     Arc::new(UnitSchema),
-                                    Diagnostics {
-                                        shard_name: id.to_string(),
-                                        handle_purpose: format!("resumption data {}", id),
-                                    },
+                                    diagnostics.clone(),
                                 )
                                 .await
                                 .unwrap();
                             let upper = write_handle.fetch_recent_upper().await;
+
+                            let read_handle = client
+                                .open_critical_since::<SourceData, (), T, Diff, PersistEpoch>(
+                                    *data_shard,
+                                    PersistClient::CONTROLLER_CRITICAL_SINCE,
+                                    diagnostics,
+                                )
+                                .await
+                                .expect("data shard");
+
+                            let export_as_of =
+                                if upper.borrow() == AntichainRef::new(&[T::minimum()]) {
+                                    // This is a brand-new export! Normally we need to ensure
+                                    // that reclocking info is available at the upper, so that the
+                                    // data we write out is reclocked precisely... but we generally
+                                    // can't read our reclocking collection at the beginning of time.
+                                    // Instead, we only require that our reclocking data is correct
+                                    // as-of the initial since of our new export. We assume that the
+                                    // controller has advanced its handle to the initial since, and
+                                    // that the remap collection is readable at that time.
+                                    read_handle.since()
+                                } else {
+                                    upper
+                                };
+
+                            as_of.meet_assign(export_as_of);
+
                             resume_uppers.insert(*id, upper.clone());
                             write_handle.expire().await;
-
-                            // TODO(petrosagg): The as_of of the ingestion should normally be based
-                            // on the since frontiers of its outputs. Even though the storage
-                            // controller makes sure to make downgrade decisions in an organized
-                            // and ordered fashion, it then proceeds to persist them in an
-                            // asynchronous and disorganized fashion to persist. The net effect is
-                            // that upon restart, or upon observing the persist state like this
-                            // function, one can see non-sensical results like the since of A be in
-                            // advance of B even when B depends on A! This can happen because the
-                            // downgrade of B gets reordered and lost. Here is our best attempt at
-                            // playing detective of what the controller meant to do by blindly
-                            // assuming that the since of the remap shard is a suitable since
-                            // frontier without consulting the since frontier of the outputs. One
-                            // day we will enforce order to chaos and this comment will be deleted.
-                            if let Some(remap_shard) = remap_shard {
-                                match seen_remap_shard.as_ref() {
-                                    None => {
-                                        let read_handle = client
-                                            .open_leased_reader::<SourceData, (), T, Diff>(
-                                                *remap_shard,
-                                                Arc::new(
-                                                    ingestion_description
-                                                        .desc
-                                                        .connection
-                                                        .timestamp_desc(),
-                                                ),
-                                                Arc::new(UnitSchema),
-                                                Diagnostics {
-                                                    shard_name: ingestion_description
-                                                        .remap_collection_id
-                                                        .to_string(),
-                                                    handle_purpose: format!(
-                                                        "resumption data for {}",
-                                                        id
-                                                    ),
-                                                },
-                                                false,
-                                            )
-                                            .await
-                                            .unwrap();
-                                        as_of.clone_from(read_handle.since());
-                                        mz_ore::task::spawn(
-                                            move || "deferred_expire",
-                                            async move {
-                                                tokio::time::sleep(std::time::Duration::from_secs(
-                                                    300,
-                                                ))
-                                                .await;
-                                                read_handle.expire().await;
-                                            },
-                                        );
-                                        seen_remap_shard = Some(remap_shard.clone());
-                                    }
-                                    Some(shard) => assert_eq!(
-                                        shard, remap_shard,
-                                        "ingestion with multiple remap shards"
-                                    ),
-                                }
-                            }
                         }
 
                         /// Convenience function to convert `BTreeMap<GlobalId, Antichain<C>>` to
