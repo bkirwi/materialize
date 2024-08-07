@@ -24,7 +24,7 @@ use mz_persist::location::{Blob, CaSResult, Consensus, ExternalError, SeqNo, Ver
 use mz_persist::metrics::ColumnarMetrics;
 use mz_persist::workload::{self, DataGenerator};
 use mz_persist_client::internals_bench::trace_push_batch_one_iter;
-use mz_persist_client::ShardId;
+use mz_persist_client::{internals_bench, ShardId};
 use mz_persist_types::parquet::EncodingConfig;
 use timely::progress::Antichain;
 use tokio::runtime::Runtime;
@@ -212,6 +212,26 @@ pub fn bench_encode_batch(name: &str, throughput: bool, c: &mut Criterion, data:
             // Intentionally alloc a new buf each iter.
             let mut buf = Vec::new();
             trace.encode(&mut buf, &metrics, &config);
+        })
+    });
+}
+
+pub fn bench_consolidate(
+    throughput: bool,
+    c: &mut Criterion,
+    runtime: &Runtime,
+    data: &DataGenerator,
+) {
+    let mut g = c.benchmark_group("consolidate");
+    if throughput {
+        g.throughput(Throughput::Bytes(data.goodput_bytes()));
+    }
+
+    g.bench_function(BenchmarkId::new("trace", data.goodput_pretty()), |b| {
+        b.iter(|| {
+            runtime
+                .block_on(internals_bench::consolidate(data))
+                .unwrap();
         })
     });
 }

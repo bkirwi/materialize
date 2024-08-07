@@ -12,14 +12,24 @@
 #![allow(missing_docs)]
 
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Instant;
 
+use crate::cfg::PersistConfig;
+use crate::fetch::FetchBatchFilter;
 use differential_dataflow::trace::Description;
+use mz_ore::metrics::MetricsRegistry;
+use mz_persist::indexed::encoding::BlobTraceUpdates;
+use mz_persist::mem::{MemBlob, MemBlobConfig};
+use mz_persist::workload::DataGenerator;
+use mz_persist_types::ShardId;
 use timely::progress::Antichain;
 use tracing::info;
 
 use crate::internal::state::HollowBatch;
 use crate::internal::trace::Trace;
+use crate::iter::{ConsolidationPart, Consolidator};
+use crate::metrics::Metrics;
 
 pub fn trace_push_batch_one_iter(num_batches: usize) {
     let mut trace = Trace::<usize>::default();
@@ -49,4 +59,35 @@ pub fn trace_push_batch_one_iter(num_batches: usize) {
         ));
     }
     black_box(trace);
+}
+
+pub async fn consolidate(data: &DataGenerator) -> anyhow::Result<()> {
+    let shard_id = ShardId::new();
+    let blob = MemBlob::open(MemBlobConfig::new(false));
+    let metrics = Metrics::new(&PersistConfig::new_for_tests(), &MetricsRegistry::new());
+    let read_metrics = metrics.read.compaction.clone();
+    let shard_metrics = metrics.shards.shard(&shard_id, "benchmarking");
+    let mut consolidator: Consolidator<u64, i64> = Consolidator::new(
+        "bench".to_string(),
+        ShardId::new(),
+        Arc::new(blob),
+        Arc::new(metrics),
+        shard_metrics,
+        read_metrics,
+        FetchBatchFilter::Snapshot {
+            as_of: Antichain::from_elem(0u64),
+        },
+        0,
+        false,
+    );
+    for batch in data.batches() {
+        let part = ConsolidationPart::from_updates(BlobTraceUpdates::Row(batch), true);
+        consolidator.push_run([(part, 100)].into());
+    }
+
+    while let Some(out) = consolidator.next_chunk(10000).await? {
+        black_box(out);
+    }
+
+    Ok(())
 }

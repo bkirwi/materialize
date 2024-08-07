@@ -117,7 +117,7 @@ impl<T: Codec64 + Timestamp + Lattice> FetchData<T> {
 }
 
 #[derive(Debug)]
-enum ConsolidationPart<T, D> {
+pub(crate) enum ConsolidationPart<T, D> {
     Queued {
         data: FetchData<T>,
     },
@@ -133,7 +133,7 @@ enum ConsolidationPart<T, D> {
 }
 
 #[derive(Debug)]
-struct Columnar<T, D> {
+pub(crate) struct Columnar<T, D> {
     updates: BlobTraceUpdates,
     _phantom: PhantomData<fn() -> (T, D)>,
 }
@@ -190,8 +190,13 @@ impl<T: Timestamp + Codec64 + Lattice, D: Codec64> ConsolidationPart<T, D> {
         metrics: &ColumnarMetrics,
     ) -> Self {
         let reconsolidate = part.maybe_unconsolidated() || force_reconsolidation;
+
+        Self::from_updates(part.normalize(metrics), reconsolidate)
+    }
+
+    pub(crate) fn from_updates(updates: BlobTraceUpdates, reconsolidate: bool) -> Self {
         let updates: Columnar<T, D> = Columnar {
-            updates: part.normalize(metrics),
+            updates,
             _phantom: Default::default(),
         };
         let updates = if reconsolidate {
@@ -358,7 +363,7 @@ where
         self.push_run(run);
     }
 
-    fn push_run(&mut self, run: VecDeque<(ConsolidationPart<T, D>, usize)>) {
+    pub(crate) fn push_run(&mut self, run: VecDeque<(ConsolidationPart<T, D>, usize)>) {
         // Normally unconsolidated parts are in their own run, but we can end up with unconsolidated
         // runs if we change our sort order or have bugs, for example. Defend against this by
         // splitting up a run if it contains possibly-unconsolidated parts.
