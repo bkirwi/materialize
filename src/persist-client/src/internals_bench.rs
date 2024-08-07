@@ -85,8 +85,10 @@ pub async fn consolidate(data: &DataGenerator) -> anyhow::Result<()> {
         consolidator.push_run([(part, 100)].into());
     }
 
-    while let Some(out) = consolidator.next_chunk(10000).await? {
-        black_box(out);
+    while let Some(chunk) = consolidator.next().await? {
+        for out in chunk {
+            black_box(out);
+        }
     }
 
     Ok(())
