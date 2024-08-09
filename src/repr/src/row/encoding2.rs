@@ -782,12 +782,7 @@ impl DatumColumnEncoder {
                     .map(|(tag, encoder)| {
                         // TODO(parkmycar): Record these stats.
                         let (array, _field_stats) = encoder.finish();
-                        let field = Field::new(
-                            tag.to_string(),
-                            array.data_type().clone(),
-                            array.is_nullable(),
-                        );
-
+                        let field = Field::new(tag.to_string(), array.data_type().clone(), true);
                         (field, array)
                     })
                     .unzip();
