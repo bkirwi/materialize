@@ -96,6 +96,7 @@ def get_default_system_parameters(
         "enable_table_keys": "true",
         "enable_variadic_left_join_lowering": "true",
         "enable_worker_core_affinity": "true",
+        "persist_batch_columnar_format": "both_v2",
         "persist_batch_delete_enabled": "true",
         "persist_batch_record_part_format": "true",
         "persist_fast_path_limit": "1000",
