@@ -73,6 +73,8 @@ pub(crate) trait RowSort<T, D> {
 
     fn len(updates: &Self::Updates) -> usize;
 
+    fn kv_size(kv: Self::KV<'_>) -> usize;
+
     fn get(updates: &Self::Updates, index: usize) -> Option<(Self::KV<'_>, T, D)>;
 
     fn interleave_updates<'a>(
@@ -166,6 +168,10 @@ impl<T: Codec64, D: Codec64> RowSort<T, D> for CodecSort<T, D> {
         updates.records().len()
     }
 
+    fn kv_size((key, value): Self::KV<'_>) -> usize {
+        8 + key.len() + value.len()
+    }
+
     fn get(updates: &Self::Updates, index: usize) -> Option<(Self::KV<'_>, T, D)> {
         let ((k, v), t, d) = updates.records().get(index)?;
         Some(((k, v), T::decode(t), D::decode(d)))
@@ -239,6 +245,10 @@ impl<K: Codec, V: Codec, T: Codec64, D: Codec64> RowSort<T, D> for StructuredSor
 
     fn len(updates: &Self::Updates) -> usize {
         updates.data.records().len()
+    }
+
+    fn kv_size((key, value): Self::KV<'_>) -> usize {
+        key.data_bytes() + value.map_or(0, |v| v.data_bytes())
     }
 
     fn get(updates: &Self::Updates, index: usize) -> Option<(Self::KV<'_>, T, D)> {
@@ -681,12 +691,33 @@ where
     pub(crate) async fn next_chunk(
         &mut self,
         max_len: usize,
+        max_bytes: usize,
     ) -> anyhow::Result<Option<BlobTraceUpdates>> {
         self.trim();
         self.unblock_progress().await?;
-        let updates = self.iter().map(|mut i| i.next_chunks(max_len));
-        let updates = updates.map(|chunk| self.sort.updates_to_blob(chunk));
-        Ok(updates)
+
+        let Some(mut iter) = self.iter() else {
+            return Ok(None);
+        };
+
+        let parts = iter.parts.clone();
+
+        // Keep a running estimate of the size left in the budget, returning None after it's
+        // exhausted. Note that we can't use take_while here... it's important that we pass
+        // on every value we receive from the iterator.
+        let mut budget = max_bytes;
+        let iter = std::iter::from_fn(move || {
+            if budget == 0 {
+                return None;
+            }
+            let update @ (_, kv, _, _) = iter.next()?;
+            budget = budget.saturating_sub(Sort::kv_size(kv) + 16);
+            Some(update)
+        });
+
+        let updates = Sort::interleave_updates(&parts, iter.take(max_len));
+        let updates = self.sort.updates_to_blob(updates);
+        Ok(Some(updates))
     }
 
     /// The size of the data that we _might_ be holding concurrently in memory. While this is
@@ -956,11 +987,6 @@ where
         }
 
         self.state.take()
-    }
-
-    fn next_chunks(&mut self, max_len: usize) -> Sort::Updates {
-        let parts = self.parts.clone();
-        Sort::interleave_updates(&parts, self.take(max_len))
     }
 }
 
