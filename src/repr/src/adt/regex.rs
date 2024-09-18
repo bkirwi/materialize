@@ -316,7 +316,6 @@ mod tests {
 
     proptest! {
         #[mz_ore::test]
-        #[cfg_attr(miri, ignore)] // too slow
         fn regex_protobuf_roundtrip( expect in any_regex() ) {
             let actual =  protobuf_roundtrip::<_, ProtoRegex>(&expect);
             assert_ok!(actual);

@@ -2128,7 +2128,6 @@ mod tests {
 
     proptest! {
         #[mz_ore::test]
-        #[cfg_attr(miri, ignore)] // too slow
         fn parse_error_protobuf_roundtrip(expect in any::<ParseError>()) {
             let actual = protobuf_roundtrip::<_, ProtoParseError>(&expect);
             assert_ok!(actual);
@@ -2138,7 +2137,6 @@ mod tests {
 
     proptest! {
         #[mz_ore::test]
-        #[cfg_attr(miri, ignore)] // too slow
         fn parse_hex_error_protobuf_roundtrip(expect in any::<ParseHexError>()) {
             let actual = protobuf_roundtrip::<_, ProtoParseHexError>(&expect);
             assert_ok!(actual);

@@ -1971,7 +1971,6 @@ mod tests {
     }
 
     #[mz_ore::test]
-    #[cfg_attr(miri, ignore)] // too slow
     fn state_proto_roundtrip() {
         fn testcase<T: Timestamp + Lattice + Codec64>(state: State<T>) {
             let before = UntypedState {

@@ -77,7 +77,6 @@ mod tests {
     // Ideally, this test would live in persist-types next to the stats <->
     // proto code, but it's much easier to proptest them from Datums.
     #[mz_ore::test]
-    #[cfg_attr(miri, ignore)] // too slow
     fn all_scalar_types_stats_roundtrip_trim() {
         proptest!(|(scalar_type in any::<ScalarType>())| {
             // The proptest! macro interferes with rustfmt.

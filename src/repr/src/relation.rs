@@ -1620,7 +1620,6 @@ mod tests {
     }
 
     #[mz_ore::test]
-    #[cfg_attr(miri, ignore)] // too slow
     fn proptest_relation_desc_roundtrips() {
         fn testcase(og: RelationDesc) {
             let bytes = og.into_proto().encode_to_vec();

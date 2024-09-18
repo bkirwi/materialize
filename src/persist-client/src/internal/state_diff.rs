@@ -1265,7 +1265,6 @@ mod tests {
     /// Model a situation where a "leader" is constantly making changes to its state, and a "follower"
     /// is applying those changes as diffs.
     #[mz_ore::test]
-    #[cfg_attr(miri, ignore)] // too slow
     fn test_state_sync() {
         use proptest::prelude::*;
 

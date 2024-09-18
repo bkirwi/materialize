@@ -3260,7 +3260,6 @@ mod tests {
 
     proptest! {
         #[mz_ore::test]
-        #[cfg_attr(miri, ignore)] // too slow
         fn eval_error_protobuf_roundtrip(expect in any::<EvalError>()) {
             let actual = protobuf_roundtrip::<_, ProtoEvalError>(&expect);
             assert_ok!(actual);

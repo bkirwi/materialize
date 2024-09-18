@@ -416,7 +416,6 @@ mod tests {
     }
 
     #[mz_ore::test]
-    #[cfg_attr(miri, ignore)] // too slow
     fn lru_cache_prop() {
         proptest!(|(state in proptest::collection::vec(any::<LruOp>(), 0..100))| prop_testcase(state));
     }

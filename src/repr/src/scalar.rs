@@ -4375,7 +4375,6 @@ mod tests {
 
     proptest! {
        #[mz_ore::test]
-       #[cfg_attr(miri, ignore)] // too slow
         fn scalar_type_protobuf_roundtrip(expect in any::<ScalarType>() ) {
             let actual = protobuf_roundtrip::<_, ProtoScalarType>(&expect);
             assert_ok!(actual);
@@ -4403,7 +4402,6 @@ mod tests {
         }
 
         #[mz_ore::test]
-        #[cfg_attr(miri, ignore)] // too slow
         fn dict_packing_unpacks_correctly(array in arb_dict(arb_datum())) {
             let PropDict(row, elts) = array;
             let datums: Vec<(&str, Datum<'_>)> = elts.iter().map(|(k, e)| (k.as_str(), e.into())).collect();
@@ -4412,7 +4410,6 @@ mod tests {
         }
 
         #[mz_ore::test]
-        #[cfg_attr(miri, ignore)] // too slow
         fn row_packing_roundtrips_single_valued(prop_datums in prop::collection::vec(arb_datum(), 1..100)) {
             let datums: Vec<Datum<'_>> = prop_datums.iter().map(|pd| pd.into()).collect();
             let row = Row::pack(&datums);
@@ -4421,7 +4418,6 @@ mod tests {
         }
 
         #[mz_ore::test]
-        #[cfg_attr(miri, ignore)] // too slow
         fn range_packing_unpacks_correctly(range in arb_range(arb_range_data())) {
             let PropRange(row, prop_range) = range;
             let row = row.unpack_first();

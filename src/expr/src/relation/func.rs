@@ -3576,8 +3576,7 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
-       #[mz_ore::test]
-        #[cfg_attr(miri, ignore)] // too slow
+        #[mz_ore::test]
         fn aggregate_func_protobuf_roundtrip(expect in any::<AggregateFunc>() ) {
             let actual = protobuf_roundtrip::<_, ProtoAggregateFunc>(&expect);
             assert_ok!(actual);
@@ -3586,8 +3585,7 @@ mod tests {
     }
 
     proptest! {
-       #[mz_ore::test]
-        #[cfg_attr(miri, ignore)] // too slow
+        #[mz_ore::test]
         fn table_func_protobuf_roundtrip(expect in any::<TableFunc>() ) {
             let actual = protobuf_roundtrip::<_, ProtoTableFunc>(&expect);
             assert_ok!(actual);
