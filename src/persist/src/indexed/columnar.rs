@@ -16,7 +16,7 @@ use std::mem::size_of;
 use ::arrow::array::{
     make_array, Array, ArrayRef, AsArray, BinaryArray, BinaryBuilder, Int64Array,
 };
-use ::arrow::buffer::OffsetBuffer;
+use ::arrow::buffer::{Buffer, OffsetBuffer};
 use ::arrow::datatypes::ToByteSlice;
 use bytes::Bytes;
 use mz_persist_types::arrow::ProtoArrayData;
@@ -480,7 +480,7 @@ impl ColumnarRecords {
     ) -> Result<(Self, Option<ColumnarRecordsStructuredExt>), TryFromProtoError> {
         let binary_array = |data: Bytes, offsets: Vec<i32>| match BinaryArray::try_new(
             OffsetBuffer::new(offsets.into()),
-            data.into(),
+            Buffer::from_bytes(data.into()),
             None,
         ) {
             Ok(data) => Ok(realloc_array(&data, lgbytes)),
