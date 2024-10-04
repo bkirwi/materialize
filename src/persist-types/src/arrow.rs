@@ -41,6 +41,11 @@ mod proto {
 use crate::arrow::proto::data_type;
 pub use proto::ProtoArrayData;
 
+/// :O
+pub fn validate(array: &dyn Array) {
+    array.to_data().validate_full().expect("valid!!")
+}
+
 /// Extract the list of fields for our recursive datatypes.
 fn fields_for_type(data_type: &DataType) -> &[FieldRef] {
     match data_type {

@@ -124,6 +124,8 @@ fn interleave_updates<T: Codec64, D: Codec64>(
     if has_ext && types_match {
         let key = interleave(|u| &u.structured().unwrap().key);
         let val = interleave(|u| &u.structured().unwrap().val);
+        mz_persist_types::arrow::validate(key.as_ref());
+        mz_persist_types::arrow::validate(val.as_ref());
         BlobTraceUpdates::Both(records, ColumnarRecordsStructuredExt { key, val })
     } else {
         BlobTraceUpdates::Row(records)

@@ -1287,6 +1287,10 @@ where
                     key: realloc_any(&do_filter(&ext.key), metrics),
                     val: realloc_any(&do_filter(&ext.val), metrics),
                 });
+                if let Some(ext) = &ext {
+                    mz_persist_types::arrow::validate(ext.key.as_ref());
+                    mz_persist_types::arrow::validate(ext.val.as_ref());
+                }
                 (records, ext)
             }
         } else {

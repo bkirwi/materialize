@@ -1191,6 +1191,11 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
         let metrics_ = Arc::clone(&metrics);
         let schema_id = write_schemas.id;
 
+        if let Some(ext) = updates.updates.structured() {
+            mz_persist_types::arrow::validate(ext.key.as_ref());
+            mz_persist_types::arrow::validate(ext.val.as_ref());
+        }
+
         let (stats, structured_key_lower, (buf, encode_time)) = isolated_runtime
             .spawn_named(|| "batch::encode_part", async move {
                 // Only encode our updates in a structured format if required, it's expensive.
