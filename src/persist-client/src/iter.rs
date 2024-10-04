@@ -245,6 +245,7 @@ impl<K: Codec, V: Codec, T: Codec64, D: Codec64> RowSort<T, D> for StructuredSor
     fn updates_from_blob(&self, mut updates: BlobTraceUpdates) -> Self::Updates {
         let structured = updates
             .get_or_make_structured::<K, V>(self.schemas.key.as_ref(), self.schemas.val.as_ref());
+        mz_persist_types::arrow::validate(structured.key.as_ref());
         let key_ord = ArrayOrd::new(structured.key.as_ref());
         let val_ord = ArrayOrd::new(structured.val.as_ref());
         StructuredUpdates {

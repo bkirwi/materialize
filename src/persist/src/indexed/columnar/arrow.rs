@@ -247,5 +247,7 @@ pub fn decode_arrow_batch_kvtd_ks_vs(
         val: val_col,
     };
 
+    mz_persist_types::arrow::validate(structured_ext.key.as_ref());
+
     Ok((primary_records, structured_ext))
 }
