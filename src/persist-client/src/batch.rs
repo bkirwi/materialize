@@ -12,11 +12,10 @@
 use arrow::array::Array;
 use differential_dataflow::Hashable;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::mem;
-use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,8 +25,8 @@ use bytes::Bytes;
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
-use futures_util::stream::{FuturesUnordered, StreamExt};
-use futures_util::FutureExt;
+use futures_util::stream::StreamExt;
+use futures_util::{stream, FutureExt};
 use mz_dyncfg::Config;
 use mz_ore::cast::CastFrom;
 use mz_ore::task::{JoinHandle, JoinHandleExt};
@@ -57,8 +56,8 @@ use crate::internal::machine::retry_external;
 use crate::internal::metrics::{BatchWriteMetrics, Metrics, RetryMetrics, ShardMetrics};
 use crate::internal::paths::{PartId, PartialBatchKey, WriterKey};
 use crate::internal::state::{
-    BatchPart, HollowBatch, HollowBatchPart, ProtoInlineBatchPart, RunMeta, RunOrder, RunPart,
-    WRITE_DIFFS_SUM,
+    BatchPart, HollowBatch, HollowBatchPart, HollowRunRef, ProtoInlineBatchPart, RunMeta, RunOrder,
+    RunPart, WRITE_DIFFS_SUM,
 };
 use crate::stats::{
     encode_updates, untrimmable_columns, STATS_BUDGET_BYTES, STATS_COLLECTION_ENABLED,
@@ -172,9 +171,10 @@ where
         }
         let () = deletes
             .delete(
-                &self.blob,
+                &*self.blob,
                 self.shard_id(),
-                &self.metrics.retries.external.batch_delete,
+                usize::MAX,
+                &*self.metrics.retries.external.batch_delete,
             )
             .await;
     }
@@ -1338,18 +1338,28 @@ pub(crate) fn validate_truncate_batch<T: Timestamp>(
     Ok(())
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct PartDeletes(BTreeSet<PartialBatchKey>);
+#[derive(Debug)]
+pub(crate) struct PartDeletes<T> {
+    hollow_parts: BTreeSet<PartialBatchKey>,
+    hollow_runs: BTreeMap<PartialBatchKey, HollowRunRef<T>>,
+}
 
-impl PartDeletes {
+impl<T> Default for PartDeletes<T> {
+    fn default() -> Self {
+        Self {
+            hollow_parts: Default::default(),
+            hollow_runs: Default::default(),
+        }
+    }
+}
+
+impl<T: Timestamp> PartDeletes<T> {
     // Adds the part to the set to be deleted and returns true if it was newly
     // inserted.
-    pub fn add<T>(&mut self, part: &RunPart<T>) -> bool {
+    pub fn add(&mut self, part: &RunPart<T>) -> bool {
         match part {
-            RunPart::Many(_) => {
-                todo!("walk the tree of parts and delete them individually.")
-            }
-            RunPart::Single(BatchPart::Hollow(x)) => self.0.insert(x.key.clone()),
+            RunPart::Many(r) => self.hollow_runs.insert(r.key.clone(), r.clone()).is_none(),
+            RunPart::Single(BatchPart::Hollow(x)) => self.hollow_parts.insert(x.key.clone()),
             RunPart::Single(BatchPart::Inline { .. }) => {
                 // Nothing to delete.
                 true
@@ -1357,29 +1367,55 @@ impl PartDeletes {
         }
     }
 
-    pub async fn delete(
-        self,
-        blob: &Arc<dyn Blob>,
-        shard_id: ShardId,
-        metrics: &Arc<RetryMetrics>,
-    ) {
-        let deletes = FuturesUnordered::new();
-        for key in self.0 {
-            let metrics = Arc::clone(metrics);
-            let blob = Arc::clone(blob);
-            deletes.push(async move {
-                let key = key.complete(&shard_id);
-                retry_external(&metrics, || blob.delete(&key)).await;
-            });
+    pub fn contains(&self, part: &RunPart<T>) -> bool {
+        match part {
+            RunPart::Many(r) => self.hollow_runs.contains_key(&r.key),
+            RunPart::Single(BatchPart::Hollow(x)) => self.hollow_parts.contains(&x.key),
+            RunPart::Single(BatchPart::Inline { .. }) => false,
         }
-        let () = deletes.collect().await;
     }
-}
 
-impl Deref for PartDeletes {
-    type Target = BTreeSet<PartialBatchKey>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    pub fn is_empty(&self) -> bool {
+        self.hollow_runs.is_empty() && self.hollow_parts.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.hollow_runs.len() + self.hollow_parts.len()
+    }
+
+    pub async fn delete(
+        mut self,
+        blob: &dyn Blob,
+        shard_id: ShardId,
+        concurrency: usize,
+        metrics: &RetryMetrics,
+    ) where
+        T: Codec64,
+    {
+        loop {
+            let () = stream::iter(mem::take(&mut self.hollow_parts))
+                .map(|key| {
+                    let key = key.complete(&shard_id);
+                    async move {
+                        retry_external(metrics, || blob.delete(&key)).await;
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+            let Some((run_key, run_ref)) = self.hollow_runs.pop_first() else {
+                break;
+            };
+
+            if let Some(run) = run_ref.get(shard_id, blob).await {
+                // Queue up both all the individual parts and the run itself for deletion.
+                for part in &run.parts {
+                    self.add(part);
+                }
+                self.hollow_parts.insert(run_key);
+            };
+        }
     }
 }
 
