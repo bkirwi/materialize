@@ -109,6 +109,7 @@ impl MockHttpServer {
 async fn test_no_block() {
     // We manually time out the test because it's better than relying on CI to time out, because
     // an actual failure (as opposed to a CI timeout) causes `services.log` to be uploaded.
+    eprintln!("RUST_MIN_STACK = {:?}", std::env::var("RUST_MIN_STACK"));
 
     // Allow the use of banned rdkafka methods, because we are just in tests.
     #[allow(clippy::disallowed_methods)]
