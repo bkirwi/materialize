@@ -84,13 +84,6 @@ impl<K, V, T: Clone, D> Clone for Applier<K, V, T, D> {
     }
 }
 
-/// If set, we round-trip the spine structure through Proto.
-pub(crate) const ROUNDTRIP_SPINE: Config<bool> = Config::new(
-    "persist_roundtrip_spine",
-    true,
-    "Roundtrip the structure of Spine through Proto.",
-);
-
 impl<K, V, T, D> Applier<K, V, T, D>
 where
     K: Debug + Codec,
@@ -496,7 +489,7 @@ where
             }
         };
         let expiry_metrics = new_state.expire_at((cfg.now)());
-        new_state.state.collections.trace.roundtrip_structure = ROUNDTRIP_SPINE.get(&cfg.configs);
+        new_state.state.collections.trace.roundtrip_structure = true;
 
         // Sanity check that all state transitions have special case for
         // being a tombstone. The ones that do will return a Break and
