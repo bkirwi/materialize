@@ -14,7 +14,7 @@ use std::iter;
 use std::ops::Add;
 use std::sync::LazyLock;
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use dec::OrderedDecimal;
 use enum_kinds::EnumKind;
 use itertools::Itertools;
@@ -3972,7 +3972,16 @@ pub fn arb_datum_for_scalar(scalar_type: &ScalarType) -> impl Strategy<Value = P
 
 /// Generates an arbitrary [`NaiveDateTime`].
 pub fn arb_naive_date_time() -> impl Strategy<Value = NaiveDateTime> {
-    add_arb_duration(chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc())
+    let date_gen = (NaiveDate::MIN.year()..=NaiveDate::MAX.year(), 0..=366u32)
+        .prop_filter_map("valid naive date", |(year, ordinal)| {
+            NaiveDate::from_yo_opt(year, ordinal)
+        });
+    let time_gen = (0..86_400u32, 0..2_000_000_000u32)
+        .prop_filter_map("valid naive time", |(a, b)| {
+            NaiveTime::from_num_seconds_from_midnight_opt(a, b)
+        });
+
+    (date_gen, time_gen).prop_map(|(date, time)| NaiveDateTime::new(date, time))
 }
 
 /// Generates an arbitrary [`DateTime`] in [`Utc`].
