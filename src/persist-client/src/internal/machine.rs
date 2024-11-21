@@ -1417,10 +1417,12 @@ pub mod datadriven {
     use mz_persist::indexed::encoding::BlobTraceBatchPart;
     use mz_persist_types::codec_impls::{StringSchema, UnitSchema};
 
+    use super::*;
     use crate::batch::{
         validate_truncate_batch, Batch, BatchBuilder, BatchBuilderConfig, BatchBuilderInternal,
         BatchParts, BLOB_TARGET_SIZE, STRUCTURED_ORDER,
     };
+    use crate::cfg::COMPACTION_MEMORY_BOUND_BYTES;
     use crate::fetch::{Cursor, EncodedPart};
     use crate::internal::compact::{CompactConfig, CompactReq, Compactor};
     use crate::internal::datadriven::DirectiveArgs;
@@ -1433,8 +1435,6 @@ pub mod datadriven {
     use crate::rpc::NoopPubSubSender;
     use crate::tests::new_test_client;
     use crate::{GarbageCollector, PersistClient};
-
-    use super::*;
 
     /// Shared state for a single [crate::internal::machine] [datadriven::TestFile].
     #[derive(Debug)]
@@ -1986,7 +1986,7 @@ pub mod datadriven {
             cfg.set_config(&BLOB_TARGET_SIZE, target_size);
         };
         if let Some(memory_bound) = memory_bound {
-            cfg.dynamic.set_compaction_memory_bound_bytes(memory_bound);
+            cfg.set_config(&COMPACTION_MEMORY_BOUND_BYTES, memory_bound);
         }
         let req = CompactReq {
             shard_id: datadriven.shard_id,
