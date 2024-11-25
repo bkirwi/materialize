@@ -28,7 +28,6 @@ from materialize.ui import UIError
 T = TypeVar("T")
 say = ui.speaker("C> ")
 
-
 DEFAULT_CONFLUENT_PLATFORM_VERSION = "7.7.0"
 
 DEFAULT_MZ_VOLUMES = [
@@ -37,7 +36,6 @@ DEFAULT_MZ_VOLUMES = [
     "tmp:/share/tmp",
     "scratch:/scratch",
 ]
-
 
 # Parameters which disable systems that periodically/unpredictably impact performance
 ADDITIONAL_BENCHMARKING_SYSTEM_PARAMETERS = {
@@ -53,7 +51,7 @@ ADDITIONAL_BENCHMARKING_SYSTEM_PARAMETERS = {
 
 
 def get_default_system_parameters(
-    version: MzVersion | None = None, zero_downtime: bool = False
+        version: MzVersion | None = None, zero_downtime: bool = False
 ) -> dict[str, str]:
     """For upgrade tests we only want parameters set when all environmentd /
     clusterd processes have reached a specific version (or higher)
@@ -146,6 +144,8 @@ def get_default_system_parameters(
         "persist_schema_register": (
             "false" if version < MzVersion.parse_mz("v0.111.0-dev") else "true"
         ),
+        # 16 MiB - large enough to avoid a big perf hit, small enough to get more coverage...
+        "persist_blob_target_size": "16777216",
         "persist_schema_require": "true",
         "persist_stats_audit_percent": "100",
         "persist_txn_tables": "lazy",  # removed, but keep value for older versions
@@ -172,7 +172,6 @@ DEFAULT_CRDB_ENVIRONMENT = [
     "COCKROACH_LOG_MAX_SYNC_DURATION=120s",
 ]
 
-
 # TODO(benesch): change to `docker-mzcompose` once v0.39 ships.
 DEFAULT_CLOUD_PROVIDER = "mzcompose"
 DEFAULT_CLOUD_REGION = "us-east-1"
@@ -183,7 +182,7 @@ DEFAULT_MZ_ENVIRONMENT_ID = f"{DEFAULT_CLOUD_PROVIDER}-{DEFAULT_CLOUD_REGION}-{D
 
 # TODO(benesch): replace with Docker health checks.
 def _check_tcp(
-    cmd: list[str], host: str, port: int, timeout_secs: int, kind: str = ""
+        cmd: list[str], host: str, port: int, timeout_secs: int, kind: str = ""
 ) -> list[str]:
     cmd.extend(
         [
@@ -208,16 +207,16 @@ def _check_tcp(
 
 # TODO(benesch): replace with Docker health checks.
 def _wait_for_pg(
-    timeout_secs: int,
-    query: str,
-    dbname: str,
-    port: int,
-    host: str,
-    user: str,
-    password: str | None,
-    expected: Iterable[Any] | Literal["any"],
-    print_result: bool = False,
-    sslmode: str = "disable",
+        timeout_secs: int,
+        query: str,
+        dbname: str,
+        port: int,
+        host: str,
+        user: str,
+        password: str | None,
+        expected: Iterable[Any] | Literal["any"],
+        print_result: bool = False,
+        sslmode: str = "disable",
 ) -> None:
     """Wait for a pg-compatible database (includes materialized)"""
     obfuscated_password = password[0:1] if password is not None else ""
@@ -266,11 +265,11 @@ def bootstrap_cluster_replica_size() -> str:
 
 def cluster_replica_size_map() -> dict[str, dict[str, Any]]:
     def replica_size(
-        workers: int,
-        scale: int,
-        disabled: bool = False,
-        is_cc: bool = False,
-        memory_limit: str | None = None,
+            workers: int,
+            scale: int,
+            disabled: bool = False,
+            is_cc: bool = False,
+            memory_limit: str | None = None,
     ) -> dict[str, Any]:
         return {
             "cpu_exclusive": False,
