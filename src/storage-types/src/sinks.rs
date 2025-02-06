@@ -75,8 +75,7 @@ impl<S: Debug + PartialEq, T: Debug + PartialEq + PartialOrder> AlterCompatible
             connection,
             envelope,
             version: _,
-            // The as of of the descriptions may differ.
-            as_of: _,
+            as_of,
             from_storage_metadata,
             partition_strategy,
             with_snapshot,
@@ -90,6 +89,7 @@ impl<S: Debug + PartialEq, T: Debug + PartialEq + PartialOrder> AlterCompatible
                 "connection",
             ),
             (envelope == &other.envelope, "envelope"),
+            (PartialOrder::less_equal(as_of, &other.as_of), "as_of"),
             (with_snapshot == &other.with_snapshot, "with_snapshot"),
             (
                 partition_strategy == &other.partition_strategy,
