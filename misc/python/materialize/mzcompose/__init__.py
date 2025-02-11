@@ -148,6 +148,11 @@ def get_default_system_parameters(
         "persist_use_critical_since_snapshot": "false" if zero_downtime else "true",
         "persist_use_critical_since_source": "false" if zero_downtime else "true",
         "persist_part_decode_format": "row_with_validate",
+        # More aggressive networking timeouts, to improve liveness and stress our retry mechanisms.
+        "persist_blob_operation_timeout": "180s",
+        "persist_blob_operation_attempt_timeout": "90s",
+        "persist_blob_connect_timeout": "15s",
+        "persist_blob_read_timeout": "30s",
         "pg_offset_known_interval": "1s",
         "statement_logging_default_sample_rate": "0.01",
         "statement_logging_max_sample_rate": "0.01",
