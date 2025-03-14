@@ -40,7 +40,6 @@ use mz_pgrepr::UInt4;
 use mz_repr::Timestamp;
 use mz_sql::catalog::BuiltinsConfig;
 use mz_sql::session::user::{INTERNAL_USER_NAME_TO_DEFAULT_CLUSTER, SUPPORT_USER, SYSTEM_USER};
-use mz_storage_types::sources::Timeline;
 use postgres::Row;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::ClientConfig;
@@ -1436,10 +1435,7 @@ async fn test_utilization_hold() {
             // If we're not in EpochMilliseconds, the timestamp math below is invalid, so assert that here.
             assert!(matches!(
                 explain.determination.timestamp_context,
-                TimestampContext::TimelineTimestamp {
-                    timeline: Timeline::EpochMilliseconds,
-                    ..
-                }
+                TimestampContext::TimelineTimestamp { .. }
             ));
             let since = explain
                 .determination

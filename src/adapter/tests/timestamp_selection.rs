@@ -23,7 +23,6 @@ use mz_sql::plan::QueryWhen;
 use mz_sql::session::vars::IsolationLevel;
 use mz_sql_parser::ast::TransactionIsolationLevel;
 use mz_storage_types::read_holds::ReadHold;
-use mz_storage_types::sources::Timeline;
 use serde::{Deserialize, Serialize};
 use timely::progress::Antichain;
 
@@ -264,21 +263,14 @@ fn test_timestamp_selection() {
                     let timeline_ctx = TimelineContext::TimestampDependent;
                     let isolation_level = IsolationLevel::from(isolation);
                     let when = parse_query_when(&det.when);
-                    let timeline = Frontiers::get_timeline(&timeline_ctx);
                     let needs_linearized_timeline =
                         Frontiers::needs_linearized_read_ts(&isolation_level, &when);
 
-                    let oracle_read_ts = match timeline {
-                        Some(timeline) if needs_linearized_timeline => match timeline {
-                            Timeline::EpochMilliseconds => Some(f.oracle),
-                            timeline => {
-                                unreachable!(
-                                    "only EpochMillis is used in tests but we got {:?}",
-                                    timeline
-                                )
-                            }
-                        },
-                        Some(_) | None => None,
+                    let oracle_read_ts = match timeline_ctx {
+                        TimelineContext::TimestampDependent if needs_linearized_timeline => {
+                            Some(f.oracle)
+                        }
+                        _ => None,
                     };
 
                     let (ts, _read_holds) = f

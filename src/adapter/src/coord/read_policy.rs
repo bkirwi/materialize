@@ -30,7 +30,7 @@ use timely::progress::Antichain;
 use timely::progress::Timestamp as TimelyTimestamp;
 
 use crate::coord::id_bundle::CollectionIdBundle;
-use crate::coord::timeline::{TimelineContext, TimelineState};
+use crate::coord::timeline::TimelineState;
 use crate::session::Session;
 use crate::util::ResultExt;
 
@@ -252,19 +252,14 @@ impl crate::coord::Coordinator {
         id_bundle: &CollectionIdBundle,
         compaction_window: CompactionWindow,
     ) {
-        // Install read holds in the Coordinator's timeline state.
-        for (timeline_context, id_bundle) in self.partition_ids_by_timeline_context(id_bundle) {
-            if let TimelineContext::TimelineDependent(timeline) = timeline_context {
-                let TimelineState { oracle, .. } = self.ensure_timeline_state(&timeline).await;
-                let read_ts = oracle.read_ts().await;
+        let TimelineState { oracle, .. } = &self.global_timeline;
+        let read_ts = oracle.read_ts().await;
 
-                let mut new_read_holds = self.acquire_read_holds(&id_bundle);
-                new_read_holds.downgrade(read_ts);
+        let mut new_read_holds = self.acquire_read_holds(&id_bundle);
+        new_read_holds.downgrade(read_ts);
 
-                let TimelineState { read_holds, .. } = self.ensure_timeline_state(&timeline).await;
-                read_holds.extend(new_read_holds);
-            }
-        }
+        let TimelineState { read_holds, .. } = &mut self.global_timeline;
+        read_holds.extend(new_read_holds);
 
         // Install read policies.
         let read_policy = ReadPolicy::from(compaction_window);

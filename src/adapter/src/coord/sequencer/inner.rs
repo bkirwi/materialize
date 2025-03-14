@@ -716,7 +716,6 @@ impl Coordinator {
                         CollectionDescription::<Timestamp> {
                             desc: source.desc.clone(),
                             data_source,
-                            timeline: Some(source.timeline),
                             since: None,
                             status_collection_id,
                         },
@@ -1071,7 +1070,6 @@ impl Coordinator {
             }
             plan::TableDataSource::DataSource {
                 desc: data_source_plan,
-                timeline,
             } => match data_source_plan {
                 plan::DataSourceDesc::IngestionExport {
                     ingestion_id,
@@ -1085,7 +1083,6 @@ impl Coordinator {
                         details,
                         data_config,
                     },
-                    timeline,
                 },
                 plan::DataSourceDesc::Webhook {
                     validate_using,
@@ -1099,7 +1096,6 @@ impl Coordinator {
                         headers,
                         cluster_id: cluster_id.expect("Webhook Tables must have cluster_id set"),
                     },
-                    timeline,
                 },
                 o => {
                     unreachable!("CREATE TABLE data source got {:?}", o)
@@ -1167,10 +1163,7 @@ impl Coordinator {
 
                         (collections, Some(register_ts), read_policies)
                     }
-                    TableDataSource::DataSource {
-                        desc: data_source,
-                        timeline,
-                    } => {
+                    TableDataSource::DataSource { desc: data_source } => {
                         match data_source {
                             DataSourceDesc::IngestionExport {
                                 ingestion_id,
@@ -1206,7 +1199,6 @@ impl Coordinator {
                                     },
                                     since: None,
                                     status_collection_id,
-                                    timeline: Some(timeline.clone()),
                                 };
 
                                 let collections = vec![(global_id, collection_desc)];
@@ -1239,7 +1231,6 @@ impl Coordinator {
                                     data_source: DataSource::Webhook,
                                     since: None,
                                     status_collection_id: None,
-                                    timeline: Some(timeline.clone()),
                                 };
                                 let collections = vec![(global_id, collection_desc)];
                                 let read_policies = coord
@@ -2343,10 +2334,8 @@ impl Coordinator {
             )) if ctx.session().vars().transaction_isolation()
                 == &IsolationLevel::StrongSessionSerializable =>
             {
-                if let Some((timeline, ts)) = determination.timestamp_context.timeline_timestamp() {
-                    ctx.session_mut()
-                        .ensure_timestamp_oracle(timeline.clone())
-                        .apply_write(*ts);
+                if let Some(ts) = determination.timestamp_context.timestamp() {
+                    ctx.session_mut().ensure_timestamp_oracle().apply_write(*ts);
                 }
                 (response, action)
             }
@@ -4245,7 +4234,6 @@ impl Coordinator {
                             data_source,
                             since: None,
                             status_collection_id,
-                            timeline: Some(source.timeline.clone()),
                         },
                     ));
 

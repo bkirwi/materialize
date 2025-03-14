@@ -52,7 +52,6 @@ use mz_sql_parser::ast::{
     CreateMaterializedViewStatement, ExplainPlanStatement, Explainee, InsertStatement,
     WithOptionValue,
 };
-use mz_storage_types::sources::Timeline;
 use opentelemetry::trace::TraceContextExt;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug_span, info, warn, Instrument};
@@ -1133,22 +1132,8 @@ impl Coordinator {
                 .iter()
                 .any(materialized_view_option_contains_temporal)
             {
-                let timeline_context =
-                    self.validate_timeline_context(resolved_ids.collections().copied())?;
-
-                // We default to EpochMilliseconds, similarly to `determine_timestamp_for`,
-                // but even in the TimestampIndependent case.
-                // Note that we didn't accurately decide whether we are TimestampDependent
-                // or TimestampIndependent, because for this we'd need to also check whether
-                // `query.contains_temporal()`, similarly to how `peek_stage_validate` does.
-                // However, this doesn't matter here, as we are just going to default to
-                // EpochMilliseconds in both cases.
-                let timeline = timeline_context
-                    .timeline()
-                    .unwrap_or(&Timeline::EpochMilliseconds);
-
                 // Let's start with the timestamp oracle read timestamp.
-                let mut timestamp = self.get_timestamp_oracle(timeline).read_ts().await;
+                let mut timestamp = self.get_timestamp_oracle().read_ts().await;
 
                 // If `least_valid_read` is later than the oracle, then advance to that time.
                 // If we didn't do this, then there would be a danger of missing the first refresh,

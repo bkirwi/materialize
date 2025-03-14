@@ -44,7 +44,6 @@ pub use mz_sql::session::vars::{
 };
 use mz_sql_parser::ast::TransactionIsolationLevel;
 use mz_storage_client::client::TableData;
-use mz_storage_types::sources::Timeline;
 use qcell::{QCell, QCellOwner};
 use rand::Rng;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -117,7 +116,7 @@ where
     // on. We express this by gating access with this token.
     #[derivative(Debug = "ignore")]
     qcell_owner: QCellOwner,
-    session_oracles: BTreeMap<Timeline, InMemoryTimestampOracle<T, NowFn<T>>>,
+    session_oracle: Option<InMemoryTimestampOracle<T, NowFn<T>>>,
 }
 
 impl<T> SessionMetadata for Session<T>
@@ -337,7 +336,7 @@ impl<T: TimestampManipulation> Session<T> {
             secret_key: rand::thread_rng().gen(),
             external_metadata_rx,
             qcell_owner: QCellOwner::new(),
-            session_oracles: BTreeMap::new(),
+            session_oracle: None,
         }
     }
 
@@ -837,27 +836,21 @@ impl<T: TimestampManipulation> Session<T> {
 
     /// Ensures that a timestamp oracle exists for `timeline` and returns a mutable reference to
     /// the timestamp oracle.
-    pub fn ensure_timestamp_oracle(
-        &mut self,
-        timeline: Timeline,
-    ) -> &mut InMemoryTimestampOracle<T, NowFn<T>> {
-        self.session_oracles
-            .entry(timeline)
-            .or_insert_with(|| InMemoryTimestampOracle::new(T::minimum(), NowFn::from(T::minimum)))
+    pub fn ensure_timestamp_oracle(&mut self) -> &mut InMemoryTimestampOracle<T, NowFn<T>> {
+        self.session_oracle.get_or_insert_with(|| {
+            InMemoryTimestampOracle::new(T::minimum(), NowFn::from(T::minimum))
+        })
     }
 
     /// Ensures that a timestamp oracle exists for reads and writes from/to a local input and
     /// returns a mutable reference to the timestamp oracle.
     pub fn ensure_local_timestamp_oracle(&mut self) -> &mut InMemoryTimestampOracle<T, NowFn<T>> {
-        self.ensure_timestamp_oracle(Timeline::EpochMilliseconds)
+        self.ensure_timestamp_oracle()
     }
 
     /// Returns a reference to the timestamp oracle for `timeline`.
-    pub fn get_timestamp_oracle(
-        &self,
-        timeline: &Timeline,
-    ) -> Option<&InMemoryTimestampOracle<T, NowFn<T>>> {
-        self.session_oracles.get(timeline)
+    pub fn get_timestamp_oracle(&self) -> Option<&InMemoryTimestampOracle<T, NowFn<T>>> {
+        self.session_oracle.as_ref()
     }
 
     /// If the current session is using the Strong Session Serializable isolation level advance the
@@ -1114,17 +1107,6 @@ impl<T: TimestampManipulation> TransactionStatus<T> {
         }
     }
 
-    /// The timeline of the transaction, if one exists.
-    pub fn timeline(&self) -> Option<Timeline> {
-        match self {
-            TransactionStatus::Default => None,
-            TransactionStatus::Started(txn)
-            | TransactionStatus::InTransaction(txn)
-            | TransactionStatus::InTransactionImplicit(txn)
-            | TransactionStatus::Failed(txn) => txn.timeline(),
-        }
-    }
-
     /// The cluster of the transaction, if one exists.
     pub fn cluster(&self) -> Option<ClusterId> {
         match self {
@@ -1198,17 +1180,14 @@ impl<T: TimestampManipulation> TransactionStatus<T> {
                             ) {
                                 (
                                     TimestampContext::TimelineTimestamp {
-                                        timeline: txn_timeline,
                                         chosen_ts: txn_ts,
                                         oracle_ts: _,
                                     },
                                     TimestampContext::TimelineTimestamp {
-                                        timeline: add_timeline,
                                         chosen_ts: add_ts,
                                         oracle_ts: _,
                                     },
                                 ) => {
-                                    assert_eq!(txn_timeline, add_timeline);
                                     assert_eq!(txn_ts, add_ts);
                                 }
                                 (TimestampContext::NoTimestamp, _) => {
@@ -1324,26 +1303,6 @@ impl<T> Transaction<T> {
                 *locks = Some(guards);
                 Ok(())
             }
-        }
-    }
-
-    /// The timeline of the transaction, if one exists.
-    fn timeline(&self) -> Option<Timeline> {
-        match &self.ops {
-            TransactionOps::Peeks {
-                determination:
-                    TimestampDetermination {
-                        timestamp_context: TimestampContext::TimelineTimestamp { timeline, .. },
-                        ..
-                    },
-                ..
-            } => Some(timeline.clone()),
-            TransactionOps::Peeks { .. }
-            | TransactionOps::None
-            | TransactionOps::Subscribe
-            | TransactionOps::Writes(_)
-            | TransactionOps::SingleStatement { .. }
-            | TransactionOps::DDL { .. } => None,
         }
     }
 

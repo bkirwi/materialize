@@ -61,7 +61,7 @@ use mz_storage_types::connections::inline::ReferencedConnection;
 use mz_storage_types::sinks::{SinkEnvelope, StorageSinkConnection};
 use mz_storage_types::sources::{
     GenericSourceConnection, SourceConnection, SourceDesc, SourceEnvelope, SourceExportDataConfig,
-    SourceExportDetails, Timeline,
+    SourceExportDetails,
 };
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
@@ -867,15 +867,6 @@ pub struct Table {
 }
 
 impl Table {
-    pub fn timeline(&self) -> Timeline {
-        match &self.data_source {
-            // The Coordinator controls insertions for writable tables
-            // (including system tables), so they are realtime.
-            TableDataSource::TableWrites { .. } => Timeline::EpochMilliseconds,
-            TableDataSource::DataSource { timeline, .. } => timeline.clone(),
-        }
-    }
-
     /// Returns all of the [`GlobalId`]s that this [`Table`] can be referenced by.
     pub fn global_ids(&self) -> impl Iterator<Item = GlobalId> + '_ {
         self.collections.values().copied()
@@ -924,10 +915,7 @@ pub enum TableDataSource {
 
     /// The table receives its data from the identified `DataSourceDesc`.
     /// This table type does not support INSERT/UPDATE/DELETE statements.
-    DataSource {
-        desc: DataSourceDesc,
-        timeline: Timeline,
-    },
+    DataSource { desc: DataSourceDesc },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1051,8 +1039,6 @@ pub struct Source {
     pub data_source: DataSourceDesc,
     /// [`RelationDesc`] of this source, derived from the `create_sql`.
     pub desc: RelationDesc,
-    /// The timeline this source exists on.
-    pub timeline: Timeline,
     /// Other catalog objects referenced by this table, e.g. custom types.
     pub resolved_ids: ResolvedIds,
     /// This value is ignored for subsources, i.e. for
@@ -1135,7 +1121,6 @@ impl Source {
             },
             desc: plan.source.desc,
             global_id,
-            timeline: plan.timeline,
             resolved_ids,
             custom_logical_compaction_window: plan
                 .source
@@ -2460,7 +2445,6 @@ impl CatalogEntry {
                             details,
                             data_config,
                         },
-                    timeline: _,
                 } => Some((*ingestion_id, external_reference, details, data_config)),
                 _ => None,
             },

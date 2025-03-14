@@ -72,7 +72,6 @@ use std::fmt;
 use std::net::IpAddr;
 use std::num::NonZeroI64;
 use std::ops::Neg;
-use std::str::FromStr;
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -154,7 +153,6 @@ use mz_storage_types::connections::ConnectionContext;
 use mz_storage_types::read_holds::ReadHold;
 use mz_storage_types::sinks::{S3SinkFormat, StorageSinkDesc};
 use mz_storage_types::sources::kafka::KAFKA_PROGRESS_DESC;
-use mz_storage_types::sources::Timeline;
 use mz_timestamp_oracle::postgres_oracle::{
     PostgresTimestampOracle, PostgresTimestampOracleConfig,
 };
@@ -1640,7 +1638,7 @@ pub struct Coordinator {
 
     /// Mechanism for totally ordering write and read timestamps, so that all reads
     /// reflect exactly the set of writes that precede them, and no writes that follow.
-    global_timelines: BTreeMap<Timeline, TimelineState<Timestamp>>,
+    global_timeline: TimelineState<Timestamp>,
 
     /// A generator for transient [`GlobalId`]s, shareable with other threads.
     transient_id_gen: Arc<TransientIdGen>,
@@ -2621,68 +2619,66 @@ impl Coordinator {
             .get_entry(&source_status_collection_id)
             .latest_global_id();
 
-        let source_desc =
-            |data_source: &DataSourceDesc, desc: &RelationDesc, timeline: &Timeline| {
-                let (data_source, status_collection_id) = match data_source.clone() {
-                    // Re-announce the source description.
-                    DataSourceDesc::Ingestion {
-                        ingestion_desc:
-                            mz_sql::plan::Ingestion {
-                                desc,
-                                progress_subsource,
-                            },
-                        cluster_id,
-                    } => {
-                        let desc = desc.into_inline_connection(catalog.state());
-                        // TODO(parkmycar): We should probably check the type here, but I'm not sure if
-                        // this will always be a Source or a Table.
-                        let progress_subsource =
-                            catalog.get_entry(&progress_subsource).latest_global_id();
-                        let ingestion = mz_storage_types::sources::IngestionDescription::new(
+        let source_desc = |data_source: &DataSourceDesc, desc: &RelationDesc| {
+            let (data_source, status_collection_id) = match data_source.clone() {
+                // Re-announce the source description.
+                DataSourceDesc::Ingestion {
+                    ingestion_desc:
+                        mz_sql::plan::Ingestion {
                             desc,
-                            cluster_id,
                             progress_subsource,
-                        );
+                        },
+                    cluster_id,
+                } => {
+                    let desc = desc.into_inline_connection(catalog.state());
+                    // TODO(parkmycar): We should probably check the type here, but I'm not sure if
+                    // this will always be a Source or a Table.
+                    let progress_subsource =
+                        catalog.get_entry(&progress_subsource).latest_global_id();
+                    let ingestion = mz_storage_types::sources::IngestionDescription::new(
+                        desc,
+                        cluster_id,
+                        progress_subsource,
+                    );
 
-                        (
-                            DataSource::Ingestion(ingestion.clone()),
-                            Some(source_status_collection_id),
-                        )
-                    }
-                    DataSourceDesc::IngestionExport {
-                        ingestion_id,
-                        external_reference: _,
-                        details,
-                        data_config,
-                    } => {
-                        // TODO(parkmycar): We should probably check the type here, but I'm not sure if
-                        // this will always be a Source or a Table.
-                        let ingestion_id = catalog.get_entry(&ingestion_id).latest_global_id();
-                        (
-                            DataSource::IngestionExport {
-                                ingestion_id,
-                                details,
-                                data_config: data_config.into_inline_connection(catalog.state()),
-                            },
-                            Some(source_status_collection_id),
-                        )
-                    }
-                    DataSourceDesc::Webhook { .. } => {
-                        (DataSource::Webhook, Some(source_status_collection_id))
-                    }
-                    DataSourceDesc::Progress => (DataSource::Progress, None),
-                    DataSourceDesc::Introspection(introspection) => {
-                        (DataSource::Introspection(introspection), None)
-                    }
-                };
-                CollectionDescription {
-                    desc: desc.clone(),
-                    data_source,
-                    since: None,
-                    status_collection_id,
-                    timeline: Some(timeline.clone()),
+                    (
+                        DataSource::Ingestion(ingestion.clone()),
+                        Some(source_status_collection_id),
+                    )
+                }
+                DataSourceDesc::IngestionExport {
+                    ingestion_id,
+                    external_reference: _,
+                    details,
+                    data_config,
+                } => {
+                    // TODO(parkmycar): We should probably check the type here, but I'm not sure if
+                    // this will always be a Source or a Table.
+                    let ingestion_id = catalog.get_entry(&ingestion_id).latest_global_id();
+                    (
+                        DataSource::IngestionExport {
+                            ingestion_id,
+                            details,
+                            data_config: data_config.into_inline_connection(catalog.state()),
+                        },
+                        Some(source_status_collection_id),
+                    )
+                }
+                DataSourceDesc::Webhook { .. } => {
+                    (DataSource::Webhook, Some(source_status_collection_id))
+                }
+                DataSourceDesc::Progress => (DataSource::Progress, None),
+                DataSourceDesc::Introspection(introspection) => {
+                    (DataSource::Introspection(introspection), None)
                 }
             };
+            CollectionDescription {
+                desc: desc.clone(),
+                data_source,
+                since: None,
+                status_collection_id,
+            }
+        };
 
         let mut compute_collections = vec![];
         let mut collections = vec![];
@@ -2692,7 +2688,7 @@ impl Coordinator {
                 CatalogItem::Source(source) => {
                     collections.push((
                         source.global_id(),
-                        source_desc(&source.data_source, &source.desc, &source.timeline),
+                        source_desc(&source.data_source, &source.desc),
                     ));
                 }
                 CatalogItem::Table(table) => {
@@ -2717,13 +2713,12 @@ impl Coordinator {
                         }
                         TableDataSource::DataSource {
                             desc: data_source_desc,
-                            timeline,
                         } => {
                             // TODO(alter_table): Support versioning tables that read from sources.
                             soft_assert_eq_or_log!(table.collections.len(), 1);
                             let collection_descs =
                                 table.collection_descs().map(|(gid, _version, desc)| {
-                                    (gid, source_desc(data_source_desc, &desc, timeline))
+                                    (gid, source_desc(data_source_desc, &desc))
                                 });
                             collections.extend(collection_descs);
                         }
@@ -2735,7 +2730,6 @@ impl Coordinator {
                         data_source: DataSource::Other,
                         since: mv.initial_as_of.clone(),
                         status_collection_id: None,
-                        timeline: None,
                     };
                     compute_collections.push((mv.global_id(), mv.desc.clone()));
                     collections.push((mv.global_id(), collection_desc));
@@ -2746,7 +2740,6 @@ impl Coordinator {
                         data_source: DataSource::Other,
                         since: ct.initial_as_of.clone(),
                         status_collection_id: None,
-                        timeline: None,
                     };
                     if ct.global_id().is_system() && collection_desc.since.is_none() {
                         // We need a non-0 since to make as_of selection work. Fill it in below with
@@ -2791,7 +2784,6 @@ impl Coordinator {
                         },
                         since: None,
                         status_collection_id: None,
-                        timeline: None,
                     };
                     collections.push((sink.global_id, collection_desc));
                 }
@@ -3691,11 +3683,8 @@ impl Coordinator {
         // to serialize an object if the keys aren't strings, so `Debug` formatting the values
         // prevents a future unrelated change from silently breaking this method.
 
-        let global_timelines: BTreeMap<_, _> = self
-            .global_timelines
-            .iter()
-            .map(|(timeline, state)| (timeline.to_string(), format!("{state:?}")))
-            .collect();
+        let global_timelines: BTreeMap<_, _> =
+            [("M".to_string(), format!("{:?}", self.global_timeline))].into();
         let active_conns: BTreeMap<_, _> = self
             .active_conns
             .iter()
@@ -3966,27 +3955,21 @@ pub fn serve(
 
         let pg_timestamp_oracle_config = timestamp_oracle_url
             .map(|pg_url| PostgresTimestampOracleConfig::new(&pg_url, &metrics_registry));
-        let mut initial_timestamps =
-            get_initial_oracle_timestamps(&pg_timestamp_oracle_config).await?;
+        let mut initial_timestamp =
+            get_initial_oracle_timestamp(&pg_timestamp_oracle_config).await?;
 
         // Insert an entry for the `EpochMilliseconds` timeline if one doesn't exist,
         // which will ensure that the timeline is initialized since it's required
         // by the system.
-        initial_timestamps
-            .entry(Timeline::EpochMilliseconds)
-            .or_insert_with(mz_repr::Timestamp::minimum);
-        let mut timestamp_oracles = BTreeMap::new();
-        for (timeline, initial_timestamp) in initial_timestamps {
-            Coordinator::ensure_timeline_state_with_initial_time(
-                &timeline,
-                initial_timestamp,
-                now.clone(),
-                pg_timestamp_oracle_config.clone(),
-                &mut timestamp_oracles,
-                read_only_controllers,
-            )
+        let init = initial_timestamp
+            .get_or_insert_with(mz_repr::Timestamp::minimum);
+        let  timestamp_oracle = Coordinator::ensure_timeline_state_with_initial_time(
+            *init,
+            now.clone(),
+            pg_timestamp_oracle_config.clone(),
+            read_only_controllers,
+        )
             .await;
-        }
 
         // Opening the durable catalog uses one or more timestamps without communicating with
         // the timestamp oracle. Here we make sure to apply the catalog upper with the timestamp
@@ -3997,9 +3980,7 @@ pub fn serve(
         //
         // This time is usually the current system time, but with protection
         // against backwards time jumps, even across restarts.
-        let epoch_millis_oracle = &timestamp_oracles
-            .get(&Timeline::EpochMilliseconds)
-            .expect("inserted above")
+        let epoch_millis_oracle = &timestamp_oracle
             .oracle;
 
         let mut boot_ts = if read_only_controllers {
@@ -4206,9 +4187,7 @@ pub fn serve(
                 let catalog_upper = handle.block_on(catalog.current_upper());
                 boot_ts = std::cmp::max(boot_ts, catalog_upper);
                 if !read_only_controllers {
-                    let epoch_millis_oracle = &timestamp_oracles
-                        .get(&Timeline::EpochMilliseconds)
-                        .expect("inserted above")
+                    let epoch_millis_oracle = &timestamp_oracle
                         .oracle;
                     handle.block_on(epoch_millis_oracle.apply_write(boot_ts));
                 }
@@ -4222,7 +4201,7 @@ pub fn serve(
                     internal_cmd_tx,
                     group_commit_tx,
                     strict_serializable_reads_tx,
-                    global_timelines: timestamp_oracles,
+                    global_timeline: timestamp_oracle,
                     transient_id_gen: Arc::new(TransientIdGen::new()),
                     active_conns: BTreeMap::new(),
                     txn_read_holds: Default::default(),
@@ -4352,11 +4331,10 @@ pub fn serve(
 // we have to live with this window of potential violations during the upgrade
 // window (which is the only point where we should switch oracle
 // implementations).
-async fn get_initial_oracle_timestamps(
+async fn get_initial_oracle_timestamp(
     pg_timestamp_oracle_config: &Option<PostgresTimestampOracleConfig>,
-) -> Result<BTreeMap<Timeline, Timestamp>, AdapterError> {
-    let mut initial_timestamps = BTreeMap::new();
-
+) -> Result<Option<Timestamp>, AdapterError> {
+    let mut initial_timestamp = None;
     if let Some(pg_timestamp_oracle_config) = pg_timestamp_oracle_config {
         let postgres_oracle_timestamps =
             PostgresTimestampOracle::<NowFn>::get_all_timelines(pg_timestamp_oracle_config.clone())
@@ -4374,26 +4352,29 @@ async fn get_initial_oracle_timestamps(
         );
 
         for (timeline, ts) in postgres_oracle_timestamps {
-            let entry = initial_timestamps
-                .entry(Timeline::from_str(&timeline).expect("could not parse timeline"));
-
-            entry
-                .and_modify(|current_ts| *current_ts = std::cmp::max(*current_ts, ts))
-                .or_insert(ts);
+            if &*timeline != "M" {
+                continue;
+            }
+            match &mut initial_timestamp {
+                Some(current_ts) => *current_ts = std::cmp::max(*current_ts, ts),
+                None => {
+                    initial_timestamp = Some(ts);
+                }
+            }
         }
     } else {
         info!("no postgres url for postgres-backed timestamp oracle configured!");
     };
 
     let debug_msg = || {
-        initial_timestamps
+        initial_timestamp
             .iter()
-            .map(|(timeline, ts)| format!("{:?}: {}", timeline, ts))
+            .map(|ts| format!("M: {ts}"))
             .join(", ")
     };
     info!("initial oracle timestamps: {}", debug_msg());
 
-    Ok(initial_timestamps)
+    Ok(initial_timestamp)
 }
 
 #[instrument]

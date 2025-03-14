@@ -416,7 +416,6 @@ impl Coordinator {
         }: PeekStageLinearizeTimestamp,
     ) -> Result<StageResult<Box<PeekStage>>, AdapterError> {
         let isolation_level = session.vars().transaction_isolation().clone();
-        let timeline = Coordinator::get_timeline(&timeline_context);
         let needs_linearized_read_ts =
             Coordinator::needs_linearized_read_ts(&isolation_level, &plan.when);
 
@@ -432,9 +431,9 @@ impl Coordinator {
             explain_ctx,
         };
 
-        match timeline {
-            Some(timeline) if needs_linearized_read_ts => {
-                let oracle = self.get_timestamp_oracle(&timeline);
+        match timeline_context {
+            TimelineContext::TimestampDependent if needs_linearized_read_ts => {
+                let oracle = self.get_timestamp_oracle();
 
                 // We ship the timestamp oracle off to an async task, so that we
                 // don't block the main task while we wait.
@@ -451,7 +450,7 @@ impl Coordinator {
                     .instrument(span),
                 )))
             }
-            Some(_) | None => {
+            _ => {
                 let stage = build_stage(None);
                 let stage = PeekStage::RealTimeRecency(stage);
                 Ok(StageResult::Immediate(Box::new(stage)))

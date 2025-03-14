@@ -76,19 +76,18 @@ impl Coordinator {
     fn check_read_holds(&self) -> Result<(), Vec<ReadHoldsInconsistency>> {
         let mut inconsistencies = Vec::new();
 
-        for timeline in self.global_timelines.values() {
-            for id in timeline.read_holds.storage_ids() {
-                if self.catalog().try_get_entry_by_global_id(&id).is_none() {
-                    inconsistencies.push(ReadHoldsInconsistency::Storage(id));
-                }
+        let timeline = &self.global_timeline;
+        for id in timeline.read_holds.storage_ids() {
+            if self.catalog().try_get_entry_by_global_id(&id).is_none() {
+                inconsistencies.push(ReadHoldsInconsistency::Storage(id));
             }
-            for (cluster_id, id) in timeline.read_holds.compute_ids() {
-                if self.catalog().try_get_cluster(cluster_id).is_none() {
-                    inconsistencies.push(ReadHoldsInconsistency::Cluster(cluster_id));
-                }
-                if !id.is_transient() && self.catalog().try_get_entry_by_global_id(&id).is_none() {
-                    inconsistencies.push(ReadHoldsInconsistency::Compute(id));
-                }
+        }
+        for (cluster_id, id) in timeline.read_holds.compute_ids() {
+            if self.catalog().try_get_cluster(cluster_id).is_none() {
+                inconsistencies.push(ReadHoldsInconsistency::Cluster(cluster_id));
+            }
+            if !id.is_transient() && self.catalog().try_get_entry_by_global_id(&id).is_none() {
+                inconsistencies.push(ReadHoldsInconsistency::Compute(id));
             }
         }
 

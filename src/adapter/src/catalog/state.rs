@@ -1088,7 +1088,6 @@ impl CatalogState {
                         }
                         mz_sql::plan::TableDataSource::DataSource {
                             desc: data_source_desc,
-                            timeline,
                         } => match data_source_desc {
                             mz_sql::plan::DataSourceDesc::IngestionExport {
                                 ingestion_id,
@@ -1102,7 +1101,6 @@ impl CatalogState {
                                     details,
                                     data_config,
                                 },
-                                timeline,
                             },
                             mz_sql::plan::DataSourceDesc::Webhook {
                                 validate_using,
@@ -1117,7 +1115,6 @@ impl CatalogState {
                                     cluster_id: cluster_id
                                         .expect("Webhook Tables must have a cluster_id set"),
                                 },
-                                timeline,
                             },
                             _ => {
                                 return Err((
@@ -1132,10 +1129,7 @@ impl CatalogState {
                 })
             }
             Plan::CreateSource(CreateSourcePlan {
-                source,
-                timeline,
-                in_cluster,
-                ..
+                source, in_cluster, ..
             }) => CatalogItem::Source(Source {
                 create_sql: Some(source.create_sql),
                 data_source: match source.data_source {
@@ -1188,7 +1182,6 @@ impl CatalogState {
                 },
                 desc: source.desc,
                 global_id,
-                timeline,
                 resolved_ids,
                 custom_logical_compaction_window: source
                     .compaction_window
@@ -2526,7 +2519,6 @@ impl CatalogState {
                 CatalogItem::Table(table) => match &table.data_source {
                     TableDataSource::DataSource {
                         desc: DataSourceDesc::IngestionExport { ingestion_id, .. },
-                        timeline: _,
                     } => {
                         let table_cw = table.custom_logical_compaction_window.unwrap_or_default();
                         let ingestion = self

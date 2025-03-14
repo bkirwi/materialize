@@ -64,9 +64,7 @@ use mz_storage_types::connections::{
 };
 use mz_storage_types::instances::StorageInstanceId;
 use mz_storage_types::sinks::{S3SinkFormat, SinkEnvelope, StorageSinkConnection};
-use mz_storage_types::sources::{
-    SourceDesc, SourceExportDataConfig, SourceExportDetails, Timeline,
-};
+use mz_storage_types::sources::{SourceDesc, SourceExportDataConfig, SourceExportDetails};
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 
@@ -642,7 +640,6 @@ pub struct CreateSourcePlan {
     pub name: QualifiedItemName,
     pub source: Source,
     pub if_not_exists: bool,
-    pub timeline: Timeline,
     // None for subsources, which run on the parent cluster.
     pub in_cluster: Option<ClusterId>,
 }
@@ -1427,10 +1424,7 @@ pub enum TableDataSource {
 
     /// The table receives its data from the identified `DataSourceDesc`.
     /// This table type does not support INSERT/UPDATE/DELETE statements.
-    DataSource {
-        desc: DataSourceDesc,
-        timeline: Timeline,
-    },
+    DataSource { desc: DataSourceDesc },
 }
 
 #[derive(Clone, Debug)]

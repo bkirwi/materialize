@@ -112,7 +112,7 @@ use mz_storage_types::sources::postgres::{
 use mz_storage_types::sources::{
     GenericSourceConnection, MySqlSourceExportDetails, PostgresSourceExportDetails,
     ProtoSourceExportStatementDetails, SourceConnection, SourceDesc, SourceExportDataConfig,
-    SourceExportDetails, SourceExportStatementDetails, Timeline,
+    SourceExportDetails, SourceExportStatementDetails,
 };
 use prost::Message;
 
@@ -670,10 +670,6 @@ pub fn plan_create_webhook_source(
         });
     }
 
-    // Note(parkmycar): We don't currently support specifying a timeline for Webhook sources. As
-    // such, we always use a default of EpochMilliseconds.
-    let timeline = Timeline::EpochMilliseconds;
-
     let plan = if is_table {
         let data_source = DataSourceDesc::Webhook {
             validate_using,
@@ -681,10 +677,7 @@ pub fn plan_create_webhook_source(
             headers,
             cluster_id: Some(in_cluster.id()),
         };
-        let data_source = TableDataSource::DataSource {
-            desc: data_source,
-            timeline,
-        };
+        let data_source = TableDataSource::DataSource { desc: data_source };
         Plan::CreateTable(CreateTablePlan {
             name,
             if_not_exists,
@@ -713,7 +706,6 @@ pub fn plan_create_webhook_source(
                 compaction_window: None,
             },
             if_not_exists,
-            timeline,
             in_cluster: Some(in_cluster.id()),
         })
     };
@@ -1187,14 +1179,6 @@ pub fn plan_create_source(
 
     let create_sql = normalize::create_statement(scx, Statement::CreateSource(stmt))?;
 
-    // Determine a default timeline for the source.
-    let timeline = match envelope {
-        SourceEnvelope::CdcV2 => {
-            Timeline::External(scx.catalog.resolve_full_name(&name).to_string())
-        }
-        _ => Timeline::EpochMilliseconds,
-    };
-
     let compaction_window = plan_retain_history_option(scx, retain_history)?;
     let source = Source {
         create_sql,
@@ -1210,7 +1194,6 @@ pub fn plan_create_source(
         name,
         source,
         if_not_exists,
-        timeline,
         in_cluster: Some(in_cluster.id()),
     }))
 }
@@ -1635,7 +1618,6 @@ pub fn plan_create_subsource(
         name,
         source,
         if_not_exists,
-        timeline: Timeline::EpochMilliseconds,
         in_cluster: None,
     }))
 }
@@ -1850,15 +1832,6 @@ pub fn plan_create_table_from_source(
 
     let name = scx.allocate_qualified_name(normalize::unresolved_item_name(name.clone())?)?;
 
-    // Allow users to specify a timeline. If they do not, determine a default
-    // timeline for the source.
-    let timeline = match envelope {
-        SourceEnvelope::CdcV2 => {
-            Timeline::External(scx.catalog.resolve_full_name(&name).to_string())
-        }
-        _ => Timeline::EpochMilliseconds,
-    };
-
     if let Some(partition_by) = partition_by {
         scx.require_feature_flag(&ENABLE_COLLECTION_PARTITION_BY)?;
         check_partition_by(&desc, partition_by)?;
@@ -1883,10 +1856,7 @@ pub fn plan_create_table_from_source(
         desc: VersionedRelationDesc::new(desc),
         temporary: false,
         compaction_window: None,
-        data_source: TableDataSource::DataSource {
-            desc: data_source,
-            timeline,
-        },
+        data_source: TableDataSource::DataSource { desc: data_source },
     };
 
     Ok(Plan::CreateTable(CreateTablePlan {

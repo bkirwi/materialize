@@ -23,7 +23,6 @@ use mz_repr::{GlobalId, RowArena, ScalarType, Timestamp, TimestampManipulation};
 use mz_sql::plan::QueryWhen;
 use mz_sql::session::metadata::SessionMetadata;
 use mz_sql::session::vars::IsolationLevel;
-use mz_storage_types::sources::Timeline;
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp as TimelyTimestamp};
 use tracing::{event, Level};
@@ -42,7 +41,6 @@ use crate::AdapterError;
 pub enum TimestampContext<T> {
     /// Read is executed in a specific timeline with a specific timestamp.
     TimelineTimestamp {
-        timeline: Timeline,
         /// The timestamp that was chosen for a read. This can differ from the
         /// `oracle_ts` when collections are not readable at the (linearized)
         /// timestamp for the oracle. In those cases (when the chosen timestamp
@@ -64,51 +62,22 @@ impl<T: TimestampManipulation> TimestampContext<T> {
     pub fn from_timeline_context(
         chosen_ts: T,
         oracle_ts: Option<T>,
-        transaction_timeline: Option<Timeline>,
         timeline_context: &TimelineContext,
     ) -> TimestampContext<T> {
         match timeline_context {
-            TimelineContext::TimelineDependent(timeline) => {
-                if let Some(transaction_timeline) = transaction_timeline {
-                    assert_eq!(timeline, &transaction_timeline);
-                }
-                Self::TimelineTimestamp {
-                    timeline: timeline.clone(),
-                    chosen_ts,
-                    oracle_ts,
-                }
-            }
-            TimelineContext::TimestampDependent => {
-                // We default to the `Timeline::EpochMilliseconds` timeline if one doesn't exist.
-                Self::TimelineTimestamp {
-                    timeline: transaction_timeline.unwrap_or(Timeline::EpochMilliseconds),
-                    chosen_ts,
-                    oracle_ts,
-                }
-            }
+            TimelineContext::TimestampDependent => Self::TimelineTimestamp {
+                chosen_ts,
+                oracle_ts,
+            },
             TimelineContext::TimestampIndependent => Self::NoTimestamp,
         }
     }
 
-    /// The timeline belonging to this context, if one exists.
-    pub fn timeline(&self) -> Option<&Timeline> {
-        self.timeline_timestamp().map(|tt| tt.0)
-    }
-
     /// The timestamp belonging to this context, if one exists.
     pub fn timestamp(&self) -> Option<&T> {
-        self.timeline_timestamp().map(|tt| tt.1)
-    }
-
-    /// The timeline and timestamp belonging to this context, if one exists.
-    pub fn timeline_timestamp(&self) -> Option<(&Timeline, &T)> {
         match self {
-            Self::TimelineTimestamp {
-                timeline,
-                chosen_ts,
-                ..
-            } => Some((timeline, chosen_ts)),
-            Self::NoTimestamp => None,
+            TimestampContext::TimelineTimestamp { chosen_ts, .. } => Some(chosen_ts),
+            TimestampContext::NoTimestamp => None,
         }
     }
 
@@ -203,17 +172,6 @@ pub trait TimestampProvider {
 
     fn catalog_state(&self) -> &CatalogState;
 
-    fn get_timeline(timeline_context: &TimelineContext) -> Option<Timeline> {
-        let timeline = match timeline_context {
-            TimelineContext::TimelineDependent(timeline) => Some(timeline.clone()),
-            // We default to the `Timeline::EpochMilliseconds` timeline if one doesn't exist.
-            TimelineContext::TimestampDependent => Some(Timeline::EpochMilliseconds),
-            TimelineContext::TimestampIndependent => None,
-        };
-
-        timeline
-    }
-
     /// Returns true if-and-only-if the given configuration needs a linearized
     /// read timetamp from a timestamp oracle.
     ///
@@ -278,8 +236,6 @@ pub trait TimestampProvider {
         let upper = self.least_valid_write(id_bundle);
         let largest_not_in_advance_of_upper = Coordinator::largest_not_in_advance_of_upper(&upper);
 
-        let timeline = Self::get_timeline(timeline_context);
-
         {
             // TODO: We currently split out getting the oracle timestamp because
             // it's a potentially expensive call, but a call that can be done in an
@@ -291,11 +247,13 @@ pub trait TimestampProvider {
             // We assert here that the logic that determines the oracle timestamp
             // matches our expectations.
 
-            if timeline.is_some() && Self::needs_linearized_read_ts(isolation_level, when) {
+            if timeline_context.timestamp_dependent()
+                && Self::needs_linearized_read_ts(isolation_level, when)
+            {
                 assert!(
                     oracle_read_ts.is_some(),
-                    "should get a timestamp from the oracle for linearized timeline {:?} but didn't",
-                    timeline);
+                    "should get a timestamp from the oracle for linearized timeline but didn't"
+                );
             }
         }
 
@@ -331,7 +289,8 @@ pub trait TimestampProvider {
         // - The isolation level is Strict Serializable but there is no timelines and the `when`
         //   allows us to advance to upper.
         if when.can_advance_to_upper()
-            && (isolation_level == &IsolationLevel::Serializable || timeline.is_none())
+            && (isolation_level == &IsolationLevel::Serializable
+                || !timeline_context.timestamp_dependent())
         {
             candidate.join_assign(&largest_not_in_advance_of_upper);
         }
@@ -348,8 +307,8 @@ pub trait TimestampProvider {
 
         let mut session_oracle_read_ts = None;
         if isolation_level == &IsolationLevel::StrongSessionSerializable {
-            if let Some(timeline) = &timeline {
-                if let Some(oracle) = session.get_timestamp_oracle(timeline) {
+            if timeline_context.timestamp_dependent() {
+                if let Some(oracle) = session.get_timestamp_oracle() {
                     let session_ts = oracle.read_ts();
                     candidate.join_assign(&session_ts);
                     session_oracle_read_ts = Some(session_ts);
@@ -399,12 +358,8 @@ pub trait TimestampProvider {
             ));
         };
 
-        let timestamp_context = TimestampContext::from_timeline_context(
-            timestamp,
-            oracle_read_ts,
-            timeline,
-            timeline_context,
-        );
+        let timestamp_context =
+            TimestampContext::from_timeline_context(timestamp, oracle_read_ts, timeline_context);
 
         let determination = TimestampDetermination {
             timestamp_context,
@@ -504,16 +459,15 @@ impl Coordinator {
         when: &QueryWhen,
     ) -> Option<Timestamp> {
         let isolation_level = session.vars().transaction_isolation().clone();
-        let timeline = Coordinator::get_timeline(timeline_ctx);
         let needs_linearized_read_ts =
             Coordinator::needs_linearized_read_ts(&isolation_level, when);
 
-        let oracle_read_ts = match timeline {
-            Some(timeline) if needs_linearized_read_ts => {
-                let timestamp_oracle = self.get_timestamp_oracle(&timeline);
+        let oracle_read_ts = match timeline_ctx {
+            TimelineContext::TimestampDependent if needs_linearized_read_ts => {
+                let timestamp_oracle = self.get_timestamp_oracle();
                 Some(timestamp_oracle.read_ts().await)
             }
-            Some(_) | None => None,
+            _ => None,
         };
 
         oracle_read_ts
@@ -706,20 +660,18 @@ pub struct TimestampSource<T> {
 }
 
 pub trait DisplayableInTimeline {
-    fn fmt(&self, timeline: Option<&Timeline>, f: &mut fmt::Formatter) -> fmt::Result;
-    fn display<'a>(&'a self, timeline: Option<&'a Timeline>) -> DisplayInTimeline<'a, Self> {
-        DisplayInTimeline { t: self, timeline }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result;
+    fn display<'a>(&'a self) -> DisplayInTimeline<'a, Self> {
+        DisplayInTimeline { t: self }
     }
 }
 
 impl DisplayableInTimeline for mz_repr::Timestamp {
-    fn fmt(&self, timeline: Option<&Timeline>, f: &mut fmt::Formatter) -> fmt::Result {
-        if let Some(Timeline::EpochMilliseconds) = timeline {
-            let ts_ms: u64 = self.into();
-            if let Ok(ts_ms) = i64::try_from(ts_ms) {
-                if let Some(ndt) = DateTime::from_timestamp_millis(ts_ms) {
-                    return write!(f, "{:13} ({})", self, ndt.format("%Y-%m-%d %H:%M:%S%.3f"));
-                }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let ts_ms: u64 = self.into();
+        if let Ok(ts_ms) = i64::try_from(ts_ms) {
+            if let Some(ndt) = DateTime::from_timestamp_millis(ts_ms) {
+                return write!(f, "{:13} ({})", self, ndt.format("%Y-%m-%d %H:%M:%S%.3f"));
             }
         }
         write!(f, "{:13}", self)
@@ -728,14 +680,13 @@ impl DisplayableInTimeline for mz_repr::Timestamp {
 
 pub struct DisplayInTimeline<'a, T: ?Sized> {
     t: &'a T,
-    timeline: Option<&'a Timeline>,
 }
 impl<'a, T> fmt::Display for DisplayInTimeline<'a, T>
 where
     T: DisplayableInTimeline,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.t.fmt(self.timeline, f)
+        self.t.fmt(f)
     }
 }
 
@@ -752,42 +703,32 @@ impl<T: fmt::Display + fmt::Debug + DisplayableInTimeline + TimestampManipulatio
     for TimestampExplanation<T>
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let timeline = self.determination.timestamp_context.timeline();
         writeln!(
             f,
             "                query timestamp: {}",
-            self.determination
-                .timestamp_context
-                .timestamp_or_default()
-                .display(timeline)
+            self.determination.timestamp_context.timestamp_or_default()
         )?;
         if let Some(oracle_read_ts) = &self.determination.oracle_read_ts {
-            writeln!(
-                f,
-                "          oracle read timestamp: {}",
-                oracle_read_ts.display(timeline)
-            )?;
+            writeln!(f, "          oracle read timestamp: {}", oracle_read_ts)?;
         }
         if let Some(session_oracle_read_ts) = &self.determination.session_oracle_read_ts {
             writeln!(
                 f,
                 "  session oracle read timestamp: {}",
-                session_oracle_read_ts.display(timeline)
+                session_oracle_read_ts
             )?;
         }
         if let Some(real_time_recency_ts) = &self.determination.real_time_recency_ts {
             writeln!(
                 f,
                 "    real time recency timestamp: {}",
-                real_time_recency_ts.display(timeline)
+                real_time_recency_ts
             )?;
         }
         writeln!(
             f,
             "largest not in advance of upper: {}",
-            self.determination
-                .largest_not_in_advance_of_upper
-                .display(timeline),
+            self.determination.largest_not_in_advance_of_upper.display(),
         )?;
         writeln!(
             f,
@@ -795,7 +736,7 @@ impl<T: fmt::Display + fmt::Debug + DisplayableInTimeline + TimestampManipulatio
             self.determination
                 .upper
                 .iter()
-                .map(|t| t.display(timeline))
+                .map(|t| t.display())
                 .collect::<Vec<_>>()
         )?;
         writeln!(
@@ -804,7 +745,7 @@ impl<T: fmt::Display + fmt::Debug + DisplayableInTimeline + TimestampManipulatio
             self.determination
                 .since
                 .iter()
-                .map(|t| t.display(timeline))
+                .map(|t| t.display())
                 .collect::<Vec<_>>()
         )?;
         writeln!(
@@ -812,7 +753,7 @@ impl<T: fmt::Display + fmt::Debug + DisplayableInTimeline + TimestampManipulatio
             "        can respond immediately: {}",
             self.respond_immediately
         )?;
-        writeln!(f, "                       timeline: {:?}", &timeline)?;
+        writeln!(f, "                       timeline: Some(EpochMillis)")?;
         writeln!(
             f,
             "              session wall time: {:13} ({})",
@@ -829,7 +770,7 @@ impl<T: fmt::Display + fmt::Debug + DisplayableInTimeline + TimestampManipulatio
                 source
                     .read_frontier
                     .iter()
-                    .map(|t| t.display(timeline))
+                    .map(|t| t.display())
                     .collect::<Vec<_>>()
             )?;
             writeln!(
@@ -838,7 +779,7 @@ impl<T: fmt::Display + fmt::Debug + DisplayableInTimeline + TimestampManipulatio
                 source
                     .write_frontier
                     .iter()
-                    .map(|t| t.display(timeline))
+                    .map(|t| t.display())
                     .collect::<Vec<_>>()
             )?;
         }

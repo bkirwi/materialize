@@ -53,7 +53,6 @@ use mz_sql::session::user::MZ_SYSTEM_ROLE_ID;
 use mz_sql::session::vars::{VarError, VarInput};
 use mz_sql::{plan, rbac};
 use mz_sql_parser::ast::Expr;
-use mz_storage_types::sources::Timeline;
 use tracing::{info_span, warn, Instrument};
 
 use crate::catalog::state::LocalExpressionCache;
@@ -800,7 +799,6 @@ impl CatalogState {
                         data_source: DataSourceDesc::Introspection(coll.data_source),
                         desc: coll.desc.clone(),
                         global_id,
-                        timeline: Timeline::EpochMilliseconds,
                         resolved_ids: ResolvedIds::empty(),
                         custom_logical_compaction_window: coll.is_retained_metrics_object.then(
                             || {

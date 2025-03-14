@@ -58,7 +58,6 @@ use tracing::{event, info_span, warn, Instrument, Level};
 use crate::active_compute_sink::{ActiveComputeSink, ActiveComputeSinkRetireReason};
 use crate::catalog::{DropObjectInfo, Op, ReplicaCreateDropReason, TransactionResult};
 use crate::coord::appends::BuiltinTableAppendNotify;
-use crate::coord::timeline::{TimelineContext, TimelineState};
 use crate::coord::{Coordinator, ReplicaMetadata};
 use crate::session::{Session, Transaction, TransactionOps};
 use crate::statement_logging::StatementEndedExecutionReason;
@@ -473,48 +472,22 @@ impl Coordinator {
             }
         }
 
-        let storage_ids_to_drop = sources_to_drop
-            .iter()
-            .map(|(_, gid)| *gid)
-            .chain(storage_sink_gids_to_drop.iter().copied())
-            .chain(table_gids_to_drop.iter().map(|(_, gid)| *gid))
-            .chain(materialized_views_to_drop.iter().map(|(_, gid)| *gid))
-            .chain(continual_tasks_to_drop.iter().map(|(_, _, gid)| *gid));
-        let compute_ids_to_drop = indexes_to_drop
-            .iter()
-            .copied()
-            .chain(materialized_views_to_drop.iter().copied())
-            .chain(
-                continual_tasks_to_drop
-                    .iter()
-                    .map(|(_, cluster_id, gid)| (*cluster_id, *gid)),
-            );
-
-        // Check if any Timelines would become empty, if we dropped the specified storage or
-        // compute resources.
-        //
-        // Note: only after a Transaction succeeds do we actually drop the timeline
-        let collection_id_bundle = self.build_collection_id_bundle(
-            storage_ids_to_drop,
-            compute_ids_to_drop,
-            clusters_to_drop.clone(),
-        );
-        let timeline_associations: BTreeMap<_, _> = self
-            .partition_ids_by_timeline_context(&collection_id_bundle)
-            .filter_map(|(context, bundle)| {
-                let TimelineContext::TimelineDependent(timeline) = context else {
-                    return None;
-                };
-                let TimelineState { read_holds, .. } = self
-                    .global_timelines
-                    .get(&timeline)
-                    .expect("all timeslines have a timestamp oracle");
-
-                let empty = read_holds.id_bundle().difference(&bundle).is_empty();
-
-                Some((timeline, (empty, bundle)))
-            })
-            .collect();
+        // let storage_ids_to_drop = sources_to_drop
+        //     .iter()
+        //     .map(|(_, gid)| *gid)
+        //     .chain(storage_sink_gids_to_drop.iter().copied())
+        //     .chain(table_gids_to_drop.iter().map(|(_, gid)| *gid))
+        //     .chain(materialized_views_to_drop.iter().map(|(_, gid)| *gid))
+        //     .chain(continual_tasks_to_drop.iter().map(|(_, _, gid)| *gid));
+        // let compute_ids_to_drop = indexes_to_drop
+        //     .iter()
+        //     .copied()
+        //     .chain(materialized_views_to_drop.iter().copied())
+        //     .chain(
+        //         continual_tasks_to_drop
+        //             .iter()
+        //             .map(|(_, cluster_id, gid)| (*cluster_id, *gid)),
+        //     );
 
         self.validate_resource_limits(&ops, conn_id.unwrap_or(&SYSTEM_CONN_ID))?;
 
@@ -640,13 +613,6 @@ impl Coordinator {
         // No error returns are allowed after this point. Enforce this at compile time
         // by using this odd structure so we don't accidentally add a stray `?`.
         let _: () = async {
-            if !timeline_associations.is_empty() {
-                for (timeline, (should_be_empty, id_bundle)) in timeline_associations {
-                    let became_empty =
-                        self.remove_resources_associated_with_timeline(timeline, id_bundle);
-                    assert_eq!(should_be_empty, became_empty, "emptiness did not match!");
-                }
-            }
             if !table_gids_to_drop.is_empty() {
                 let ts = self.get_local_write_ts().await;
                 self.drop_tables(table_gids_to_drop, ts.timestamp);
@@ -1373,7 +1339,6 @@ impl Coordinator {
             },
             since: None,
             status_collection_id: None,
-            timeline: None,
         };
         let collections = vec![(id, collection_desc)];
 

@@ -533,11 +533,7 @@ impl CatalogState {
                 let mut updates = self
                     .pack_table_update(id, oid, schema_id, name, owner_id, privileges, diff, table);
 
-                if let TableDataSource::DataSource {
-                    desc: data_source,
-                    timeline: _,
-                } = &table.data_source
-                {
+                if let TableDataSource::DataSource { desc: data_source } = &table.data_source {
                     updates.extend(match data_source {
                         DataSourceDesc::IngestionExport {
                             ingestion_id,
