@@ -271,12 +271,6 @@ fn test_timestamp_selection() {
                     let oracle_read_ts = match timeline {
                         Some(timeline) if needs_linearized_timeline => match timeline {
                             Timeline::EpochMilliseconds => Some(f.oracle),
-                            timeline => {
-                                unreachable!(
-                                    "only EpochMillis is used in tests but we got {:?}",
-                                    timeline
-                                )
-                            }
                         },
                         Some(_) | None => None,
                     };

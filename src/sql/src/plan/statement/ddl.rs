@@ -1188,12 +1188,7 @@ pub fn plan_create_source(
     let create_sql = normalize::create_statement(scx, Statement::CreateSource(stmt))?;
 
     // Determine a default timeline for the source.
-    let timeline = match envelope {
-        SourceEnvelope::CdcV2 => {
-            Timeline::External(scx.catalog.resolve_full_name(&name).to_string())
-        }
-        _ => Timeline::EpochMilliseconds,
-    };
+    let timeline = Timeline::EpochMilliseconds;
 
     let compaction_window = plan_retain_history_option(scx, retain_history)?;
     let source = Source {
@@ -1852,12 +1847,7 @@ pub fn plan_create_table_from_source(
 
     // Allow users to specify a timeline. If they do not, determine a default
     // timeline for the source.
-    let timeline = match envelope {
-        SourceEnvelope::CdcV2 => {
-            Timeline::External(scx.catalog.resolve_full_name(&name).to_string())
-        }
-        _ => Timeline::EpochMilliseconds,
-    };
+    let timeline = Timeline::EpochMilliseconds;
 
     if let Some(partition_by) = partition_by {
         scx.require_feature_flag(&ENABLE_COLLECTION_PARTITION_BY)?;

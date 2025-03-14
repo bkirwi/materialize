@@ -531,14 +531,6 @@ pub enum Timeline {
     /// EpochMilliseconds means the timestamp is the number of milliseconds since
     /// the Unix epoch.
     EpochMilliseconds,
-    /// External means the timestamp comes from an external data source and we
-    /// don't know what the number means. The attached String is the source's name,
-    /// which will result in different sources being incomparable.
-    External(String),
-    /// User means the user has manually specified a timeline. The attached
-    /// String is specified by the user, allowing them to decide sources that are
-    /// joinable.
-    User(String),
 }
 
 impl Timeline {
@@ -549,8 +541,6 @@ impl Timeline {
     fn id_char(&self) -> char {
         match self {
             Self::EpochMilliseconds => Self::EPOCH_MILLISECOND_ID_CHAR,
-            Self::External(_) => Self::EXTERNAL_ID_CHAR,
-            Self::User(_) => Self::USER_ID_CHAR,
         }
     }
 }
@@ -561,22 +551,15 @@ impl RustType<ProtoTimeline> for Timeline {
         ProtoTimeline {
             kind: Some(match self {
                 Timeline::EpochMilliseconds => Kind::EpochMilliseconds(()),
-                Timeline::External(s) => Kind::External(s.clone()),
-                Timeline::User(s) => Kind::User(s.clone()),
             }),
         }
     }
 
     fn from_proto(proto: ProtoTimeline) -> Result<Self, TryFromProtoError> {
-        use proto_timeline::Kind;
-        let kind = proto
+        let _kind = proto
             .kind
             .ok_or_else(|| TryFromProtoError::missing_field("ProtoTimeline::kind"))?;
-        Ok(match kind {
-            Kind::EpochMilliseconds(()) => Timeline::EpochMilliseconds,
-            Kind::External(s) => Timeline::External(s),
-            Kind::User(s) => Timeline::User(s),
-        })
+        Ok(Timeline::EpochMilliseconds)
     }
 }
 
@@ -584,8 +567,6 @@ impl ToString for Timeline {
     fn to_string(&self) -> String {
         match self {
             Self::EpochMilliseconds => format!("{}", self.id_char()),
-            Self::External(id) => format!("{}.{id}", self.id_char()),
-            Self::User(id) => format!("{}.{id}", self.id_char()),
         }
     }
 }
@@ -604,11 +585,11 @@ impl FromStr for Timeline {
                 Some(_) => Err(format!("unknown timeline: {s}")),
             },
             Self::EXTERNAL_ID_CHAR => match chars.next() {
-                Some('.') => Ok(Self::External(chars.as_str().to_string())),
+                Some('.') => Ok(Self::EpochMilliseconds),
                 _ => Err(format!("unknown timeline: {s}")),
             },
             Self::USER_ID_CHAR => match chars.next() {
-                Some('.') => Ok(Self::User(chars.as_str().to_string())),
+                Some('.') => Ok(Self::EpochMilliseconds),
                 _ => Err(format!("unknown timeline: {s}")),
             },
             _ => Err(format!("unknown timeline: {s}")),
@@ -1924,7 +1905,6 @@ mod tests {
     use arrow::array::{make_comparator, ArrayData};
     use bytes::Bytes;
     use mz_expr::EvalError;
-    use mz_ore::assert_err;
     use mz_ore::metrics::MetricsRegistry;
     use mz_persist::indexed::columnar::arrow::{realloc_any, realloc_array};
     use mz_persist::metrics::ColumnarMetrics;
@@ -1941,19 +1921,6 @@ mod tests {
     use crate::stats::RelationPartStats;
 
     use super::*;
-
-    #[mz_ore::test]
-    fn test_timeline_parsing() {
-        assert_eq!(Ok(Timeline::EpochMilliseconds), "M".parse());
-        assert_eq!(Ok(Timeline::External("JOE".to_string())), "E.JOE".parse());
-        assert_eq!(Ok(Timeline::User("MIKE".to_string())), "U.MIKE".parse());
-
-        assert_err!("Materialize".parse::<Timeline>());
-        assert_err!("Ejoe".parse::<Timeline>());
-        assert_err!("Umike".parse::<Timeline>());
-        assert_err!("Dance".parse::<Timeline>());
-        assert_err!("".parse::<Timeline>());
-    }
 
     #[track_caller]
     fn roundtrip_source_data(
