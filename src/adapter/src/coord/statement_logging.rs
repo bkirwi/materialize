@@ -30,7 +30,7 @@ use rand::{distributions::Bernoulli, prelude::Distribution, thread_rng};
 use sha2::{Digest, Sha256};
 use tokio::time::MissedTickBehavior;
 use tracing::debug;
-use uuid::Uuid;
+use uuid::{NoContext, Uuid};
 
 use crate::coord::{ConnMeta, Coordinator};
 use crate::session::Session;
@@ -321,7 +321,15 @@ impl Coordinator {
                     *accounted,
                     "accounting for logging should be done in `begin_statement_execution`"
                 );
-                let uuid = Uuid::new_v4();
+                // UUIDv7 to get a rough ordering by time, which is convenient for lookups.
+                let uuid = Uuid::new_v7(uuid::Timestamp::from_unix(
+                    NoContext,
+                    *prepared_at / 1000,
+                    (*prepared_at % 1000)
+                        .try_into()
+                        .expect("% 1000 is always small")
+                        * 1_000_000,
+                ));
                 let sql = std::mem::take(sql);
                 let redacted_sql = std::mem::take(redacted_sql);
                 let sql_hash: [u8; 32] = Sha256::digest(sql.as_bytes()).into();
@@ -719,8 +727,13 @@ impl Coordinator {
         }
         let (ps_record, ps_uuid) = self.log_prepared_statement(session, logging)?;
 
-        let ev_id = Uuid::new_v4();
         let now = self.now();
+        // UUIDv7 to get a rough ordering by time, which is convenient for lookups.
+        let ev_id = Uuid::new_v7(uuid::Timestamp::from_unix(
+            NoContext,
+            now / 1000,
+            (now % 1000).try_into().expect("% 1000 is always small") * 1_000_000,
+        ));
         self.record_statement_lifecycle_event(
             &StatementLoggingId(ev_id),
             &StatementLifecycleEvent::ExecutionBegan,
