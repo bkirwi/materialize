@@ -657,8 +657,20 @@ impl<T: Timestamp + Lattice + Codec64> Trace<T> {
         metrics: &ColumnarMetrics,
     ) -> ApplyMergeResult {
         for batch in self.spine.spine_batches_mut().rev() {
+            let before = SpineBatch::diffs_sum::<D>(
+                batch.parts.iter().flat_map(|p| p.batch.parts.iter()),
+                metrics,
+            );
             let result = batch.maybe_replace_checked::<D>(res, metrics);
             if result.matched() {
+                let after = SpineBatch::diffs_sum::<D>(
+                    batch.parts.iter().flat_map(|p| p.batch.parts.iter()),
+                    metrics,
+                );
+                if let (Some(before), Some(after)) = (before, after) {
+                    assert_eq!(before, after);
+                }
+
                 return result;
             }
         }
