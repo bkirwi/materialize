@@ -15,23 +15,6 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
-use differential_dataflow::difference::Semigroup;
-use differential_dataflow::lattice::Lattice;
-use differential_dataflow::trace::Description;
-use futures_util::{StreamExt, TryFutureExt};
-use mz_dyncfg::Config;
-use mz_ore::cast::CastFrom;
-use mz_ore::error::ErrorExt;
-use mz_persist::location::Blob;
-use mz_persist_types::part::Part;
-use mz_persist_types::{Codec, Codec64};
-use timely::PartialOrder;
-use timely::progress::{Antichain, Timestamp};
-use tokio::sync::mpsc::Sender;
-use tokio::sync::{TryAcquireError, mpsc, oneshot};
-use tracing::{Instrument, Span, debug, debug_span, error, trace, warn};
-
 use crate::async_runtime::IsolatedRuntime;
 use crate::batch::{BatchBuilderConfig, BatchBuilderInternal, BatchParts, PartDeletes};
 use crate::cfg::{
@@ -49,6 +32,24 @@ use crate::internal::state::{HollowBatch, RunMeta, RunOrder, RunPart};
 use crate::internal::trace::{ApplyMergeResult, FueledMergeRes};
 use crate::iter::{Consolidator, StructuredSort};
 use crate::{Metrics, PersistConfig, ShardId};
+use anyhow::anyhow;
+use differential_dataflow::difference::Semigroup;
+use differential_dataflow::lattice::Lattice;
+use differential_dataflow::trace::Description;
+use futures_util::{StreamExt, TryFutureExt};
+use itertools::assert_equal;
+use mz_dyncfg::Config;
+use mz_ore::cast::CastFrom;
+use mz_ore::error::ErrorExt;
+use mz_persist::location::Blob;
+use mz_persist::metrics::ColumnarMetrics;
+use mz_persist_types::part::Part;
+use mz_persist_types::{Codec, Codec64};
+use timely::PartialOrder;
+use timely::progress::{Antichain, Timestamp};
+use tokio::sync::mpsc::Sender;
+use tokio::sync::{TryAcquireError, mpsc, oneshot};
+use tracing::{Instrument, Span, debug, debug_span, error, trace, warn};
 
 /// A request for compaction.
 ///
@@ -492,6 +493,33 @@ where
     ) -> Result<CompactRes<T>, anyhow::Error> {
         let () = Self::validate_req(&req)?;
 
+        fn diffs_sum<'a, D: Semigroup>(
+            parts: impl Iterator<Item = Option<D>>,
+            metrics: &ColumnarMetrics,
+        ) -> Option<D> {
+            parts
+                .reduce(|a, b| match (a, b) {
+                    (Some(mut a), Some(b)) => {
+                        a.plus_equals(&b);
+                        Some(a)
+                    }
+                    _ => None,
+                })
+                .flatten()
+        }
+
+        let diff_sum = if cfg!(debug_assertions) {
+            diffs_sum::<D>(
+                req.inputs
+                    .iter()
+                    .flat_map(|p| p.parts.iter())
+                    .map(|p| p.diffs_sum::<D>(&metrics.columnar)),
+                &metrics.columnar,
+            )
+        } else {
+            None
+        };
+
         // We introduced a fast-path optimization in https://github.com/MaterializeInc/materialize/pull/15363
         // but had to revert it due to a very scary bug. Here we count how many of our compaction reqs
         // could be eligible for the optimization to better understand whether it's worth trying to
@@ -599,7 +627,7 @@ where
             len += updates;
         }
 
-        Ok(CompactRes {
+        let res = CompactRes {
             output: HollowBatch::new(
                 req.desc.clone(),
                 all_parts,
@@ -607,7 +635,20 @@ where
                 all_run_meta,
                 all_run_splits,
             ),
-        })
+        };
+
+        if let Some(sum) = diff_sum {
+            let after = diffs_sum::<D>(
+                req.inputs
+                    .iter()
+                    .flat_map(|p| p.parts.iter())
+                    .map(|p| p.diffs_sum::<D>(&metrics.columnar)),
+                &metrics.columnar,
+            );
+            assert_equal(Some(sum), after);
+        }
+
+        Ok(res)
     }
 
     /// Sorts and groups all runs from the inputs into chunks, each of which has been determined
