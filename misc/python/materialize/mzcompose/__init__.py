@@ -318,6 +318,11 @@ def get_variable_system_parameters(
             ["false"] if zero_downtime else ["true", "false"],
         ),
         VariableSystemParameter(
+            "persist_enable_incremental_compaction",
+            "true",
+            ["true", "false"],
+        ),
+        VariableSystemParameter(
             "persist_part_decode_format", "arrow", ["arrow", "row_with_validate"]
         ),
         VariableSystemParameter(
@@ -558,7 +563,6 @@ UNINTERESTING_SYSTEM_PARAMETERS = [
     "compute_peek_stash_num_batches",
     "compute_peek_stash_batch_size",
     "enable_timely_init_at_process_startup",
-    "persist_enable_incremental_compaction",
     "storage_statistics_retention_duration",
 ]
 
