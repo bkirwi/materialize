@@ -15,6 +15,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::async_runtime;
+use crate::internal::machine::{
+    NEXT_LISTEN_BATCH_RETRYER_CLAMP, NEXT_LISTEN_BATCH_RETRYER_INITIAL_BACKOFF,
+    NEXT_LISTEN_BATCH_RETRYER_MULTIPLIER,
+};
+use crate::internal::state::ROLLUP_THRESHOLD;
+use crate::operators::STORAGE_SOURCE_DECODE_FUEL;
+use crate::read::READER_LEASE_DURATION;
 use mz_build_info::BuildInfo;
 use mz_dyncfg::{Config, ConfigDefault, ConfigSet, ConfigUpdates};
 use mz_ore::instrument;
@@ -26,14 +34,6 @@ use proptest_derive::Arbitrary;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-
-use crate::internal::machine::{
-    NEXT_LISTEN_BATCH_RETRYER_CLAMP, NEXT_LISTEN_BATCH_RETRYER_INITIAL_BACKOFF,
-    NEXT_LISTEN_BATCH_RETRYER_MULTIPLIER,
-};
-use crate::internal::state::ROLLUP_THRESHOLD;
-use crate::operators::STORAGE_SOURCE_DECODE_FUEL;
-use crate::read::READER_LEASE_DURATION;
 
 // Ignores the patch version
 const SELF_MANAGED_VERSIONS: &[Version] = &[
@@ -263,6 +263,7 @@ impl PersistConfig {
 
         let mut cfg = Self::new_default_configs(&DUMMY_BUILD_INFO, SYSTEM_TIME.clone());
         cfg.hostname = "tests".into();
+        cfg.isolated_runtime_worker_threads = async_runtime::TEST_THREADS;
         cfg
     }
 }
