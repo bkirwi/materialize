@@ -95,12 +95,9 @@ impl IsolatedRuntime {
 
 impl Drop for IsolatedRuntime {
     fn drop(&mut self) {
-        // We don't need to worry about `shutdown_background` leaking
-        // blocking tasks (i.e., tasks spawned with `spawn_blocking`) because
-        // the `IsolatedRuntime` wrapper prevents access to `spawn_blocking`.
-        self.inner
-            .take()
-            .expect("cannot drop twice")
-            .shutdown_background()
+        // Due to https://sourceware.org/bugzilla/show_bug.cgi?id=19951, we want to ensure that all
+        // threads are dropped and joined before threads are detached. Dropping the runtime without
+        // an explicit shutdown seems to be the only way to not aggressively detach these threads.
+        let _runtime = self.inner.take().expect("cannot drop twice");
     }
 }
