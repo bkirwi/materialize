@@ -121,7 +121,13 @@ impl From<PostgresConsensusConfig> for PostgresClientConfig {
             config.url,
             config.knobs,
             config.metrics,
-            SET_SERIALIZABLE.to_string(),
+            if USE_POSTGRES_TUNED_QUERIES.get(&config.dyncfg) {
+                // FIXME: either burn every connection if this changes or resolve statically...
+                "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+                    .to_string()
+            } else {
+                SET_SERIALIZABLE.to_string()
+            },
         )
     }
 }
