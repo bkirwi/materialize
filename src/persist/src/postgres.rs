@@ -27,7 +27,9 @@ use mz_ore::cast::CastFrom;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::url::SensitiveUrl;
 use mz_postgres_client::metrics::PostgresClientMetrics;
-use mz_postgres_client::{PostgresClient, PostgresClientConfig, PostgresClientKnobs};
+use mz_postgres_client::{
+    PostgresClient, PostgresClientConfig, PostgresClientKnobs, SET_SERIALIZABLE,
+};
 use postgres_protocol::escape::escape_identifier;
 use tokio_postgres::error::SqlState;
 use tracing::{info, warn};
@@ -115,7 +117,12 @@ pub struct PostgresConsensusConfig {
 
 impl From<PostgresConsensusConfig> for PostgresClientConfig {
     fn from(config: PostgresConsensusConfig) -> Self {
-        PostgresClientConfig::new(config.url, config.knobs, config.metrics)
+        PostgresClientConfig::new(
+            config.url,
+            config.knobs,
+            config.metrics,
+            SET_SERIALIZABLE.to_string(),
+        )
     }
 }
 

@@ -31,7 +31,9 @@ use mz_ore::instrument;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::url::SensitiveUrl;
 use mz_pgrepr::Numeric;
-use mz_postgres_client::{PostgresClient, PostgresClientConfig, PostgresClientKnobs};
+use mz_postgres_client::{
+    PostgresClient, PostgresClientConfig, PostgresClientKnobs, SET_SERIALIZABLE,
+};
 use mz_repr::Timestamp;
 use postgres_protocol::escape::escape_identifier;
 use serde::{Deserialize, Serialize};
@@ -101,7 +103,12 @@ pub struct PostgresTimestampOracleConfig {
 impl From<PostgresTimestampOracleConfig> for PostgresClientConfig {
     fn from(config: PostgresTimestampOracleConfig) -> Self {
         let metrics = config.metrics.postgres_client.clone();
-        PostgresClientConfig::new(config.url.clone(), Arc::new(config), metrics)
+        PostgresClientConfig::new(
+            config.url.clone(),
+            Arc::new(config),
+            metrics,
+            SET_SERIALIZABLE.to_string(),
+        )
     }
 }
 

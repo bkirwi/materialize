@@ -38,6 +38,10 @@ use tracing::debug;
 use crate::error::PostgresError;
 use crate::metrics::PostgresClientMetrics;
 
+/// Set the given session isolation level to serializable.
+pub const SET_SERIALIZABLE: &str =
+    "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE";
+
 /// Configuration knobs for [PostgresClient].
 pub trait PostgresClientKnobs: std::fmt::Debug + Send + Sync {
     /// Maximum number of connections allowed in a pool.
@@ -62,6 +66,7 @@ pub struct PostgresClientConfig {
     url: SensitiveUrl,
     knobs: Arc<dyn PostgresClientKnobs>,
     metrics: PostgresClientMetrics,
+    preamble: String,
 }
 
 impl PostgresClientConfig {
@@ -70,11 +75,13 @@ impl PostgresClientConfig {
         url: SensitiveUrl,
         knobs: Arc<dyn PostgresClientKnobs>,
         metrics: PostgresClientMetrics,
+        preamble: String,
     ) -> Self {
         PostgresClientConfig {
             url,
             knobs,
             metrics,
+            preamble,
         }
     }
 }
@@ -123,11 +130,13 @@ impl PostgresClient {
             .max_size(config.knobs.connection_pool_max_size())
             .post_create(Hook::async_fn(move |client, _| {
                 connections_created.inc();
+                let preamble = config.preamble.clone();
                 Box::pin(async move {
                     debug!("opened new consensus postgres connection");
-                    client.batch_execute(
-                        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-                    ).await.map_err(|e| HookError::Abort(HookErrorCause::Backend(e)))
+                    client
+                        .batch_execute(&preamble)
+                        .await
+                        .map_err(|e| HookError::Abort(HookErrorCause::Backend(e)))
                 })
             }))
             .pre_recycle(Hook::sync_fn(move |_client, conn_metrics| {
