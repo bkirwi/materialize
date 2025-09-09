@@ -41,5 +41,5 @@ ADDITIONAL_SYSTEM_PARAMETER_DEFAULTS = {
     # Uses a lot of memory, hard to predict how much
     "memory_limiter_interval": "0",
     # TODO: Remove when https://github.com/MaterializeInc/database-issues/issues/9660 is fixed
-    "log_filter": "warn",
+    "log_filter": "mz_storage=warn,mz_compute=warn,info",
 }
