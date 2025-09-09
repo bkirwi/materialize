@@ -4612,8 +4612,9 @@ impl BinaryFunc {
             | BinaryFunc::SubDate
             | BinaryFunc::SubDateInterval
             | BinaryFunc::SubTime
-            | BinaryFunc::SubTimeInterval
             | BinaryFunc::SubNumeric => (true, true),
+            // <time> - <interval> wraps!
+            BinaryFunc::SubTimeInterval => (false, false),
             BinaryFunc::MulInt16
             | BinaryFunc::MulInt32
             | BinaryFunc::MulInt64

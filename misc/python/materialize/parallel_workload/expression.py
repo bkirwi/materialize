@@ -150,7 +150,7 @@ FUNC_OPS[Double] += [
 
 FUNC_OPS[Numeric] += [
     # FuncOp("log({}, {})", [Numeric, Numeric]),
-    FuncOp("round({}, {})", [Numeric, Int]),
+    # FuncOp("round({}, {})", [Numeric, Int]),
 ]
 
 # for dt in [Numeric, Double]:

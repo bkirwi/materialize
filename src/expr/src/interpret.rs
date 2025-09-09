@@ -591,6 +591,12 @@ impl SpecialUnary {
                 },
                 pushdownable: true,
             }),
+            // This function is effectively nondeterministic, due to inconsistent trimming of numerics.
+            // https://github.com/MaterializeInc/database-issues/issues/9674
+            UnaryFunc::CastNumericToString(_) => Some(SpecialUnary {
+                map_fn: |_specs, range| eagerly(range, |v| ResultSpec::value_all()),
+                pushdownable: false,
+            }),
             _ => None,
         }
     }
