@@ -1066,76 +1066,6 @@ where
         Ok(read_handle)
     }
 
-    // TODO(petrosagg): This signature is not very useful in the context of partially ordered times
-    // where the as_of frontier might have multiple elements. In the current form the mutually
-    // incomparable updates will be accumulated together to a state of the collection that never
-    // actually existed. We should include the original time in the updates advanced by the as_of
-    // frontier in the result and let the caller decide what to do with the information.
-    fn snapshot(
-        &self,
-        id: GlobalId,
-        as_of: T,
-        txns_read: &TxnsRead<T>,
-    ) -> BoxFuture<'static, Result<Vec<(Row, StorageDiff)>, StorageError<T>>>
-    where
-        T: Codec64 + From<EpochMillis> + TimestampManipulation,
-    {
-        let metadata = match self.collection_metadata(id) {
-            Ok(metadata) => metadata.clone(),
-            Err(e) => return async { Err(e.into()) }.boxed(),
-        };
-        let txns_read = metadata.txns_shard.as_ref().map(|txns_id| {
-            assert_eq!(txns_id, txns_read.txns_id());
-            txns_read.clone()
-        });
-        let persist = Arc::clone(&self.persist);
-        async move {
-            let mut read_handle = Self::read_handle_for_snapshot(persist, &metadata, id).await?;
-            let contents = match txns_read {
-                None => {
-                    // We're not using txn-wal for tables, so we can take a snapshot directly.
-                    read_handle
-                        .snapshot_and_fetch(Antichain::from_elem(as_of))
-                        .await
-                }
-                Some(txns_read) => {
-                    // We _are_ using txn-wal for tables. It advances the physical upper of the
-                    // shard lazily, so we need to ask it for the snapshot to ensure the read is
-                    // unblocked.
-                    //
-                    // Consider the following scenario:
-                    // - Table A is written to via txns at time 5
-                    // - Tables other than A are written to via txns consuming timestamps up to 10
-                    // - We'd like to read A at 7
-                    // - The application process of A's txn has advanced the upper to 5+1, but we need
-                    //   it to be past 7, but the txns shard knows that (5,10) is empty of writes to A
-                    // - This branch allows it to handle that advancing the physical upper of Table A to
-                    //   10 (NB but only once we see it get past the write at 5!)
-                    // - Then we can read it normally.
-                    txns_read.update_gt(as_of.clone()).await;
-                    let data_snapshot = txns_read
-                        .data_snapshot(metadata.data_shard, as_of.clone())
-                        .await;
-                    data_snapshot.snapshot_and_fetch(&mut read_handle).await
-                }
-            };
-            match contents {
-                Ok(contents) => {
-                    let mut snapshot = Vec::with_capacity(contents.len());
-                    for ((data, _), _, diff) in contents {
-                        // TODO(petrosagg): We should accumulate the errors too and let the user
-                        // interpret the result
-                        let row = data.0?;
-                        snapshot.push((row, diff));
-                    }
-                    Ok(snapshot)
-                }
-                Err(_) => Err(StorageError::ReadBeforeSince(id)),
-            }
-        }
-        .boxed()
-    }
-
     fn snapshot_and_stream(
         &self,
         id: GlobalId,
@@ -1571,7 +1501,18 @@ where
         id: GlobalId,
         as_of: Self::Timestamp,
     ) -> BoxFuture<'static, Result<Vec<(Row, StorageDiff)>, StorageError<Self::Timestamp>>> {
-        self.snapshot(id, as_of, &self.txns_read)
+        let cursor = self.snapshot_cursor(id, as_of);
+        Box::pin(async move {
+            let mut cursor = cursor.await?;
+            let mut out = vec![];
+            while let Some(chunk) = cursor.next().await {
+                out.reserve(chunk.size_hint().0);
+                for (sourcedata, _time, diff) in chunk {
+                    out.push((sourcedata.0?, diff));
+                }
+            }
+            Ok(out)
+        })
     }
 
     async fn snapshot_latest(
@@ -1582,15 +1523,16 @@ where
         let res = match upper.as_option() {
             Some(f) if f > &T::minimum() => {
                 let as_of = f.step_back().unwrap();
-
-                let snapshot = self.snapshot(id, as_of, &self.txns_read).await.unwrap();
-                snapshot
-                    .into_iter()
-                    .map(|(row, diff)| {
+                let mut cursor = self.snapshot_cursor(id, as_of).await?;
+                let mut out = vec![];
+                while let Some(chunk) = cursor.next().await {
+                    out.reserve(chunk.size_hint().0);
+                    for (sourcedata, _time, diff) in chunk {
                         assert_eq!(diff, 1, "snapshot doesn't accumulate to set");
-                        row
-                    })
-                    .collect()
+                        out.push(sourcedata.0?);
+                    }
+                }
+                out
             }
             Some(_min) => {
                 // The collection must be empty!
