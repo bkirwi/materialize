@@ -1389,12 +1389,7 @@ where
 
             // Let StorageCollections know!
             storage_collections
-                .alter_table_desc(
-                    existing_collection,
-                    new_collection,
-                    new_desc.clone(),
-                    expected_version,
-                )
+                .alter_table_desc(existing_collection, new_desc.clone(), expected_version)
                 .await?;
 
             existing.collection_metadata.data_shard.clone()
@@ -3199,10 +3194,6 @@ where
         collection_desc: &CollectionDescription<T>,
     ) -> Result<Vec<GlobalId>, StorageError<T>> {
         let mut dependencies = Vec::new();
-
-        if let Some(id) = collection_desc.primary {
-            dependencies.push(id);
-        }
 
         match &collection_desc.data_source {
             DataSource::Introspection(_)

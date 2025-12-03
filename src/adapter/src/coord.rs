@@ -118,6 +118,7 @@ use mz_license_keys::ValidatedLicenseKey;
 use mz_orchestrator::OfflineReason;
 use mz_ore::cast::{CastFrom, CastInto, CastLossy};
 use mz_ore::channel::trigger::Trigger;
+use mz_ore::collections::CollectionExt;
 use mz_ore::future::TimeoutError;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::{EpochMillis, NowFn};
@@ -2747,7 +2748,6 @@ impl Coordinator {
                 since: None,
                 status_collection_id,
                 timeline: Some(timeline.clone()),
-                primary: None,
             }
         };
 
@@ -2770,21 +2770,9 @@ impl Coordinator {
                 CatalogItem::Table(table) => {
                     match &table.data_source {
                         TableDataSource::TableWrites { defaults: _ } => {
-                            let versions: BTreeMap<_, _> = table
-                                .collection_descs()
-                                .map(|(gid, version, desc)| (version, (gid, desc)))
-                                .collect();
-                            let collection_descs = versions.iter().map(|(version, (gid, desc))| {
-                                let next_version = version.bump();
-                                let primary_collection =
-                                    versions.get(&next_version).map(|(gid, _desc)| gid).copied();
-                                let mut collection_desc =
-                                    CollectionDescription::for_table(desc.clone());
-                                collection_desc.primary = primary_collection;
-
-                                (*gid, collection_desc)
-                            });
-                            collections.extend(collection_descs);
+                            let id = table.global_ids().into_first();
+                            let desc = table.desc_for(&table.global_id_writes());
+                            collections.push((id, CollectionDescription::for_table(desc.clone())));
                         }
                         TableDataSource::DataSource {
                             desc: data_source_desc,
@@ -2865,7 +2853,6 @@ impl Coordinator {
                         since: None,
                         status_collection_id: None,
                         timeline: None,
-                        primary: None,
                     };
                     collections.push((sink.global_id, collection_desc));
                 }

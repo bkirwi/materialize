@@ -757,7 +757,6 @@ impl Coordinator {
                                 timeline: Some(source.timeline),
                                 since: None,
                                 status_collection_id,
-                                primary: None,
                             },
                         ));
                     }
@@ -1268,7 +1267,6 @@ impl Coordinator {
                                         since: None,
                                         status_collection_id,
                                         timeline: Some(timeline.clone()),
-                                        primary: None,
                                     };
 
                                     let collections = vec![(global_id, collection_desc)];
@@ -1305,7 +1303,6 @@ impl Coordinator {
                                         since: None,
                                         status_collection_id: None,
                                         timeline: Some(timeline.clone()),
-                                        primary: None,
                                     };
                                     let collections = vec![(global_id, collection_desc)];
                                     let read_policies = coord
@@ -4394,7 +4391,6 @@ impl Coordinator {
                             since: None,
                             status_collection_id,
                             timeline: Some(source.timeline.clone()),
-                            primary: None,
                         },
                     ));
 

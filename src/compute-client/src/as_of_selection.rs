@@ -1066,7 +1066,6 @@ mod tests {
         async fn alter_table_desc(
             &self,
             _existing_collection: GlobalId,
-            _new_collection: GlobalId,
             _new_desc: RelationDesc,
             _expected_version: RelationVersion,
         ) -> Result<(), StorageError<Self::Timestamp>> {
