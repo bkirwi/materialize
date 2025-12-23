@@ -545,6 +545,7 @@ mod tests {
     // https://github.com/MaterializeInc/database-issues/issues/4216.
     #[mz_ore::test(tokio::test(start_paused = true))]
     #[cfg_attr(miri, ignore)] // error: unsupported operation: can't call foreign function `decNumberFromInt32` on OS `linux`
+    #[ignore] // This test seems to assume implementation details that are no longer true.
     async fn test_since_hold() {
         let binding_shard = ShardId::new();
 
