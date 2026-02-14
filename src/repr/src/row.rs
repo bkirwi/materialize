@@ -1097,7 +1097,7 @@ unsafe fn read_lengthed_datum<'a>(data: &mut &'a [u8], tag: Tag) -> Datum<'a> {
     match tag {
         Tag::BytesTiny | Tag::BytesShort | Tag::BytesLong | Tag::BytesHuge => Datum::Bytes(bytes),
         Tag::StringTiny | Tag::StringShort | Tag::StringLong | Tag::StringHuge => {
-            Datum::String(str::from_utf8_unchecked(bytes))
+            Datum::String(str::from_utf8(bytes).unwrap())
         }
         Tag::ListTiny | Tag::ListShort | Tag::ListLong | Tag::ListHuge => {
             Datum::List(DatumList { data: bytes })
@@ -3777,5 +3777,12 @@ mod tests {
 
         assert_eq!(map_1.cmp(&map_null), Ordering::Less);
         assert_eq!(map_null.cmp(&map_1), Ordering::Greater);
+    }
+
+    #[test]
+    fn safety_bug() {
+        RowRef::from_slice(&[0x13, 0x01, 0x80])
+            .iter()
+            .for_each(|d| println!("{}", d));
     }
 }
